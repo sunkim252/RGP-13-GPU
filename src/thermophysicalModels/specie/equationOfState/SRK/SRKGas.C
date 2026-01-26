@@ -23,51 +23,33 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "PengRobinsonGas.H"
 #include "IOstreams.H"
+#include "SRKGas.H"
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-template<class Specie>
-Foam::PengRobinsonGas<Specie>::PengRobinsonGas
-(
-    const word& name,
-    const dictionary& dict
-)
-:
-    Specie(name, dict),
-    Tc_(dict.subDict("equationOfState").lookup<scalar>("Tc")),
-    Vc_(dict.subDict("equationOfState").lookup<scalar>("Vc")),
-    Zc_(1.0),
-    Pc_(dict.subDict("equationOfState").lookup<scalar>("Pc")),
-    omega_(dict.subDict("equationOfState").lookup<scalar>("omega"))
-{
-    Zc_ = Pc_*Vc_/(RR*Tc_);
+template <class Specie>
+Foam::SRKGas<Specie>::SRKGas(const word &name, const dictionary &dict)
+    : Specie(name, dict),
+      Tc_(dict.subDict("equationOfState").lookup<scalar>("Tc")),
+      Vc_(dict.subDict("equationOfState").lookup<scalar>("Vc")), Zc_(1.0),
+      Pc_(dict.subDict("equationOfState").lookup<scalar>("Pc")),
+      omega_(dict.subDict("equationOfState").lookup<scalar>("omega")) {
+  Zc_ = Pc_ * Vc_ / (RR * Tc_);
 }
-
 
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
 
-
-template<class Specie>
-void Foam::PengRobinsonGas<Specie>::write(Ostream& os) const
-{
-    Specie::write(os);
+template <class Specie> void Foam::SRKGas<Specie>::write(Ostream &os) const {
+  Specie::write(os);
 }
-
 
 // * * * * * * * * * * * * * * * Ostream Operator  * * * * * * * * * * * * * //
 
-template<class Specie>
-Foam::Ostream& Foam::operator<<
-(
-    Ostream& os,
-    const PengRobinsonGas<Specie>& pg
-)
-{
-    pg.write(os);
-    return os;
+template <class Specie>
+Foam::Ostream &Foam::operator<<(Ostream &os, const SRKGas<Specie> &pg) {
+  pg.write(os);
+  return os;
 }
-
 
 // ************************************************************************* //
