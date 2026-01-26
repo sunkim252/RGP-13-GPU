@@ -1,0 +1,9 @@
+Make/linux*
+Make/korea*
+*.o
+*.so
+*.dep
+lnInclude/
+.vscode/
+*.swp
+foam_src_ref/
