@@ -1,0 +1,20 @@
+EXE_INC = \
+    -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/meshTools/lnInclude \
+    -I$(LIB_SRC)/thermophysicalModels/specie/lnInclude \
+    -I$(LIB_SRC)/physicalProperties/lnInclude \
+    -I$(LIB_SRC)/thermophysicalModels/basic/lnInclude \
+    -I$(LIB_SRC)/thermophysicalModels/multicomponentThermo/lnInclude \
+    -I$(LIB_SRC)/thermophysicalModels/specie/transport/sutherland \
+    -I$(LIB_SRC)/thermophysicalModels/specie/thermo/janaf \
+    -I$(LIB_SRC)/thermophysicalModels/specie/thermo/thermo \
+    -I$(LIB_SRC)/thermophysicalModels/specie/thermo/sensibleEnthalpy \
+    -I$(LIB_SRC)/thermophysicalModels/specie/equationOfState/SRK \
+    -I./specie/equationOfState/SRK \
+    -I./specie/transport/takahashi
+
+LIB_LIBS = \
+    -lfiniteVolume \
+    -lmeshTools \
+    -lspecie \
+    -lfluidThermophysicalModels

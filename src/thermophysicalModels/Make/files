@@ -1,0 +1,3 @@
+myThermos.C
+
+LIB = $(FOAM_USER_LIBBIN)/libMySRKThermo

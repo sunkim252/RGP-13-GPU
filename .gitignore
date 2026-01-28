@@ -1,9 +1,11 @@
-Make/linux*
-Make/korea*
+**/Make/linux*
+**/Make/korea*
 *.o
 *.so
 *.dep
 lnInclude/
 .vscode/
 *.swp
-foam_src_ref/
+foam_src_ref
+realFluidFoam-9
+run/
