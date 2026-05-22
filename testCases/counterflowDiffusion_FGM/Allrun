@@ -1,0 +1,10 @@
+#!/bin/sh
+cd "${0%/*}" || exit 1                       # run from this directory
+. "${WM_PROJECT_DIR:?source OpenFOAM bashrc first}/bin/tools/RunFunctions"
+
+# 0.orig holds the clean uniform initial fields (setFields overwrites 0/).
+[ -d 0 ] || cp -r 0.orig 0
+
+runApplication blockMesh
+runApplication setFields
+runApplication foamRun

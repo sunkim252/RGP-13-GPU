@@ -1,5 +1,28 @@
 Make/linux64*
+**/Make/linux64*
 lnInclude/
 *.o
 *.so
 *.dep
+
+# build / runtime artefacts
+rebuild.log
+*.log
+**/log.*
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Reproducible data products (rebuilt by scripts in tools/fgm_table_gen/)
+tools/fgm_table_gen/data/
+!tools/fgm_table_gen/data/.gitkeep
+
+# OpenFOAM case run-time output (time directories, generated logs, etc.)
+# Keep the case skeleton: 0.orig/, system/, constant/ (incl. polyMesh)
+testCases/**/0/
+testCases/**/log.*
+testCases/**/processor*
+testCases/**/postProcessing/
+testCases/**/[0-9]*[0-9]/
+testCases/**/[0-9]*e*/

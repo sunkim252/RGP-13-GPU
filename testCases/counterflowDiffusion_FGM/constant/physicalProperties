@@ -1,0 +1,58 @@
+FoamFile { format ascii; class dictionary; object physicalProperties; }
+
+// NOTE: this verification case exercises the FGM model machinery (3-D table
+// load, gZ closure, source application) with trivial perfect-gas "fake
+// species" Z, C, air -- it is NOT a physically calibrated flame. Z and C are
+// the FGM control variables transported as Yi (piggyback coupling); air is
+// the inert balance. Real-fluid (SRK) thermo coupling is a later step.
+
+thermoType
+{
+    type            hePsiThermo;
+    mixture         multicomponentMixture;
+    transport       sutherland;
+    thermo          janaf;
+    equationOfState perfectGas;
+    specie          specie;
+    energy          sensibleEnthalpy;
+}
+
+defaultSpecie air;
+
+species (Z C air);
+
+Z
+{
+    specie { molWeight 28.96; }
+    thermodynamics
+    {
+        Tlow 200; Thigh 5000; Tcommon 1000;
+        highCpCoeffs (3.5 0 0 0 0 0 0);
+        lowCpCoeffs  (3.5 0 0 0 0 0 0);
+    }
+    transport { As 1.512e-6; Ts 120; }
+}
+
+C
+{
+    specie { molWeight 28.96; }
+    thermodynamics
+    {
+        Tlow 200; Thigh 5000; Tcommon 1000;
+        highCpCoeffs (3.5 0 0 0 0 0 0);
+        lowCpCoeffs  (3.5 0 0 0 0 0 0);
+    }
+    transport { As 1.512e-6; Ts 120; }
+}
+
+air
+{
+    specie { molWeight 28.96; }
+    thermodynamics
+    {
+        Tlow 200; Thigh 5000; Tcommon 1000;
+        highCpCoeffs (3.5 0 0 0 0 0 0);
+        lowCpCoeffs  (3.5 0 0 0 0 0 0);
+    }
+    transport { As 1.512e-6; Ts 120; }
+}

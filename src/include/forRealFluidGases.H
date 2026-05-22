@@ -32,6 +32,8 @@ License
 
 #include "sensibleEnthalpy.H"
 #include "sensibleInternalEnergy.H"
+#include "absoluteEnthalpy.H"
+#include "absoluteInternalEnergy.H"
 
 #include "chungTransport.H"
 #include "thermo.H"
@@ -45,7 +47,9 @@ License
 
 #define forRealFluidGasEnergiesAndThermos(Mu, Macro, Args...)                  \
     forRealFluidGasEqns(Mu, sensibleEnthalpy, janafThermo, Macro, Args);      \
-    forRealFluidGasEqns(Mu, sensibleInternalEnergy, janafThermo, Macro, Args)
+    forRealFluidGasEqns(Mu, sensibleInternalEnergy, janafThermo, Macro, Args);\
+    forRealFluidGasEqns(Mu, absoluteEnthalpy, janafThermo, Macro, Args);      \
+    forRealFluidGasEqns(Mu, absoluteInternalEnergy, janafThermo, Macro, Args)
 
 #define forRealFluidGasTransports(Macro, Args...)                             \
     forRealFluidGasEnergiesAndThermos(chungTransport, Macro, Args)

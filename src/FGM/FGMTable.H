@@ -25,9 +25,21 @@ Class
     Foam::FGMTable
 
 Description
-    Lookup table for Flamelet-Generated Manifold (FGM) combustion model.
-    Reads 1D tables (PV, sourcePV, T, rho) from constant/fgmProperties
-    and provides linear interpolation as a function of progress variable.
+    Lookup table for the diffusion-flame (FPV + presumed beta-PDF) FGM
+    combustion model.
+
+    Reads a 3-D table of the Favre-filtered progress-variable source term
+    from constant/fgmProperties, as a function of
+        (Z~ , gZ , C~)
+    where
+        Z~  = Favre mean mixture fraction,
+        gZ  = Zvar/(Z~(1-Z~)) = mixture-fraction segregation factor [0,1),
+        C~  = Favre mean progress variable.
+
+    The dictionary provides the axis sizes (nZ, nGz, nC), the three axes
+    (Z, gZ, C) and a flat sourcePV list in C-order:
+        idx = (iZ*nGz + iGz)*nC + iC
+    Trilinear interpolation is provided via lookup().
 
 SourceFiles
     FGMTable.C
@@ -41,6 +53,8 @@ SourceFiles
 #include "fvMesh.H"
 #include "scalar.H"
 #include "List.H"
+#include "HashTable.H"
+#include "wordList.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -60,17 +74,56 @@ class FGMTable
         //- Reference to the mesh database
         const fvMesh& mesh_;
 
-        //- Progress variable axis
-        List<scalar> pvAxis_;
+        //- Axis sizes
+        label nZ_;
+        label nGz_;
+        label nC_;
 
-        //- Source term for progress variable
+        //- Mixture-fraction axis (Z~)
+        List<scalar> Z_axis_;
+
+        //- Segregation-factor axis (gZ = Zvar/(Z~(1-Z~)))
+        List<scalar> gZ_axis_;
+
+        //- Progress-variable axis (C~)
+        List<scalar> C_axis_;
+
+        //- Flat 3-D PV source table, C-order idx = (iZ*nGz + iGz)*nC + iC
         List<scalar> sourcePV_;
 
-        //- Temperature table
+        //- Optional tabulated temperature [K] (empty if not present)
         List<scalar> T_table_;
 
-        //- Density table
-        List<scalar> rho_table_;
+        //- Tabulated species mass fractions, keyed by species name.
+        //  Each entry is a flat nZ*nGz*nC list in the same C-order.
+        HashTable<List<scalar>> Y_tables_;
+
+        //- Names of the tabulated species (order as in the 'species' entry)
+        wordList speciesNames_;
+
+
+    // Private Member Functions
+
+        //- Trilinear interpolation of an arbitrary flat table at (Z~, gZ, C~)
+        scalar interpolateTable(const List<scalar>& table,
+                                scalar Z, scalar gZ, scalar C) const;
+
+        //- Locate value v in a sorted axis; returns lower index i and sets
+        //  the linear weight w in [0,1] such that
+        //  result = (1-w)*axis[i] + w*axis[i+1]. Clamps to the ends.
+        void bracket
+        (
+            const List<scalar>& axis,
+            scalar v,
+            label& i,
+            scalar& w
+        ) const;
+
+        //- Flat index into sourcePV_
+        inline label flatIndex(label iZ, label iGz, label iC) const
+        {
+            return (iZ*nGz_ + iGz)*nC_ + iC;
+        }
 
 
 public:
@@ -87,38 +140,34 @@ public:
 
     // Member Functions
 
-        //- Interpolate a value from a table given a progress variable value
-        scalar interpolate
-        (
-            const List<scalar>& table,
-            scalar pv
-        ) const;
+        //- Trilinear interpolation of the PV source term at (Z~, gZ, C~).
+        //  Named 'interpolate' (not 'lookup') to avoid hiding the inherited
+        //  dictionary::lookup used in the constructor.
+        scalar interpolate(scalar Z, scalar gZ, scalar C) const;
+
+        //- Trilinear interpolation of the tabulated temperature [K]
+        scalar interpolateT(scalar Z, scalar gZ, scalar C) const;
+
+        //- Trilinear interpolation of a tabulated species mass fraction
+        scalar interpolateY(const word& specie,
+                            scalar Z, scalar gZ, scalar C) const;
+
+        //- True if the given species is tabulated
+        inline bool hasSpecie(const word& specie) const
+        {
+            return Y_tables_.found(specie);
+        }
+
+        //- True if temperature is tabulated
+        inline bool hasT() const { return !T_table_.empty(); }
 
         // Access
 
-            //- Return const access to the PV axis
-            inline const List<scalar>& pvAxis() const
-            {
-                return pvAxis_;
-            }
-
-            //- Return const access to the source PV table
-            inline const List<scalar>& sourcePV() const
-            {
-                return sourcePV_;
-            }
-
-            //- Return const access to the temperature table
-            inline const List<scalar>& T() const
-            {
-                return T_table_;
-            }
-
-            //- Return const access to the density table
-            inline const List<scalar>& rho() const
-            {
-                return rho_table_;
-            }
+            inline const List<scalar>& Zaxis() const { return Z_axis_; }
+            inline const List<scalar>& gZaxis() const { return gZ_axis_; }
+            inline const List<scalar>& Caxis() const { return C_axis_; }
+            inline const List<scalar>& sourcePV() const { return sourcePV_; }
+            inline const wordList& speciesNames() const { return speciesNames_; }
 };
 
 

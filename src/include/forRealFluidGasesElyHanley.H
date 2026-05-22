@@ -15,6 +15,8 @@
 
 #include "sensibleEnthalpy.H"
 #include "sensibleInternalEnergy.H"
+#include "absoluteEnthalpy.H"
+#include "absoluteInternalEnergy.H"
 
 #include "elyHanleyTransport.H"
 #include "thermo.H"
@@ -26,7 +28,9 @@
 
 #define forRealFluidGasEnergiesAndThermosEH(Mu, Macro, Args...)               \
     forRealFluidGasEqnsEH(Mu, sensibleEnthalpy, janafThermo, Macro, Args);    \
-    forRealFluidGasEqnsEH(Mu, sensibleInternalEnergy, janafThermo, Macro, Args)
+    forRealFluidGasEqnsEH(Mu, sensibleInternalEnergy, janafThermo, Macro, Args);\
+    forRealFluidGasEqnsEH(Mu, absoluteEnthalpy, janafThermo, Macro, Args);    \
+    forRealFluidGasEqnsEH(Mu, absoluteInternalEnergy, janafThermo, Macro, Args)
 
 #define forRealFluidGasTransportsEH(Macro, Args...)                           \
     forRealFluidGasEnergiesAndThermosEH(elyHanleyTransport, Macro, Args)

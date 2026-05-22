@@ -44,43 +44,83 @@ Foam::FGMTable::FGMTable
         )
     ),
     mesh_(mesh),
-    pvAxis_(lookup("PV")),
-    sourcePV_(lookup("sourcePV")),
-    T_table_(lookup("T")),
-    rho_table_(lookup("rho"))
+    nZ_(readLabel(lookup("nZ"))),
+    nGz_(readLabel(lookup("nGz"))),
+    nC_(readLabel(lookup("nC"))),
+    Z_axis_(lookup("Z")),
+    gZ_axis_(lookup("gZ")),
+    C_axis_(lookup("C")),
+    sourcePV_(lookup("sourcePV"))
 {
-    Info<< "\nFGM Table initialisation" << endl;
-    Info<< "Table length: " << pvAxis_.size() << endl;
-    Info<< "Table contents:" << endl;
-    Info<< "{" << endl;
-    Info<< "    PV (progress variable axis)" << endl;
-    Info<< "    sourcePV (reaction source term)" << endl;
-    Info<< "    T (temperature)" << endl;
-    Info<< "    rho (density)" << endl;
-    Info<< "}" << nl << endl;
+    Info<< "\nFGM (FPV + beta-PDF) table initialisation" << endl;
+    Info<< "    axes: nZ=" << nZ_
+        << "  nGz=" << nGz_
+        << "  nC=" << nC_ << endl;
+    Info<< "    sourcePV entries: " << sourcePV_.size()
+        << " (expected " << nZ_*nGz_*nC_ << ")" << nl << endl;
 
-    if (pvAxis_.size() < 2)
+    if (nZ_ < 2 || nGz_ < 2 || nC_ < 2)
     {
         FatalErrorInFunction
-            << "FGM table must have at least 2 entries, but has "
-            << pvAxis_.size()
+            << "Each FGM axis must have at least 2 entries: "
+            << "nZ=" << nZ_ << " nGz=" << nGz_ << " nC=" << nC_
             << exit(FatalError);
     }
 
     if
     (
-        sourcePV_.size() != pvAxis_.size()
-     || T_table_.size() != pvAxis_.size()
-     || rho_table_.size() != pvAxis_.size()
+        Z_axis_.size() != nZ_
+     || gZ_axis_.size() != nGz_
+     || C_axis_.size() != nC_
     )
     {
         FatalErrorInFunction
-            << "FGM table arrays must all have the same size." << nl
-            << "PV size: " << pvAxis_.size() << nl
-            << "sourcePV size: " << sourcePV_.size() << nl
-            << "T size: " << T_table_.size() << nl
-            << "rho size: " << rho_table_.size()
+            << "FGM axis lengths do not match declared sizes." << nl
+            << "Z: " << Z_axis_.size() << " (nZ=" << nZ_ << ")" << nl
+            << "gZ: " << gZ_axis_.size() << " (nGz=" << nGz_ << ")" << nl
+            << "C: " << C_axis_.size() << " (nC=" << nC_ << ")"
             << exit(FatalError);
+    }
+
+    const label nTot = nZ_*nGz_*nC_;
+    if (sourcePV_.size() != nTot)
+    {
+        FatalErrorInFunction
+            << "sourcePV size " << sourcePV_.size()
+            << " != nZ*nGz*nC = " << nTot
+            << exit(FatalError);
+    }
+
+    // ---- Optional temperature table ----
+    if (found("T"))
+    {
+        T_table_ = List<scalar>(lookup("T"));
+        if (T_table_.size() != nTot)
+        {
+            FatalErrorInFunction
+                << "T table size " << T_table_.size() << " != " << nTot
+                << exit(FatalError);
+        }
+        Info<< "    tabulated: T" << endl;
+    }
+
+    // ---- Optional species composition tables (for R2 real-fluid coupling) ----
+    if (found("species"))
+    {
+        speciesNames_ = wordList(lookup("species"));
+        forAll(speciesNames_, i)
+        {
+            const word key("Y_" + speciesNames_[i]);
+            List<scalar> tbl(lookup(key));
+            if (tbl.size() != nTot)
+            {
+                FatalErrorInFunction
+                    << key << " size " << tbl.size() << " != " << nTot
+                    << exit(FatalError);
+            }
+            Y_tables_.insert(speciesNames_[i], tbl);
+        }
+        Info<< "    tabulated species: " << speciesNames_ << nl << endl;
     }
 }
 
@@ -93,58 +133,113 @@ Foam::FGMTable::~FGMTable()
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
-Foam::scalar Foam::FGMTable::interpolate
+void Foam::FGMTable::bracket
 (
-    const List<scalar>& table,
-    scalar pvValue
+    const List<scalar>& axis,
+    scalar v,
+    label& i,
+    scalar& w
 ) const
 {
-    // Clamp PV to [0, 1]
-    pvValue = min(pvValue, scalar(1));
-    pvValue = max(pvValue, scalar(0));
+    const label n = axis.size();
 
-    // Handle exact zero
-    if (pvValue == 0)
+    if (v <= axis[0])
     {
-        return table[0];
+        i = 0;
+        w = 0;
+        return;
+    }
+    if (v >= axis[n - 1])
+    {
+        i = n - 2;
+        w = 1;
+        return;
     }
 
-    // Small number to prevent divide by zero
-    const scalar smallValue = 1e-5;
-
-    scalar lower_pv = 0;
-    scalar upper_pv = 0;
-    scalar lower_val = 0;
-    scalar upper_val = 0;
-
-    // Find the bracketing interval in the PV axis
-    for (label j = 0; j < pvAxis_.size(); j++)
+    // Linear scan (axes are small). Find j with axis[j] >= v.
+    label j = 1;
+    while (j < n - 1 && axis[j] < v)
     {
-        if (pvAxis_[j] >= pvValue)
-        {
-            // Guard against j == 0 (should not happen since pvValue > 0
-            // and pvAxis_[0] is typically 0, but be safe)
-            label jLow = max(j - 1, label(0));
-
-            lower_pv = pvAxis_[jLow];
-            upper_pv = pvAxis_[j];
-
-            lower_val = table[jLow];
-            upper_val = table[j];
-
-            break;
-        }
+        j++;
     }
 
-    const scalar rate =
-        (upper_val - lower_val) / max(upper_pv - lower_pv, smallValue);
+    i = j - 1;
+    const scalar d = axis[j] - axis[i];
+    w = (d > VSMALL) ? (v - axis[i])/d : 0;
+}
 
-    scalar interpolatedValue = (pvValue - lower_pv) * rate + lower_val;
 
-    // Clamp to table minimum
-    interpolatedValue = max(interpolatedValue, min(table));
+Foam::scalar Foam::FGMTable::interpolateTable
+(
+    const List<scalar>& table,
+    scalar Z,
+    scalar gZ,
+    scalar C
+) const
+{
+    label iZ, iG, iC;
+    scalar wZ, wG, wC;
 
-    return interpolatedValue;
+    bracket(Z_axis_, Z, iZ, wZ);
+    bracket(gZ_axis_, gZ, iG, wG);
+    bracket(C_axis_, C, iC, wC);
+
+    // Trilinear interpolation over the 8 surrounding nodes.
+    const scalar c000 = table[flatIndex(iZ,   iG,   iC  )];
+    const scalar c100 = table[flatIndex(iZ+1, iG,   iC  )];
+    const scalar c010 = table[flatIndex(iZ,   iG+1, iC  )];
+    const scalar c110 = table[flatIndex(iZ+1, iG+1, iC  )];
+    const scalar c001 = table[flatIndex(iZ,   iG,   iC+1)];
+    const scalar c101 = table[flatIndex(iZ+1, iG,   iC+1)];
+    const scalar c011 = table[flatIndex(iZ,   iG+1, iC+1)];
+    const scalar c111 = table[flatIndex(iZ+1, iG+1, iC+1)];
+
+    const scalar c00 = c000*(1 - wZ) + c100*wZ;
+    const scalar c10 = c010*(1 - wZ) + c110*wZ;
+    const scalar c01 = c001*(1 - wZ) + c101*wZ;
+    const scalar c11 = c011*(1 - wZ) + c111*wZ;
+
+    const scalar c0 = c00*(1 - wG) + c10*wG;
+    const scalar c1 = c01*(1 - wG) + c11*wG;
+
+    return c0*(1 - wC) + c1*wC;
+}
+
+
+Foam::scalar Foam::FGMTable::interpolate(scalar Z, scalar gZ, scalar C) const
+{
+    return interpolateTable(sourcePV_, Z, gZ, C);
+}
+
+
+Foam::scalar Foam::FGMTable::interpolateT(scalar Z, scalar gZ, scalar C) const
+{
+    if (T_table_.empty())
+    {
+        FatalErrorInFunction
+            << "Temperature is not tabulated in fgmProperties."
+            << exit(FatalError);
+    }
+    return interpolateTable(T_table_, Z, gZ, C);
+}
+
+
+Foam::scalar Foam::FGMTable::interpolateY
+(
+    const word& specie,
+    scalar Z,
+    scalar gZ,
+    scalar C
+) const
+{
+    if (!Y_tables_.found(specie))
+    {
+        FatalErrorInFunction
+            << "Species '" << specie << "' is not tabulated in fgmProperties."
+            << "  Available: " << speciesNames_
+            << exit(FatalError);
+    }
+    return interpolateTable(Y_tables_[specie], Z, gZ, C);
 }
 
 

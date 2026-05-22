@@ -256,9 +256,18 @@ inline Foam::scalar Foam::chungTransport<Thermo>::kappa
                   + b3[j]*kappaiM_;
         }
 
-        // Heat capacity at constant volume in [cal/mol.K]
-        // Use Cp from thermo chain; approximate Cv_ideal = Cp - R
-        scalar CvIdeal = this->Cp(p, T) - this->R();
+        // Heat capacity at constant volume in [cal/mol.K].
+        // Chung's alpha = Cv/R - 3/2 requires the IDEAL-GAS Cv0, NOT the
+        // real Cv. The thermo chain returns
+        //   janafThermo<EOS>::Cp(p,T) = JANAF_poly(T) + EOS::Cp(p,T)
+        // i.e. Cp_real = Cp_ig + Cp_dep_SRK, so it carries the dense-fluid
+        // departure (the pseudo-critical Cp peak, e.g. O2 near Tc/100 bar
+        // shows Cp_real ~ 4500 vs Cp_ig ~ 920 J/kg/K). Feeding that into
+        // alpha inflates Psi and over-predicts kappa in the dense region.
+        // Recover Cp_ig by evaluating at a low reference pressure (1 atm)
+        // where the SRK departure is < 1 %. Mirrors elyHanleyTransport.
+        const scalar pRefCpIg = 1.01325e5;
+        scalar CvIdeal = this->Cp(pRefCpIg, T) - this->R();
         scalar Cv = CvIdeal*this->W()*0.2388e-3;
 
         // Universal gas constant [cal/mol.K]
@@ -268,7 +277,11 @@ inline Foam::scalar Foam::chungTransport<Thermo>::kappa
         scalar alpha = (Cv/R) - 3.0/2.0;
 
         // Calculate beta in eq (9)
-        scalar beta = 0.7862-0.7109*omegaM_ + 1.1368*sqr(omegaM_);
+        // Chung et al. (1988) / Poling 5th ed. Eq (10-3.14): the omega^2
+        // coefficient is 1.3168 (the previous 1.1368 was a transposition;
+        // negligible for low-omega O2 but matters for H2O omega=0.344,
+        // kerosene omega=0.467).
+        scalar beta = 0.7862-0.7109*omegaM_ + 1.3168*sqr(omegaM_);
 
         // Calculate Tr in eq (9)
         scalar Tr = T/TcM_;

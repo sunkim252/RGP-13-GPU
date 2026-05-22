@@ -25,6 +25,7 @@ License
 
 #include "FGM.H"
 #include "fvmSup.H"
+#include "fvcGrad.H"
 #include "addToRunTimeSelectionTable.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
@@ -51,11 +52,20 @@ Foam::combustionModels::FGM::FGM
 :
     combustionModel(modelType, thermo, turb),
     table_(this->mesh()),
-    pvName_
+    zName_
     (
-        this->coeffs().lookupOrDefault<word>("progressVariable", "PV")
+        this->coeffs().lookupOrDefault<word>("mixtureFraction", "Z")
     ),
-    pvIndex_(-1),
+    cName_
+    (
+        this->coeffs().lookupOrDefault<word>("progressVariable", "C")
+    ),
+    zIndex_(-1),
+    cIndex_(-1),
+    Cv_
+    (
+        this->coeffs().lookupOrDefault<scalar>("Cv", 0.1)
+    ),
     sourcePV_
     (
         IOobject
@@ -83,14 +93,17 @@ Foam::combustionModels::FGM::FGM
         dimensionedScalar(dimEnergy/dimVolume/dimTime, 0)
     )
 {
-    // Find the progress variable index in the species list
     const speciesTable& species = thermo.species();
 
-    pvIndex_ = species[pvName_];
+    zIndex_ = species[zName_];
+    cIndex_ = species[cName_];
 
-    Info<< "FGM combustion model:" << nl
-        << "    Progress variable: " << pvName_ << nl
-        << "    Species index: " << pvIndex_ << nl
+    Info<< "FGM (FPV + beta-PDF) combustion model:" << nl
+        << "    Mixture fraction:  " << zName_
+        << "  (species index " << zIndex_ << ")" << nl
+        << "    Progress variable: " << cName_
+        << "  (species index " << cIndex_ << ")" << nl
+        << "    LES variance coeff Cv = " << Cv_ << nl
         << endl;
 }
 
@@ -105,19 +118,36 @@ Foam::combustionModels::FGM::~FGM()
 
 void Foam::combustionModels::FGM::correct()
 {
-    const volScalarField& PV = this->thermo().Y(pvIndex_);
+    const volScalarField& Z = this->thermo().Y(zIndex_);
+    const volScalarField& C = this->thermo().Y(cIndex_);
+
+    // Keep the density tmp alive while we read it.
+    const tmp<volScalarField> trho(this->thermo().rho());
+    const volScalarField& rho = trho();
+
+    // |grad(Z)|^2 for the algebraic subgrid variance closure.
+    const tmp<volScalarField> tmagSqrGradZ(magSqr(fvc::grad(Z)));
+    const volScalarField& magSqrGradZ = tmagSqrGradZ();
+
+    const scalarField& V = this->mesh().V();
 
     forAll(sourcePV_, celli)
     {
-        const scalar pvVal = PV[celli];
+        const scalar Zc = max(min(Z[celli], scalar(1)), scalar(0));
+        const scalar Cc = max(C[celli], scalar(0));
 
-        sourcePV_[celli] =
-            table_.interpolate(table_.sourcePV(), pvVal);
+        // LES filter width Delta = V^(1/3); algebraic variance + segregation.
+        const scalar delta = cbrt(V[celli]);
+        const scalar Zvar = Cv_*sqr(delta)*magSqrGradZ[celli];
+        const scalar Zfluc = max(Zc*(scalar(1) - Zc), SMALL);
+        const scalar gZ = min(max(Zvar/Zfluc, scalar(0)), scalar(1));
+
+        // Tabulated mass-fraction PV source [1/s] -> volumetric [kg/m^3/s].
+        sourcePV_[celli] = rho[celli]*table_.interpolate(Zc, gZ, Cc);
     }
 
-    // Step 1: Qdot = 0. Temperature evolution relies on species
-    // transport and thermodynamic coupling. A proper Qdot based on
-    // enthalpy differences can be added in a later step.
+    // Qdot = 0 for now; temperature follows species transport + real-fluid
+    // thermodynamic coupling.
     Qdot_ = dimensionedScalar(dimEnergy/dimVolume/dimTime, 0);
 }
 
@@ -125,12 +155,12 @@ void Foam::combustionModels::FGM::correct()
 Foam::tmp<Foam::volScalarField::Internal>
 Foam::combustionModels::FGM::R(const label speciei) const
 {
-    if (speciei == pvIndex_)
+    if (speciei == cIndex_)
     {
         return sourcePV_;
     }
 
-    // For all other species, return zero source
+    // Mixture fraction Z and all other species carry no chemical source.
     return
         volScalarField::Internal::New
         (
@@ -146,11 +176,10 @@ Foam::combustionModels::FGM::R(volScalarField& Y) const
 {
     tmp<fvScalarMatrix> tSu(new fvScalarMatrix(Y, dimMass/dimTime));
 
-    if (Y.name() == pvName_)
+    if (Y.name() == cName_)
     {
-        // Add explicit source: the fvScalarMatrix source convention is
-        // that source() is on the RHS with a negative sign, i.e.
-        //   [A][x] = [source]  =>  need source = rate * V
+        // Explicit source for the progress variable. fvScalarMatrix stores
+        // the RHS source with a negative sign, so subtract rate * V.
         tSu.ref().source() -= sourcePV_ * this->mesh().V();
     }
 

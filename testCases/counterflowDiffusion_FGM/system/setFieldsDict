@@ -1,0 +1,31 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| Seed a central Z-rich box so |grad(Z)| != 0 and the segregation factor gZ  |
+| is exercised in the FGM lookup.                                            |
+\*---------------------------------------------------------------------------*/
+FoamFile { format ascii; class dictionary; object setFieldsDict; }
+
+// Seed a small "partially burnt" C=0.1 everywhere so the tabulated source is
+// active (the manifold has omega_C=0 at C=0 by construction -> a cold C=0
+// start never ignites). The central box also raises Z to 0.5 to give a
+// |grad(Z)| gradient and exercise the gZ axis.
+defaultFieldValues
+(
+    volScalarFieldValue Z   0.2
+    volScalarFieldValue C   0.1
+    volScalarFieldValue air 0.7
+);
+
+regions
+(
+    boxToCell
+    {
+        box (0.008 0 -1) (0.012 0.005 1);
+        fieldValues
+        (
+            volScalarFieldValue Z   0.5
+            volScalarFieldValue air 0.4
+        );
+    }
+);
+
+// ************************************************************************* //

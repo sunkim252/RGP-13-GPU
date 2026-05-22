@@ -1,0 +1,16 @@
+FoamFile { format ascii; class dictionary; object controlDict; }
+
+solver          multicomponentFluid;
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         2e-4;
+deltaT          5e-8;
+writeControl    timeStep;
+writeInterval   1000;
+writeFormat     ascii;
+writePrecision  10;
+runTimeModifiable false;
+adjustTimeStep  no;
+
+libs ("libRGP13realFluid.so");

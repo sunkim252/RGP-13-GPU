@@ -27,12 +27,19 @@ void Foam::SRKelyHanleyMixture<ThermoType>::calculateRealGas
     scalar& ZcM
 ) const
 {
-    // ---------------- SRK EoS mixing rules (identical to chung) ----------
-    forAll(BM_, i)
-    {
-        bM += X[i]*BM_[i];
-    }
-
+    // ---------------- SRK EoS mixing rules (Oefelein 2019 Eqs. 24-25) ----
+    //
+    //   a_m = SUM_i SUM_j X_i X_j a_ij,
+    //         a_ij = sqrt(a_i a_j) (1 - k_ij)        [Eq. 25]
+    //   b_m = SUM_i SUM_j X_i X_j b_ij,
+    //         b_ij = (1/8)(b_i^1/3 + b_j^1/3)^3 (1 - l_ij)
+    //
+    // a_m is split across three Soave temperature-functional terms
+    // (COEF1..3, with k_ij already baked in by the constructor); b_m
+    // uses the precomputed BIJ_ matrix (with l_ij baked in). This
+    // replaces the previous linear b_m = SUM X_i b_i (Kay's rule).
+    //
+    // Peneloux c_m stays linear by Peneloux et al. (1982).
     forAll(CM_, i)
     {
         cM += X[i]*CM_[i];
@@ -44,6 +51,7 @@ void Foam::SRKelyHanleyMixture<ThermoType>::calculateRealGas
         coef1 += Xi2*COEF1_[i][i];
         coef2 += Xi2*COEF2_[i][i];
         coef3 += Xi2*COEF3_[i][i];
+        bM    += Xi2*BIJ_[i][i];
     }
     for (label i = 0; i < COEF1_.size(); i++)
     {
@@ -53,34 +61,57 @@ void Foam::SRKelyHanleyMixture<ThermoType>::calculateRealGas
             coef1 += twoXiXj*COEF1_[i][j];
             coef2 += twoXiXj*COEF2_[i][j];
             coef3 += twoXiXj*COEF3_[i][j];
+            bM    += twoXiXj*BIJ_[i][j];
         }
     }
 
     // ---------------- Ely-Hanley mixture critical state ------------------
-    // Pseudo-pure mole-weighted averaging — see notes in
-    // RGP-13_ECS_deviations.ipynb Item 11.
-    //   T_c,m = sum_i X_i T_c,i
-    //   V_c,m = sum_i X_i V_c,i
-    //   omega_m = sum_i X_i omega_i
-    //   M_m   = sum_i X_i W_i           (mole-weighted molar mass)
-    //   P_c,m = sum_i X_i P_c,i         (auxiliary, only for Z_c,m)
-    //   Z_c,m = P_c,m * V_c,m^(SI) / (R T_c,m)
-    // V_c,i is stored in cm^3/mol by rfSpecie; convert to m^3/kmol for Z.
-    scalar PcM = 0;
+    // ECS reducing-ratio mixing rules of Oefelein 2019 Eqs. (13)-(17),
+    // taken in the Leach-Chappelear-Leland shape-factor = 1 limit
+    // (the full shape factors are still applied per-species inside
+    // elyHanleyTransport when forming F_mu, F_lam, so this is a vdW1f
+    // approximation only at the *mixing* step). In that limit
+    //   h_i = V_c,i / V_c,o,    f_i = T_c,i / T_c,o,
+    //   h_ij = (1/8)(h_i^1/3 + h_j^1/3)^3 (1 - l_ij),
+    //   f_ij = sqrt(f_i f_j) (1 - k_ij),
+    // so that
+    //   V_c,m = h_x V_c,o = SUM SUM X_i X_j V_c,ij
+    //   T_c,m V_c,m = (f_x V_c,o) (h_x V_c,o)
+    //               = SUM SUM X_i X_j sqrt(T_ci T_cj) (1-k_ij) V_c,ij
+    // The pair quantities VCIJ_ (= V_c,ij) and TVCIJ_ (= sqrt(T_ci T_cj)
+    // (1-k_ij) V_c,ij) are precomputed in the constructor.
+    //
+    // omega_m and M_m use the linear Kay's rule (omega is exact under
+    // arithmetic-mean omega_ij combining; M_m is the standard ECS
+    // simplification).
+    scalar PcM    = 0;
+    scalar TcVcM  = 0;
     forAll(X, i)
     {
-        TcM    += X[i]*ListTc_[i];
-        VcM    += X[i]*ListVc_[i];      // cm^3/mol
         omegaM += X[i]*ListOmega_[i];
         MM     += X[i]*ListW_[i];
         PcM    += X[i]*ListPc_[i];
+
+        const scalar Xi2 = X[i]*X[i];
+        VcM    += Xi2*VCIJ_[i][i];
+        TcVcM  += Xi2*TVCIJ_[i][i];
+    }
+    for (label i = 0; i < VCIJ_.size(); i++)
+    {
+        for (label j = i + 1; j < VCIJ_.size(); j++)
+        {
+            const scalar twoXiXj = 2.0*X[i]*X[j];
+            VcM   += twoXiXj*VCIJ_[i][j];
+            TcVcM += twoXiXj*TVCIJ_[i][j];
+        }
     }
 
-    if (TcM == 0) { TcM = 1e-30; }
     if (VcM == 0) { VcM = 1e-30; }
     if (MM  == 0) { MM  = 1e-30; }
+    TcM = TcVcM/VcM;
+    if (TcM == 0) { TcM = 1e-30; }
 
-    const scalar Ru   = Foam::constant::thermodynamic::RR;   // J/(kmol K)
+    const scalar Ru    = Foam::constant::thermodynamic::RR;  // J/(kmol K)
     const scalar VcMSI = VcM*1e-3;                           // -> m^3/kmol
     if (PcM > 1e-6 && TcM > 1e-6)
     {
@@ -221,6 +252,10 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
     COEF3_(numberOfSpecies_),
     CM_(numberOfSpecies_, scalar(0)),
     KIJ_(numberOfSpecies_),
+    LIJ_(numberOfSpecies_),
+    BIJ_(numberOfSpecies_),
+    VCIJ_(numberOfSpecies_),
+    TVCIJ_(numberOfSpecies_),
     MMD_(numberOfSpecies_),
     SIGMD_(numberOfSpecies_)
 {
@@ -240,10 +275,14 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
                        /this->specieThermos()[i].Pc();
     }
 
-    // k_ij parsing (identical to SRKchungTakaMixture)
+    // k_ij and l_ij parsing. k_ij is shared with SRKchungTakaMixture
+    // (energy interaction). l_ij is the Oefelein-2019 volume
+    // interaction used by the Lorentz combining rule for b_ij and
+    // V_c,ij; if absent in the dict it defaults to 0.
     forAll(KIJ_, i)
     {
         KIJ_[i].setSize(numberOfSpecies_, scalar(0));
+        LIJ_[i].setSize(numberOfSpecies_, scalar(0));
     }
     if (dict.found("binaryInteraction"))
     {
@@ -265,15 +304,23 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
             }
             if (ia < 0 || ib < 0) continue;
             const scalar kij = iter().dict().lookupOrDefault<scalar>("kij", 0);
+            const scalar lij = iter().dict().lookupOrDefault<scalar>("lij", 0);
             KIJ_[ia][ib] = kij;
             KIJ_[ib][ia] = kij;
+            LIJ_[ia][ib] = lij;
+            LIJ_[ib][ia] = lij;
         }
     }
 
-    // Pre-compute SRK + diffusivity pair matrices
+    // Pre-compute SRK + diffusivity pair matrices, plus the Oefelein
+    // 2019 quadratic combining matrices BIJ_, VCIJ_, TVCIJ_ used by
+    // the b_m, V_c,m, T_c,m mixing rules.
     List<scalar> nCOEF1(numberOfSpecies_);
     List<scalar> nCOEF2(numberOfSpecies_);
     List<scalar> nCOEF3(numberOfSpecies_);
+    List<scalar> nBIJ(numberOfSpecies_);
+    List<scalar> nVCIJ(numberOfSpecies_);
+    List<scalar> nTVCIJ(numberOfSpecies_);
     List<scalar> nMMD(numberOfSpecies_);
     List<scalar> nSIGMD(numberOfSpecies_);
 
@@ -283,11 +330,15 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
         const scalar miOmega = si.omega();
         const scalar miTc    = si.Tc();
         const scalar miPc    = si.Pc();
+        const scalar miVc    = si.Vc();      // cm^3/mol
         const scalar miW     = si.W();
         const scalar miSigmv = si.sigmvi();
 
         const scalar mFi = 0.48508 + 1.5517*miOmega - 0.15613*sqr(miOmega);
         const scalar Ai  = 0.42747*sqr(RR*miTc)/miPc;
+        const scalar bi  = BM_[i];           // already computed above
+        const scalar bi13 = pow(bi,  1.0/3.0);
+        const scalar Vci13 = pow(miVc, 1.0/3.0);
 
         forAll(nCOEF1, j)
         {
@@ -295,13 +346,18 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
             const scalar mjOmega = sj.omega();
             const scalar mjTc    = sj.Tc();
             const scalar mjPc    = sj.Pc();
+            const scalar mjVc    = sj.Vc();
             const scalar mjW     = sj.W();
             const scalar mjSigmv = sj.sigmvi();
 
             const scalar mFj = 0.48508 + 1.5517*mjOmega - 0.15613*sqr(mjOmega);
             const scalar Aj  = 0.42747*sqr(RR*mjTc)/mjPc;
+            const scalar bj  = BM_[j];
+            const scalar bj13 = pow(bj,  1.0/3.0);
+            const scalar Vcj13 = pow(mjVc, 1.0/3.0);
 
             const scalar oneMinusKij = (i == j) ? 1.0 : (1.0 - KIJ_[i][j]);
+            const scalar oneMinusLij = (i == j) ? 1.0 : (1.0 - LIJ_[i][j]);
             const scalar sqAij = sqrt(Ai*Aj);
 
             nCOEF1[j] = sqAij*(1 + mFi)*(1 + mFj)*oneMinusKij;
@@ -313,6 +369,16 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
                 )*oneMinusKij;
             nCOEF3[j] = sqAij*mFi*mFj/sqrt(miTc*mjTc)*oneMinusKij;
 
+            // Lorentz combining rule for SRK b_ij and ECS V_c,ij
+            // (Oefelein 2019 Eqs. 16, 25).
+            const scalar bSum3  = pow3(bi13   + bj13);
+            const scalar VcSum3 = pow3(Vci13  + Vcj13);
+            nBIJ[j]  = 0.125*bSum3 *oneMinusLij;
+            nVCIJ[j] = 0.125*VcSum3*oneMinusLij;
+            // Eq. 17 cross term sqrt(T_ci T_cj)(1-k_ij), weighted by
+            // V_c,ij so that T_c,m = (sum X_i X_j TVCIJ) / V_c,m.
+            nTVCIJ[j] = sqrt(miTc*mjTc)*oneMinusKij*nVCIJ[j];
+
             nMMD[j]  = 1/miW + 1/mjW;
             nSIGMD[j] = pow(miSigmv, 1.0/3) + pow(mjSigmv, 1.0/3);
         }
@@ -320,6 +386,9 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
         COEF1_[i] = nCOEF1;
         COEF2_[i] = nCOEF2;
         COEF3_[i] = nCOEF3;
+        BIJ_[i]   = nBIJ;
+        VCIJ_[i]  = nVCIJ;
+        TVCIJ_[i] = nTVCIJ;
         MMD_[i]   = nMMD;
         SIGMD_[i] = nSIGMD;
     }

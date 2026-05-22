@@ -1,0 +1,14 @@
+FoamFile { format ascii; class dictionary; object combustionProperties; }
+
+combustionModel FGM;
+
+FGMCoeffs
+{
+    // Species names used as the FGM control variables (transported as Yi).
+    mixtureFraction  Z;
+    progressVariable C;
+
+    // LES mixture-fraction subgrid-variance coefficient:
+    //   Zvar = Cv * Delta^2 * |grad(Z)|^2,   gZ = Zvar/(Z(1-Z))
+    Cv 0.1;
+}

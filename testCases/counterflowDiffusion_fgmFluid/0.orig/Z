@@ -1,0 +1,11 @@
+FoamFile { format ascii; class volScalarField; object Z; }
+dimensions [0 0 0 0 0 0 0];
+internalField uniform 0.2;
+boundaryField
+{
+    inlet { type fixedValue; value uniform 0.2; }
+    outlet { type zeroGradient; }
+    upperWall { type symmetry; }
+    lowerWall { type symmetry; }
+    frontAndBack { type empty; }
+}

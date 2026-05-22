@@ -25,14 +25,20 @@ Class
     Foam::combustionModels::FGM
 
 Description
-    Flamelet-Generated Manifold (FGM) combustion model.
+    Diffusion-flame Flamelet-Generated Manifold (FPV + presumed beta-PDF)
+    combustion model.
 
-    Reads a 1D lookup table from constant/fgmProperties and maps the
-    progress variable (PV) to reaction source terms. PV is treated as
-    a regular species Yi in the multicomponentFluid solver.
+    The mixture fraction Z and progress variable C are transported as
+    regular species Yi in the multicomponentFluid solver (the "piggyback"
+    coupling): Z carries no source, C is driven by the tabulated source
+    omega_C. The mixture-fraction subgrid variance is closed algebraically
+    for LES,
+        Zvar = Cv * Delta^2 * |grad(Z~)|^2,
+    and the segregation factor gZ = Zvar/(Z~(1-Z~)) together with Z~ and C~
+    indexes the 3-D FGM table (see FGMTable) to return omega_C.
 
-    For Step 1, Qdot returns zero. Temperature evolution relies on
-    species transport and thermodynamic coupling.
+    Qdot returns zero; temperature follows from species transport and the
+    real-fluid thermodynamic coupling.
 
 SourceFiles
     FGM.C
@@ -65,11 +71,20 @@ class FGM
         //- FGM lookup table
         FGMTable table_;
 
-        //- Name of the progress variable species
-        word pvName_;
+        //- Name of the mixture-fraction species
+        word zName_;
+
+        //- Name of the progress-variable species
+        word cName_;
+
+        //- Index of the mixture fraction in the species list
+        label zIndex_;
 
         //- Index of the progress variable in the species list
-        label pvIndex_;
+        label cIndex_;
+
+        //- LES mixture-fraction variance coefficient (Cv)
+        scalar Cv_;
 
         //- Cached source term for progress variable [kg/m^3/s]
         volScalarField::Internal sourcePV_;

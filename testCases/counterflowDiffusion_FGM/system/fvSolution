@@ -1,0 +1,19 @@
+FoamFile { format ascii; class dictionary; object fvSolution; }
+
+solvers
+{
+    "rho.*" { solver diagonal; }
+    p { solver PCG; preconditioner DIC; tolerance 1e-6; relTol 0.01; }
+    pFinal { $p; relTol 0; }
+    "(U|h|Yi|PV|air|Z|C)" { solver PBiCGStab; preconditioner DILU; tolerance 1e-6; relTol 0.1; }
+    "(U|h|Yi|PV|air|Z|C)Final" { $U; relTol 0; }
+    Yi { solver PBiCGStab; preconditioner DILU; tolerance 1e-6; relTol 0.1; }
+    YiFinal { $Yi; relTol 0; }
+}
+
+PIMPLE
+{
+    nOuterCorrectors 1;
+    nCorrectors 2;
+    nNonOrthogonalCorrectors 0;
+}
