@@ -203,10 +203,14 @@ protected:
         //- Methane reference viscosity mu_o(rho_o, T_o) [Pa.s].
         //  Three-term decomposition per Hanley-McCarty-Haynes 1975:
         //    mu_o = mu_o*(T_o) + mu_o**(T_o) * rho_o + Delta_mu_o(rho_o, T_o)
+        //  Per Oefelein (AIAA 2019-0634) Eq. (47) the Enskog correction
+        //  X_eta multiplies ONLY the dense correction Delta_mu_o:
+        //    mu_o = mu*_o + mu**_o*rho + Delta_mu_o * X_eta
         inline scalar muRef
         (
             const scalar rhoO,
-            const scalar TO
+            const scalar TO,
+            const scalar X_eta = 1.0
         ) const;
 
         //- Methane reference *translational* thermal conductivity [W/m/K].
@@ -217,10 +221,49 @@ protected:
         //  The methane *internal-mode* contribution is intentionally
         //  excluded here and is reintroduced in kappa() via Modified
         //  Eucken on the target fluid's Cp_ig.
+        //  Per Oefelein Eq. (51) X_lam multiplies ONLY the dense
+        //  correction Delta_lambda_o:
+        //    lambda_o = lambda*_o + lambda**_o*rho + Delta_lambda_o * X_lam
         inline scalar lambdaRef
         (
             const scalar rhoO,
-            const scalar TO
+            const scalar TO,
+            const scalar X_lam = 1.0
+        ) const;
+
+        //- Methane reference mass density [kg/m^3] from the SRK EoS at the
+        //  ECS-mapped reference state (T_o, P_o).  Replaces the density
+        //  scaling rho_o = rho_x * h_x, which for dense fluids maps to an
+        //  UNPHYSICAL methane density (e.g. O2 liquid -> rho_o ~ 850 > methane
+        //  max ~538) that railed against the rho_o clamp and made the HHM
+        //  dense term over-predict mu/kappa by 100s of %.  Solving the
+        //  methane SRK cubic at (T_o, P_o = p*h_x/f_x) keeps rho_o physical
+        //  (<= M_o/b ~ 538 kg/m^3), eliminating the rail.  Root chosen by
+        //  minimum fugacity (stable phase), matching the Pedersen/marlim3
+        //  corresponding-states implementation.  Validated O2 mu MAPE
+        //  33 -> 3.2 %, H2O 87 -> 36.5 % (test/proto_eosdensity.py).
+        inline scalar srkMethaneRho(const scalar T, const scalar P) const;
+
+        //- Pedersen-Fredenslund corresponding-states mapping (Pedersen,
+        //  Fredenslund & Thomassen 1989 / PVTSIM / Petrobras marlim3).
+        //  Replaces the LCL theta,phi shape factors + Enskog X with the
+        //  critical-property-ratio mapping (which aligns the target and
+        //  methane critical points by construction, removing the
+        //  phase-misalignment 'bump' near the target pseudo-critical) plus
+        //  the smooth rotational-coupling alpha(rho_R, MW) correction.
+        //  Fills the methane reference state (TRef [K], rhoO [kg/m3] via
+        //  srkMethaneRho) and the scaling factor
+        //    base = (Tcmix/TcO)^(-1/6) (Pcmix/PcO)^(2/3) (alpha_mix/alpha_0)
+        //  with F_eta = base*sqrt(MWmix/MO), F_lam = base*sqrt(MO/MWmix).
+        //  MWmix is the Pedersen mixture molar weight.
+        inline void pedersenMap
+        (
+            const scalar p,
+            const scalar T,
+            scalar& TRef,
+            scalar& rhoO,
+            scalar& base,
+            scalar& MWmix
         ) const;
 
         //- Enskog size-difference correction X_eta (Ely 1981 Eq. 53)

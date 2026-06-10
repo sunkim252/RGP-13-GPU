@@ -103,11 +103,22 @@ protected:
         //- Mixture-fraction segregation factor gZ = Zvar/(Z~(1-Z~)) (derived)
         volScalarField gZ_;
 
+        //- Scalar dissipation rate at Z = Z_st [1/s] (derived per cell from
+        //  Pitsch-Steiner 2000: chi_st = chi_tilde * f(Z_st)/f(Z~), with
+        //  chi_tilde = 2 D_eff |grad Z|^2 and the textbook polynomial
+        //  shape f(Z) = Z(1-Z) used in place of exp(-2[erfc^-1(2Z)]^2)).
+        volScalarField chi_st_;
+
         //- Cached volumetric PV source rho*omega_C [kg/m^3/s]
         volScalarField sourcePV_;
 
         //- LES mixture-fraction variance coefficient (Cv)
         scalar Cv_;
+
+        //- Bilger stoichiometric mixture fraction (mass-based). Default
+        //  0.0625 for LOX/Russian rocket kerosene; override in
+        //  fgmProperties via 'Z_st'.
+        scalar Z_st_;
 
         //- Per-variable Lewis numbers, keyed by field name ("Z", "C", and
         //  -- in the future differential-diffusion extension -- per species).
@@ -116,6 +127,14 @@ protected:
 
         //- Turbulent Schmidt number for the control-variable subgrid flux
         scalar Sct_;
+
+        //- Mixture-fraction variance closure regime, auto-selected from the
+        //  momentum-transport "simulationType":
+        //    les     -> mixing length L = Delta = V^(1/3)   (subgrid filter)
+        //    ras     -> mixing length L = k^(3/2)/epsilon   (integral scale)
+        //    laminar -> L = 0 (no unresolved variance; gZ -> 0)
+        enum class varModel { laminar, ras, les };
+        varModel varModel_;
 
         //- Indices of thermo species that are tabulated as Y_<sp>
         labelList tabSpecieIDs_;
@@ -147,6 +166,12 @@ private:
         //  Le defaults to 1. This is the single extension point for non-unity
         //  Lewis numbers and future per-species differential diffusion.
         tmp<volScalarField> Deff(const word& var);
+
+        //- Mixture-fraction variance mixing-length squared L^2 [m^2] per cell,
+        //  auto-selected from the momentum-transport simulationType (LES filter
+        //  width / RAS integral length / laminar zero). Used in the algebraic
+        //  variance closure Zvar = Cv * L^2 * |grad Z~|^2.
+        tmp<scalarField> varianceLengthSqr();
 
 
 public:

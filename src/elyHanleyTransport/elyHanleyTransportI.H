@@ -165,9 +165,10 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::phiShape
     // identity zone to [0.75, 1.75], moving the transition into
     // T = 270-348 K for O2 and producing a visible kink near 300 K
     // in test/O2_phase2.
-    const scalar w = 0.5;
-    const scalar Vp = softClamp(Vri, 0.5, 2.0, w);
-    const scalar Tp = softClamp(Tri, 0.5, 2.0, w);
+    // Hard clamp per Oefelein (AIAA 2019-0634) Eqs. (45)-(46):
+    //   V^+ = max(1/2, min(Vri, 2)),  T^+ = max(1/2, min(Tri, 2))
+    const scalar Vp = max(scalar(0.5), min(Vri, scalar(2.0)));
+    const scalar Tp = max(scalar(0.5), min(Tri, scalar(2.0)));
     // Leach-Chappelear-Leland 1968 Table 1 coefficients (methane ref).
     const scalar a1 =  0.3409;  // c_phi1
     const scalar a2 =  1.0054;  // c_phi2
@@ -192,9 +193,10 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::thetaShape
     // identity-on-[0.5, 2] geometry as phiShape — see the comment
     // there for why w was widened from 0.25 (kink in mu, kappa near
     // 300 K for O2 in test/O2_phase2).
-    const scalar w = 0.5;
-    const scalar Vp = softClamp(Vri, 0.5, 2.0, w);
-    const scalar Tp = softClamp(Tri, 0.5, 2.0, w);
+    // Hard clamp per Oefelein (AIAA 2019-0634) Eqs. (45)-(46):
+    //   V^+ = max(1/2, min(Vri, 2)),  T^+ = max(1/2, min(Tri, 2))
+    const scalar Vp = max(scalar(0.5), min(Vri, scalar(2.0)));
+    const scalar Tp = max(scalar(0.5), min(Tri, scalar(2.0)));
     const scalar b1 =  0.0892;  // c_theta1
     const scalar b2 = -0.3680;  // c_theta2
     const scalar b3 =  0.8464;  // c_theta3
@@ -214,20 +216,39 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::muStarO
     const scalar TO
 ) const
 {
-    // Sutherland fit to CoolProp methane in the dilute (zero-density)
-    // limit, T in [100, 2000] K:
-    //   mu*_o(T) = mu0 (T/T0)^1.5 (T0 + S)/(T + S),
-    //   mu0 = 1.130893e-5 Pa.s @ T0 = 300 K, S = 195.78 K.
-    // Median |err| 1.53 %, 95th 2.57 %, max 4.12 % on the fit grid.
-    // Lower-bounded at 40 K to keep pow/(T+S) safe; the asymptotic
-    // T^(1/2) tail makes the fit safe to extrapolate well past the
-    // upper edge of the fit window, which matters for low-T_c targets
-    // (e.g. H2 with f_x ~ 0.15 maps T = 300 K -> T_o ~ 2 kK).
+    // HHM-form Oefelein Eq. (48) 9-term polynomial:
+    //   mu*_o(T) = sum_{n=1..9} a_n T^((n-4)/3)  [Pa.s]
+    // Coefficients least-squares fitted to CoolProp methane dilute viscosity
+    // (P -> 0) on a 200-point grid over T in [95, 2000] K. Residuals are at
+    // machine precision (9 parameters, 200 points, smooth function). The
+    // polynomial is monotonically rising and well-behaved on extrapolation
+    // to ~10 kK (light-fluid mapping: H2 with f_x ~ 0.17 puts T = 1 kK at
+    // T_o ~ 6 kK, well within the smooth extrapolation regime).
+    //
+    // Replaces the previous Sutherland approximation (median 1.53 %,
+    // max 4.12 % error). The 9-term form matches the original HHM 1975
+    // structure and Oefelein 2019 Eq. (48); the asymptotic saturation
+    // discussed in the old comment was an artefact of T_o softClamp upper
+    // bound, not of the polynomial itself.
     const scalar T_dilute = max(scalar(40), TO);
-    const scalar muMu0 = 1.130893e-05;
-    const scalar muT0  = 300.0;
-    const scalar muS   = 195.7781;
-    return muMu0*pow(T_dilute/muT0, 1.5)*(muT0 + muS)/(T_dilute + muS);
+    const scalar t      = T_dilute;
+    const scalar t13    = cbrt(t);              // T^(1/3)
+    const scalar t23    = t13*t13;              // T^(2/3)
+    const scalar t43    = t*t13;                // T^(4/3)
+    const scalar t53    = t*t23;                // T^(5/3)
+    const scalar inv_t13 = 1.0/t13;             // T^(-1/3)
+    const scalar inv_t23 = 1.0/t23;             // T^(-2/3)
+    const scalar inv_t   = 1.0/t;               // T^(-1)
+    return
+        ( 1.674132e-05)*inv_t
+      + (-2.761685e-05)*inv_t23
+      + ( 2.091559e-05)*inv_t13
+      + (-8.819240e-06)
+      + ( 3.533633e-07)*t13
+      + ( 3.914929e-07)*t23
+      + (-9.347888e-09)*t
+      + ( 2.112902e-10)*t43
+      + (-2.398066e-12)*t53;
 }
 
 
@@ -237,7 +258,8 @@ template<class Thermo>
 inline Foam::scalar Foam::elyHanleyTransport<Thermo>::muRef
 (
     const scalar rhoO,
-    const scalar TO
+    const scalar TO,
+    const scalar X_eta
 ) const
 {
     // Hanley-McCarty-Haynes 1975 methane reference viscosity (Oefelein
@@ -285,8 +307,16 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::muRef
     // polynomial would saturate at the upper softClamp boundary and
     // produce a flat mu(T) past T = T_o,sat * f_x, which surfaced as
     // a constant ~9e-6 Pa.s mu_H2 above ~350 K.
-    const scalar T_clip   = softClamp(TO,   133.0, 2000.0, 30.0); // for HHM dense fit
-    const scalar rho_clip = softClamp(rhoO,   0.0,  569.0, 80.0);
+    // T_o floor lowered 133 -> 40 K (Oefelein p.12 methane-ref validity).
+    // This is safe now that rho_o comes from srkMethaneRho (physical, <=538
+    // kg/m^3) instead of the rho_x*h_x scaling that railed against the 569
+    // clamp. With the EoS density the cold-dense over-prediction is gone
+    // (O2 mu MAPE 33 -> ~4 %, H2O 87 -> ~36 %; test/proto_eosdensity.py).
+    // The 2000 K ceiling is kept (light fluids like H2 map to very high T_o
+    // where the dilute polynomial must not extrapolate). rho_o clamp kept as
+    // a backstop; SRK already bounds rho_o below it.
+    const scalar T_clip   = softClamp(TO,    40.0, 2000.0, 30.0); // methane ref 40-2000 K
+    const scalar rho_clip = softClamp(rhoO,   0.0,  569.0, 80.0); // HHM rho_c,o*3.5
 
     // ----- mu*_o(T) : Sutherland fit to CoolProp methane (zero-density)
     // Delegated to muStarO(); see the helper for the fit constants and
@@ -331,7 +361,8 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::muRef
     const scalar dMuDense =
         exp(cmu1 + cmu2*Tinv) * (exp(inner) - 1.0);
 
-    return muStar + muStarStar*rho_clip + dMuDense;  // Pa.s
+    // Oefelein Eq. (47): X_eta multiplies only the dense correction.
+    return muStar + muStarStar*rho_clip + dMuDense*X_eta;  // Pa.s
 }
 
 
@@ -341,7 +372,8 @@ template<class Thermo>
 inline Foam::scalar Foam::elyHanleyTransport<Thermo>::lambdaRef
 (
     const scalar rhoO,
-    const scalar TO
+    const scalar TO,
+    const scalar X_lam
 ) const
 {
     // Methane *translational* thermal conductivity in the methane (ECS)
@@ -375,7 +407,7 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::lambdaRef
     // there) — needed because methane reference loses physical
     // correspondence with the target fluid at very low T_o / very
     // high rho_o.
-    const scalar T_clip   = softClamp(TO,   133.0, 2000.0, 30.0);
+    const scalar T_clip   = softClamp(TO,    40.0, 2000.0, 30.0); // 40 K floor; see muRef note
     const scalar rho_clip = softClamp(rhoO,   0.0,  569.0, 80.0);
 
     // ----- lambda*_o(T) : Oefelein Eq. (52), monatomic Eucken on
@@ -411,11 +443,20 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::lambdaRef
     const scalar inner_raw =
           (clam3 + clam4/T_15)*rho01
         + (rho_r_o - 1.0)*rho05*(clam5 + clam6*Tinv + clam7*Tinv*Tinv);
-    const scalar inner = max(scalar(-10), min(inner_raw, scalar(10)));
+    // Overflow guard widened +-10 -> +-50 (matches muRef). The old +-10 cap
+    // FIRED in the normal dense-liquid regime (inner_raw ~ 19 for cold-dense
+    // methane), zeroing the dominant Delta_lambda_o term and collapsing the
+    // liquid kappa to its dilute+initial value (methane 100 K/10 MPa: clip10
+    // gives 0.064 vs NIST 0.20 W/m/K, -68 %; clip50 gives 0.196, -2 %). This
+    // was tolerable only while rho_o railed at the 569 clamp; with the
+    // physical srkMethaneRho density inner_raw stays ~19 (<50), so +-50 never
+    // fires in-regime and only guards true fp64 overflow. (2026-06-10)
+    const scalar inner = max(scalar(-50), min(inner_raw, scalar(50)));
     const scalar dLamDense =
         exp(clam1 + clam2*Tinv) * (exp(inner) - 1.0);
 
-    return lamStar + lamStarStar*rho_clip + dLamDense;   // W/m/K
+    // Oefelein Eq. (51): X_lam multiplies only the dense correction.
+    return lamStar + lamStarStar*rho_clip + dLamDense*X_lam;   // W/m/K
 }
 
 
@@ -457,6 +498,149 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::enskogXlam
 }
 
 
+// * * * * * * * * * * Methane reference SRK density * * * * * * * * * * * * //
+
+template<class Thermo>
+inline Foam::scalar Foam::elyHanleyTransport<Thermo>::srkMethaneRho
+(
+    const scalar T,
+    const scalar P
+) const
+{
+    // SRK EoS for the pure methane reference fluid. Constants are the
+    // reference-fluid criticals (TcO_, omegaO_) with the methane Pc and W.
+    const scalar RR = Foam::constant::thermodynamic::RR;   // J/(kmol K)
+    const scalar Pc = 4.5992e6;                            // methane Pc [Pa]
+    const scalar mfac = 0.480 + 1.574*omegaO_ - 0.176*sqr(omegaO_);
+    const scalar sAlpha = 1.0 + mfac*(1.0 - sqrt(T/TcO_));
+    const scalar aAlpha = 0.42748*sqr(RR)*sqr(TcO_)/Pc*sqr(sAlpha);
+    const scalar b      = 0.08664*RR*TcO_/Pc;
+
+    const scalar A = aAlpha*P/sqr(RR*T);
+    const scalar B = b*P/(RR*T);
+
+    // Cubic  Z^3 - Z^2 + (A - B - B^2) Z - A B = 0  (same Cardano form as
+    // SRKGas::Z), but the root is selected by minimum fugacity so the dense
+    // (liquid) branch is taken for compressed-liquid methane reference states
+    // -- SRKGas picks the max (vapour) root, which is wrong for T_o < T_c,o.
+    const scalar a2 = -1.0;
+    const scalar a1 = A - B - sqr(B);
+    const scalar a0 = -A*B;
+    const scalar Q  = (3.0*a1 - sqr(a2))/9.0;
+    const scalar Rl = (9.0*a2*a1 - 27.0*a0 - 2.0*a2*a2*a2)/54.0;
+    const scalar Q3 = Q*Q*Q;
+    const scalar D  = Q3 + Rl*Rl;
+
+    scalar Zsel = 1.0;
+    if (D <= 0)
+    {
+        // three real roots: choose the one with the smallest ln(phi)
+        const scalar th = ::acos(max(scalar(-1), min(scalar(1), Rl/sqrt(-Q3))));
+        const scalar qm = 2.0*sqrt(-Q);
+        const scalar pi = constant::mathematical::pi;
+        const scalar r[3] =
+        {
+            qm*cos(th/3.0) - a2/3.0,
+            qm*cos((th + 2.0*pi)/3.0) - a2/3.0,
+            qm*cos((th + 4.0*pi)/3.0) - a2/3.0
+        };
+        scalar best = great;
+        for (int i = 0; i < 3; i++)
+        {
+            const scalar Zi = r[i];
+            if (Zi > B)
+            {
+                const scalar lnphi =
+                    Zi - 1.0 - log(max(Zi - B, scalar(1e-30)))
+                  - (A/B)*log(1.0 + B/Zi);
+                if (lnphi < best) { best = lnphi; Zsel = Zi; }
+            }
+        }
+    }
+    else
+    {
+        const scalar D05 = sqrt(D);
+        const scalar S = (Rl + D05 < 0) ? -cbrt(mag(Rl + D05)) : cbrt(Rl + D05);
+        const scalar Tl = (D05 > Rl)    ? -cbrt(mag(Rl - D05)) : cbrt(Rl - D05);
+        Zsel = S + Tl - a2/3.0;
+    }
+
+    const scalar Vm = Zsel*RR*T/P;            // m^3/kmol
+    return MO_/max(Vm, scalar(1e-30));        // kg/m^3
+}
+
+
+// * * * * * * * * Pedersen corresponding-states mapping * * * * * * * * * * //
+
+template<class Thermo>
+inline void Foam::elyHanleyTransport<Thermo>::pedersenMap
+(
+    const scalar p,
+    const scalar T,
+    scalar& TRef,
+    scalar& rhoO,
+    scalar& base,
+    scalar& MWmix
+) const
+{
+    const scalar RR = Foam::constant::thermodynamic::RR;
+    const scalar PcO = 4.5992e6;                       // methane Pc [Pa]
+
+    // ----- Pedersen mixture criticals from per-component diagonals -----
+    // Tcmd_[i][i], Pcmd_[i][i], Mmd_[i][i] are the PURE-component criticals
+    // (SRKelyHanleyMixture.C: TCMD[i][i]=ListTc_[i] etc.).
+    // Mixture molar weight. NB Mmd_[i][i] is the Fuller reduced mass (~2/M_i),
+    // NOT the molar weight, so it must NOT be used here -- MM_ is the actual
+    // mixture molar weight and the Pedersen MWn/MWw blend differs from it by
+    // < 0.1 % for the kerosene surrogate, so MM_ is used directly.
+    MWmix = MM_;
+    scalar Tcmix, Pcmix;
+    const label n = Xmd_.size();
+    if (n <= 1)
+    {
+        Tcmix = TcM_;
+        Pcmix = ZcM_*RR*TcM_/max(VcM_, scalar(1e-30));
+    }
+    else
+    {
+        // Pedersen Eqs. 11-27..11-30: Tcmix, Pcmix combining rule
+        scalar num = 0, den = 0;
+        forAll(Xmd_, i)
+        {
+            const scalar ti = pow(Tcmd_[i][i]/max(Pcmd_[i][i], scalar(1e-30)), 1.0/3.0);
+            forAll(Xmd_, j)
+            {
+                const scalar tj =
+                    pow(Tcmd_[j][j]/max(Pcmd_[j][j], scalar(1e-30)), 1.0/3.0);
+                const scalar v  = pow(ti + tj, 3.0);
+                const scalar xx = Xmd_[i]*Xmd_[j];
+                num += xx*v*sqrt(Tcmd_[i][i]*Tcmd_[j][j]);
+                den += xx*v;
+            }
+        }
+        Tcmix = num/max(den, scalar(1e-30));
+        Pcmix = 8.0*num/max(den*den, scalar(1e-30));
+    }
+
+    // ----- base mapping by critical ratios (aligns critical points) -----
+    const scalar TR = T*TcO_/max(Tcmix, scalar(1e-30));
+    const scalar PR = p*PcO /max(Pcmix, scalar(1e-30));
+    const scalar rho = srkMethaneRho(TR, PR);
+
+    // ----- Pedersen alpha rotational-coupling correction -----
+    const scalar rhoR = rho/162.66;
+    const scalar a0   = 1.0 + 0.031*pow(rhoR, 1.847);
+    const scalar amix = 1.0 + 7.378e-3*pow(rhoR, 1.847)*pow(MWmix, 0.5173);
+    const scalar ar   = a0/max(amix, scalar(1e-30));
+
+    TRef = TR*ar;
+    const scalar PRef = PR*ar;
+    rhoO = srkMethaneRho(TRef, PRef);
+
+    base = pow(Tcmix/TcO_, -1.0/6.0)*pow(Pcmix/PcO, 2.0/3.0)*(amix/a0);
+}
+
+
 // * * * * * * * * * * Public mu, kappa, phi, Dimix * * * * * * * * * * * //
 
 template<class Thermo>
@@ -466,41 +650,20 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::mu
     const scalar T
 ) const
 {
-    // Pure ECS / Ely-Hanley evaluation for every species. The previous
-    // hybrid Chung short-circuit produced step jumps in mu(Y_mix) where
-    // the polarity selector flipped (e.g. Y_H2O ~ 0.86 in O2/H2O), so it
-    // has been removed in favour of a single continuous formula.
-    // Mixture reducing ratios f_x, h_x via shape factors of a pseudo-
-    // pure fluid with mixture critical parameters.
-    const scalar Vri    = (this->rho(p, T) > 0)
-                        ? (MM_/this->rho(p, T))/VcM_ : 1.0;
-    const scalar Tri    = T/max(TcM_, 1e-20);
-    const scalar phi_i  = phiShape(Vri, Tri, omegaM_);
-    const scalar theta_i = thetaShape(Vri, Tri, omegaM_);
+    // Pedersen-Fredenslund corresponding-states evaluation (see pedersenMap).
+    // The critical-ratio mapping aligns the target and methane critical
+    // points, so the methane reference changes phase at the SAME reduced
+    // state as the target -- this removes the pseudo-critical 'bump' that
+    // the LCL theta shape factor produced (e.g. CO2 ~300-360 K, H2O
+    // ~700-800 K, where LCL pushed T_o below methane T_c into the liquid
+    // branch while the target was already gas-like, over-predicting mu by
+    // 3-4x). Validated O2 mu 3.2->2.9, CO2 6.7->5.9, H2O 36->23, KERO
+    // 54->27 % MAPE (test/proto_pedersen.py).
+    scalar TRef, rhoO, base, MWmix;
+    pedersenMap(p, T, TRef, rhoO, base, MWmix);
 
-    const scalar hx = (VcM_/VcO_)*phi_i;
-    const scalar fx = (TcM_/TcO_)*theta_i;
-
-    const scalar rhoSI = this->rho(p, T);             // kg/m^3
-    const scalar rhoO  = rhoSI*hx;                    // scaled to methane frame
-    const scalar TO    = T/fx;
-
-    // Scaling factor F_mu per Oefelein Eq. (41)
-    const scalar F_mu =
-        sqrt(MM_/MO_)*sqrt(fx)*pow(hx, -2.0/3.0);
-
-    // Enskog correction with numerical dfx/dT
-    const scalar dT = max(1.0, 1e-3*T);
-    const scalar fx_p = (TcM_/TcO_)
-        *thetaShape(Vri, (T + dT)/TcM_, omegaM_);
-    const scalar fx_m = (TcM_/TcO_)
-        *thetaShape(Vri, (T - dT)/TcM_, omegaM_);
-    const scalar dfxdT = (fx_p - fx_m)/(2.0*dT);
-    const scalar X_eta = enskogXeta(T, fx, dfxdT);
-
-    const scalar muO = muRef(rhoO, TO);     // Pa.s
-
-    return F_mu*muO*X_eta;
+    const scalar F_eta = base*sqrt(MWmix/MO_);
+    return F_eta*muRef(rhoO, TRef);                // Pa.s  (X_eta = 1)
 }
 
 
@@ -526,36 +689,16 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::kappa
     // those modes activated at room T (~3x overprediction of k_H2
     // observed in test/H2_phase2 prior to this fix).
 
-    const scalar Vri    = (this->rho(p, T) > 0)
-                        ? (MM_/this->rho(p, T))/VcM_ : 1.0;
-    const scalar Tri    = T/max(TcM_, 1e-20);
-    const scalar phi_i   = phiShape(Vri, Tri, omegaM_);
-    const scalar theta_i = thetaShape(Vri, Tri, omegaM_);
-
-    const scalar hx = (VcM_/VcO_)*phi_i;
-    const scalar fx = (TcM_/TcO_)*theta_i;
-
-    const scalar rhoSI = this->rho(p, T);
-    const scalar rhoO  = rhoSI*hx;
-    const scalar TO    = T/fx;
-
-    // F_lam, F_mu per Oefelein Eqs. (41)-(42).
-    const scalar hx_m23 = pow(hx, -2.0/3.0);
-    const scalar sqrtfx = sqrt(fx);
-    const scalar F_lam = sqrt(MO_/MM_)*sqrtfx*hx_m23;
-    const scalar F_mu  = sqrt(MM_/MO_)*sqrtfx*hx_m23;
-
-    // Enskog X_lam with numerical dfx/dT (same as before).
-    const scalar dT = max(1.0, 1e-3*T);
-    const scalar fx_p = (TcM_/TcO_)
-        *thetaShape(Vri, (T + dT)/TcM_, omegaM_);
-    const scalar fx_m = (TcM_/TcO_)
-        *thetaShape(Vri, (T - dT)/TcM_, omegaM_);
-    const scalar dfxdT = (fx_p - fx_m)/(2.0*dT);
-    const scalar X_lam = enskogXlam(T, fx, dfxdT);
+    // Pedersen-Fredenslund corresponding-states mapping (see pedersenMap /
+    // mu()). Same critical-ratio + alpha mapping used for mu, so the
+    // translational kappa shares the methane reference state and is bump-free.
+    scalar TRef, rhoO, base, MWmix;
+    pedersenMap(p, T, TRef, rhoO, base, MWmix);
+    const scalar F_eta = base*sqrt(MWmix/MO_);
+    const scalar F_lam = base*sqrt(MO_/MWmix);
 
     // ----- ECS translational contribution -----
-    const scalar lamECS = F_lam*lambdaRef(rhoO, TO)*X_lam;     // W/m/K
+    const scalar lamECS = F_lam*lambdaRef(rhoO, TRef);        // W/m/K
 
     // ----- Modified Eucken internal-mode contribution -----
     // Mason-Monchick (1962); Reid-Prausnitz-Poling 5th ed. Eq. (10-3.14):
@@ -595,7 +738,7 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::kappa
     // < 1 % of Cp_ig. The extra cubic-Z solve cost is one per kappa()
     // call; acceptable given typical CFD call frequency.
     constexpr scalar p_ref_for_CpIg = 1.01325e5;
-    const scalar muTargetDilute = F_mu*muStarO(TO);            // Pa.s
+    const scalar muTargetDilute = F_eta*muStarO(TRef);        // Pa.s
     const scalar CpIg           = this->Cp(p_ref_for_CpIg, T); // J/(kg.K)
     const scalar Rs             = this->R();                   // J/(kg.K)
     const scalar CpInt          = CpIg - 2.5*Rs;               // internal-mode Cp
