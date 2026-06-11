@@ -199,9 +199,12 @@ the full enumeration of corrections and their derivations.
 4. Leach, J.W., Chappelear, P.S. & Leland, T.W. *Use of molecular
    shape factors in vapor-liquid equilibrium calculations with the
    corresponding states principle*. AIChE J. **14** (1968) 568.
-5. Hanley, H.J.M., McCarty, R.D. & Haynes, W.M. *The viscosity and
-   thermal conductivity coefficients of dilute and dense fluid
-   methane*. J. Phys. Chem. Ref. Data **4** (1975) 135.
+5. Hanley, H.J.M., McCarty, R.D. & Haynes, W.M. *Equations for the
+   viscosity and thermal conductivity coefficients of methane*.
+   Cryogenics **15** (1975) 413; and Hanley, H.J.M., Haynes, W.M. &
+   McCarty, R.D. *The viscosity and thermal conductivity coefficients
+   for dense gaseous and liquid methane*. J. Phys. Chem. Ref. Data
+   **6** (1977) 597.
 6. Ely, J.F. & Hanley, H.J.M. *Prediction of transport properties.
    1. Viscosity of fluids and mixtures*. Ind. Eng. Chem. Fundam.
    **20** (1981) 323.
