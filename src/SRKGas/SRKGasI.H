@@ -403,15 +403,55 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
 
     if (D <= 0)
     {
-        const scalar th = ::acos(Rl/sqrt(-Q3));
+        // Three real roots: smallest = liquid, largest = vapour, middle =
+        // mechanically unstable (dp/dv > 0, never the stable phase). Select
+        // the thermodynamically stable branch by minimum fugacity, i.e.
+        // minimum Gibbs energy (mu = mu0 + R T ln f), using the SRK
+        // analytic fugacity coefficient
+        //   ln(phi) = Z - 1 - ln(Z - B) - (A/B) ln(1 + B/Z).
+        // At p > psat(T) the liquid root wins, at p < psat the vapour root,
+        // and both coincide on the saturation line (Maxwell construction).
+        // The old max-root choice always returned the vapour branch, which
+        // for compressed-liquid states (e.g. LOX at 100-120 K, ~5 MPa)
+        // overestimates v by an order of magnitude. Pattern identical to
+        // elyHanleyTransport::srkMethaneRho (Pedersen/marlim3, validated in
+        // test/proto_eosdensity.py).
+        const scalar th = ::acos(max(scalar(-1), min(scalar(1), Rl/sqrt(-Q3))));
         const scalar qm = 2*sqrt(-Q);
-        const scalar r1 = qm*cos(th/3.0) - a2/3.0;
-        const scalar r2 =
-            qm*cos((th + 2*constant::mathematical::pi)/3.0) - a2/3.0;
-        const scalar r3 =
-            qm*cos((th + 4*constant::mathematical::pi)/3.0) - a2/3.0;
+        const scalar pi = constant::mathematical::pi;
+        const scalar r[3] =
+        {
+            qm*cos(th/3.0) - a2/3.0,
+            qm*cos((th + 2*pi)/3.0) - a2/3.0,
+            qm*cos((th + 4*pi)/3.0) - a2/3.0
+        };
 
-        root = max(r1, max(r2, r3));
+        scalar best = great;
+        for (int i = 0; i < 3; i++)
+        {
+            const scalar Zi = r[i];
+
+            // Physical roots only: Z > B <=> v > b (above the covolume)
+            if (Zi > B)
+            {
+                const scalar lnPhi =
+                    Zi - 1.0 - log(max(Zi - B, scalar(1e-30)))
+                  - (A/B)*log(1.0 + B/Zi);
+
+                if (lnPhi < best)
+                {
+                    best = lnPhi;
+                    root = Zi;
+                }
+            }
+        }
+
+        // Fallback (no root above the covolume -- pathological inputs):
+        // retain the legacy largest-root behaviour.
+        if (root < 0)
+        {
+            root = max(r[0], max(r[1], r[2]));
+        }
     }
     else
     {
