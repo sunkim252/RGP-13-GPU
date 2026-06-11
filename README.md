@@ -113,6 +113,29 @@ binaryInteraction
 }
 ```
 
+Recommended set for the LOX/kerosene FPV species (N2, CO2, O2, CO, KERO,
+H2O — KERO treated as an n-decane analog, M = 140.3, Tc = 635 K). Shipped in
+the FGM test-case `thermo.compressibleGas4S` dicts:
+
+| pair | kij | provenance |
+|---|---|---|
+| N2_O2   | -0.0119 | cryogenic-VLE compilations (Knapp et al. 1982 class) |
+| N2_CO2  | -0.017  | same |
+| O2_CO2  |  0.10   | estimate |
+| O2_H2O  | -0.015  | repo reference value |
+| CO2_H2O |  0.12   | T-dependent (0.07-0.3); combustion-range mean |
+| KERO_N2 |  0.13   | N2/n-decane |
+| KERO_CO2|  0.114  | CO2/n-decane |
+| KERO_O2 |  0.10   | estimate (N2 analog) |
+| KERO_CO |  0.10   | estimate (CO ~ N2) |
+| KERO_H2O|  0.45   | water/alkane nonideality (VLE-class) |
+
+Unlisted pairs (H2, remaining product pairs) default to 0 — those species only
+appear in hot, low-density regions where the attraction correction is
+negligible. Sensitivity at 52-55 bar: mixing-layer density shifts by up to
+-5.2 % (O2/KERO 70/30 by mass, 200 K); pure streams and 1500 K products are
+unaffected (0.0 %).
+
 ## Source layout
 
 ```
