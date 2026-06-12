@@ -169,8 +169,25 @@ Foam::SRKelyHanleyMixture<ThermoType>::calcMixture
         MM, VcM, TcM, omegaM, ZcM
     );
 
-    // Push SRK + Peneloux into the EoS slot
-    mixture_.updateEoS(bM, coef1, coef2, coef3, cM);
+    // Composition-weighted temperature-dependent Peneloux c(T) coefficients
+    // (Peneloux 1982: c_m linear in mole fraction). The liquid->gas ramp
+    // window is taken as the widest among the c(T)-active components.
+    scalar cMq0 = 0, cMq1 = 0, cMq2 = 0, cMTlo = 0, cMThi = 0;
+    forAll(CMq0_, i)
+    {
+        cMq0 += X[i]*CMq0_[i];
+        cMq1 += X[i]*CMq1_[i];
+        cMq2 += X[i]*CMq2_[i];
+        cMTlo = max(cMTlo, CMTlo_[i]);
+        cMThi = max(cMThi, CMThi_[i]);
+    }
+
+    // Push SRK + Peneloux (constant baseline cM + optional c(T)) into the EoS
+    mixture_.updateEoS
+    (
+        bM, coef1, coef2, coef3, cM,
+        cMq0, cMq1, cMq2, cMTlo, cMThi
+    );
 
     // Composition-dependent Tc, Pc matrices for Fuller + Takahashi
     // (mole-weighted pair averages; identical to SRKchungTakaMixture)
@@ -251,6 +268,11 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
     COEF2_(numberOfSpecies_),
     COEF3_(numberOfSpecies_),
     CM_(numberOfSpecies_, scalar(0)),
+    CMq0_(numberOfSpecies_, scalar(0)),
+    CMq1_(numberOfSpecies_, scalar(0)),
+    CMq2_(numberOfSpecies_, scalar(0)),
+    CMTlo_(numberOfSpecies_, scalar(0)),
+    CMThi_(numberOfSpecies_, scalar(0)),
     KIJ_(numberOfSpecies_),
     LIJ_(numberOfSpecies_),
     BIJ_(numberOfSpecies_),
@@ -270,6 +292,11 @@ Foam::SRKelyHanleyMixture<ThermoType>::SRKelyHanleyMixture
         ListVc_[i]    = this->specieThermos()[i].Vc();
         ListOmega_[i] = this->specieThermos()[i].omega();
         CM_[i]        = this->specieThermos()[i].c();
+        CMq0_[i]      = this->specieThermos()[i].cq0();
+        CMq1_[i]      = this->specieThermos()[i].cq1();
+        CMq2_[i]      = this->specieThermos()[i].cq2();
+        CMTlo_[i]     = this->specieThermos()[i].cTlo();
+        CMThi_[i]     = this->specieThermos()[i].cThi();
         BM_[i]        = 0.08664*RR
                        *this->specieThermos()[i].Tc()
                        /this->specieThermos()[i].Pc();

@@ -42,8 +42,12 @@ inline Foam::elyHanleyTransport<Thermo>::elyHanleyTransport
     //    Haynes 1975 reference state.)
     TcO_(190.564), VcO_(0.0992), MO_(16.043), omegaO_(0.011), ZcO_(0.286),
     Ymd_(Ymd), Xmd_(Xmd),
-    Tcmd_(Tcmd), Pcmd_(Pcmd), Mmd_(Mmd), sigmd_(sigmd)
-{}
+    Tcmd_(Tcmd), Pcmd_(Pcmd), Mmd_(Mmd), sigmd_(sigmd),
+    mapTfac_(0), mapPfac_(0), baseConst_(0), MWpow_(0),
+    cacheP_(0), cacheT_(-1), cacheTRef_(0), cacheRhoO_(0), cacheBase_(0)
+{
+    updatePedersenConst();
+}
 
 
 template<class Thermo>
@@ -60,7 +64,10 @@ inline Foam::elyHanleyTransport<Thermo>::elyHanleyTransport
     omegaO_(tr.omegaO_), ZcO_(tr.ZcO_),
     Ymd_(tr.Ymd_), Xmd_(tr.Xmd_),
     Tcmd_(tr.Tcmd_), Pcmd_(tr.Pcmd_),
-    Mmd_(tr.Mmd_), sigmd_(tr.sigmd_)
+    Mmd_(tr.Mmd_), sigmd_(tr.sigmd_),
+    mapTfac_(tr.mapTfac_), mapPfac_(tr.mapPfac_),
+    baseConst_(tr.baseConst_), MWpow_(tr.MWpow_),
+    cacheP_(0), cacheT_(-1), cacheTRef_(0), cacheRhoO_(0), cacheBase_(0)
 {}
 
 
@@ -573,27 +580,19 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::srkMethaneRho
 // * * * * * * * * Pedersen corresponding-states mapping * * * * * * * * * * //
 
 template<class Thermo>
-inline void Foam::elyHanleyTransport<Thermo>::pedersenMap
-(
-    const scalar p,
-    const scalar T,
-    scalar& TRef,
-    scalar& rhoO,
-    scalar& base,
-    scalar& MWmix
-) const
+inline void Foam::elyHanleyTransport<Thermo>::updatePedersenConst()
 {
+    // Composition-only Pedersen quantities, hoisted out of pedersenMap()'s
+    // per-(p,T) hot path. The O(N^2) combining rule and the critical-ratio
+    // powers depend only on composition/criticals, so they are evaluated once
+    // per composition update here instead of twice per cell (mu + kappa) per
+    // (p,T). Pure refactor -- pedersenMap() reads mapTfac_/mapPfac_/baseConst_/
+    // MWpow_ and is otherwise identical.
     const scalar RR = Foam::constant::thermodynamic::RR;
     const scalar PcO = 4.5992e6;                       // methane Pc [Pa]
 
-    // ----- Pedersen mixture criticals from per-component diagonals -----
-    // Tcmd_[i][i], Pcmd_[i][i], Mmd_[i][i] are the PURE-component criticals
-    // (SRKelyHanleyMixture.C: TCMD[i][i]=ListTc_[i] etc.).
-    // Mixture molar weight. NB Mmd_[i][i] is the Fuller reduced mass (~2/M_i),
-    // NOT the molar weight, so it must NOT be used here -- MM_ is the actual
-    // mixture molar weight and the Pedersen MWn/MWw blend differs from it by
-    // < 0.1 % for the kerosene surrogate, so MM_ is used directly.
-    MWmix = MM_;
+    // Pedersen mixture criticals from PURE-component diagonals Tcmd_[i][i],
+    // Pcmd_[i][i] (SRKelyHanleyMixture.C: TCMD[i][i]=ListTc_[i] etc.).
     scalar Tcmix, Pcmix;
     const label n = Xmd_.size();
     if (n <= 1)
@@ -622,22 +621,70 @@ inline void Foam::elyHanleyTransport<Thermo>::pedersenMap
         Pcmix = 8.0*num/max(den*den, scalar(1e-30));
     }
 
+    mapTfac_   = TcO_/max(Tcmix, scalar(1e-30));
+    mapPfac_   = PcO /max(Pcmix, scalar(1e-30));
+    baseConst_ = pow(Tcmix/TcO_, -1.0/6.0)*pow(Pcmix/PcO, 2.0/3.0);
+    MWpow_     = pow(MM_, 0.5173);
+
+    cacheT_ = -1;   // invalidate the (p,T) map cache (composition changed)
+}
+
+
+template<class Thermo>
+inline void Foam::elyHanleyTransport<Thermo>::pedersenMapCached
+(
+    const scalar p,
+    const scalar T,
+    scalar& TRef,
+    scalar& rhoO,
+    scalar& base,
+    scalar& MWmix
+) const
+{
+    MWmix = MM_;
+    if (T == cacheT_ && p == cacheP_)
+    {
+        TRef = cacheTRef_; rhoO = cacheRhoO_; base = cacheBase_;
+        return;
+    }
+    pedersenMap(p, T, TRef, rhoO, base, MWmix);
+    cacheP_ = p; cacheT_ = T;
+    cacheTRef_ = TRef; cacheRhoO_ = rhoO; cacheBase_ = base;
+}
+
+
+template<class Thermo>
+inline void Foam::elyHanleyTransport<Thermo>::pedersenMap
+(
+    const scalar p,
+    const scalar T,
+    scalar& TRef,
+    scalar& rhoO,
+    scalar& base,
+    scalar& MWmix
+) const
+{
+    // MM_ is the actual mixture molar weight (Mmd_[i][i] is the Fuller reduced
+    // mass ~2/M_i and must NOT be used here).
+    MWmix = MM_;
+
     // ----- base mapping by critical ratios (aligns critical points) -----
-    const scalar TR = T*TcO_/max(Tcmix, scalar(1e-30));
-    const scalar PR = p*PcO /max(Pcmix, scalar(1e-30));
+    // mapTfac_ = Tc0/Tcmix, mapPfac_ = Pc0_CH4/Pcmix (precomputed).
+    const scalar TR = T*mapTfac_;
+    const scalar PR = p*mapPfac_;
     const scalar rho = srkMethaneRho(TR, PR);
 
     // ----- Pedersen alpha rotational-coupling correction -----
-    const scalar rhoR = rho/162.66;
-    const scalar a0   = 1.0 + 0.031*pow(rhoR, 1.847);
-    const scalar amix = 1.0 + 7.378e-3*pow(rhoR, 1.847)*pow(MWmix, 0.5173);
-    const scalar ar   = a0/max(amix, scalar(1e-30));
+    const scalar rhoRp = pow(rho/162.66, 1.847);       // single pow
+    const scalar a0    = 1.0 + 0.031*rhoRp;
+    const scalar amix  = 1.0 + 7.378e-3*rhoRp*MWpow_;
+    const scalar ar    = a0/max(amix, scalar(1e-30));
 
     TRef = TR*ar;
     const scalar PRef = PR*ar;
     rhoO = srkMethaneRho(TRef, PRef);
 
-    base = pow(Tcmix/TcO_, -1.0/6.0)*pow(Pcmix/PcO, 2.0/3.0)*(amix/a0);
+    base = baseConst_*(amix/a0);
 }
 
 
@@ -660,7 +707,7 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::mu
     // 3-4x). Validated O2 mu 3.2->2.9, CO2 6.7->5.9, H2O 36->23, KERO
     // 54->27 % MAPE (test/proto_pedersen.py).
     scalar TRef, rhoO, base, MWmix;
-    pedersenMap(p, T, TRef, rhoO, base, MWmix);
+    pedersenMapCached(p, T, TRef, rhoO, base, MWmix);
 
     const scalar F_eta = base*sqrt(MWmix/MO_);
     return F_eta*muRef(rhoO, TRef);                // Pa.s  (X_eta = 1)
@@ -693,7 +740,7 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::kappa
     // mu()). Same critical-ratio + alpha mapping used for mu, so the
     // translational kappa shares the methane reference state and is bump-free.
     scalar TRef, rhoO, base, MWmix;
-    pedersenMap(p, T, TRef, rhoO, base, MWmix);
+    pedersenMapCached(p, T, TRef, rhoO, base, MWmix);
     const scalar F_eta = base*sqrt(MWmix/MO_);
     const scalar F_lam = base*sqrt(MO_/MWmix);
 
@@ -731,13 +778,16 @@ inline Foam::scalar Foam::elyHanleyTransport<Thermo>::kappa
     // lambdaRef (translational density correction).
     //
     // Cleanest portable evaluation: call this->Cp(p_ref, T) at a low
-    // reference pressure where the SRK Cp departure is negligible.
-    // p_ref = 1 atm = 101325 Pa: at T = 300 K, B = b*p/RT ~ 9e-4 and
-    // Cp_dep is O(0.01 %) of Cp_ig; even at T = 100 K (above O2 NBP =
-    // 90 K so single-phase vapour at 1 atm) the SRK Cp departure is
-    // < 1 % of Cp_ig. The extra cubic-Z solve cost is one per kappa()
-    // call; acceptable given typical CFD call frequency.
-    constexpr scalar p_ref_for_CpIg = 1.01325e5;
+    // reference pressure where the SRK Cp departure is negligible (-> Cp_ig).
+    // p_ref must keep ALL species single-phase VAPOUR over the operating T
+    // range. 1 atm fails for H2O: below its 1-atm boiling point (373 K) the
+    // SRK cubic returns a compressed-LIQUID root, so Cp(1 atm, T<373) carries
+    // a large liquid departure and the internal Eucken term jumps where the
+    // root flips (~380 K), producing a spurious kappa step (observed both at
+    // 250 and 500 bar at the same T => fixed-p_ref artefact, not physical).
+    // p_ref = 100 Pa << P_sat(H2O, 300 K) = 3.5 kPa guarantees vapour for all
+    // species over 300-2000 K, so Cp(p_ref) == Cp_ig to machine precision.
+    constexpr scalar p_ref_for_CpIg = 100.0;
     const scalar muTargetDilute = F_eta*muStarO(TRef);        // Pa.s
     const scalar CpIg           = this->Cp(p_ref_for_CpIg, T); // J/(kg.K)
     const scalar Rs             = this->R();                   // J/(kg.K)
@@ -884,6 +934,9 @@ inline void Foam::elyHanleyTransport<Thermo>::updateTRANS
     Ymd_ = Ymd; Xmd_ = Xmd;
     Tcmd_ = Tcmd; Pcmd_ = Pcmd;
     Mmd_ = Mmd; sigmd_ = sigmd;
+
+    // Re-derive the composition-only Pedersen constants for the hot path.
+    updatePedersenConst();
 }
 
 
@@ -906,6 +959,7 @@ inline void Foam::elyHanleyTransport<Thermo>::operator=
     Ymd_ = tr.Ymd_; Xmd_ = tr.Xmd_;
     Tcmd_ = tr.Tcmd_; Pcmd_ = tr.Pcmd_;
     Mmd_ = tr.Mmd_; sigmd_ = tr.sigmd_;
+    updatePedersenConst();
 }
 
 
@@ -927,6 +981,7 @@ inline void Foam::elyHanleyTransport<Thermo>::operator+=
         omegaM_ = X1*omegaM_ + X2*tr.omegaM_;
         ZcM_    = X1*ZcM_    + X2*tr.ZcM_;
     }
+    updatePedersenConst();
 }
 
 

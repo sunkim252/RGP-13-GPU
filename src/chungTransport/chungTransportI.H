@@ -62,7 +62,9 @@ inline Foam::chungTransport<Thermo>::chungTransport
     Tcmd_(Tcmd),
     Pcmd_(Pcmd),
     Mmd_(Mmd),
-    sigmd_(sigmd)
+    sigmd_(sigmd),
+    cacheP_(0), cacheT_(-1), cacheTstar_(0), cacheMur_(0),
+    cacheEta0_(0), cacheY_(0), cacheG1_(0)
 {}
 
 
@@ -87,7 +89,9 @@ inline Foam::chungTransport<Thermo>::chungTransport
     Tcmd_(ch.Tcmd_),
     Pcmd_(ch.Pcmd_),
     Mmd_(ch.Mmd_),
-    sigmd_(ch.sigmd_)
+    sigmd_(ch.sigmd_),
+    cacheP_(0), cacheT_(-1), cacheTstar_(0), cacheMur_(0),
+    cacheEta0_(0), cacheY_(0), cacheG1_(0)
 {}
 
 
@@ -116,6 +120,18 @@ inline void Foam::chungTransport<Thermo>::calculate
     scalar& G1
 ) const
 {
+    // Single-entry (p,T) cache: RhoFluidThermo evaluates mu(p,T) then
+    // kappa(p,T) with the same (p,T) on one transportMixture, so the second
+    // call reuses this result -- saving the rho(p,T) cubic solve and the
+    // collision-integral Omega* (exp/pow/sin). Invalidated on composition
+    // change (updateTRANS). mutable: OpenFOAM serial per-process cell loop.
+    if (T == cacheT_ && p == cacheP_)
+    {
+        Tstar = cacheTstar_; mur = cacheMur_; eta0 = cacheEta0_;
+        Y = cacheY_; G1 = cacheG1_;
+        return;
+    }
+
     const scalar A=1.16145 , B=0.14874, C=0.52487 , D=0.77320 , E=2.16178;
     const scalar F=2.43787 , G= -6.435e-4, H=7.27371, S=18.0323, W=-0.76830;
 
@@ -146,6 +162,11 @@ inline void Foam::chungTransport<Thermo>::calculate
     // Calculate G1 term in eq (10)
     const scalar oneMinusY = 1.0 - Y;
     G1 = (1.0 -  0.5*Y)/(oneMinusY*oneMinusY*oneMinusY);
+
+    // store in the (p,T) cache for the matching kappa()/mu() call
+    cacheP_ = p; cacheT_ = T;
+    cacheTstar_ = Tstar; cacheMur_ = mur; cacheEta0_ = eta0;
+    cacheY_ = Y; cacheG1_ = G1;
 }
 
 
@@ -264,9 +285,14 @@ inline Foam::scalar Foam::chungTransport<Thermo>::kappa
         // departure (the pseudo-critical Cp peak, e.g. O2 near Tc/100 bar
         // shows Cp_real ~ 4500 vs Cp_ig ~ 920 J/kg/K). Feeding that into
         // alpha inflates Psi and over-predicts kappa in the dense region.
-        // Recover Cp_ig by evaluating at a low reference pressure (1 atm)
-        // where the SRK departure is < 1 %. Mirrors elyHanleyTransport.
-        const scalar pRefCpIg = 1.01325e5;
+        // Recover Cp_ig by evaluating at a low reference pressure where the
+        // SRK departure is negligible AND the fluid stays single-phase vapour.
+        // 1 atm fails near a species' 1-atm boiling point (e.g. H2O at 373 K,
+        // O2 at 90 K) where the cubic returns a compressed-liquid root, so
+        // Cp(1 atm) carries a liquid departure and Cv0 jumps. p_ref = 100 Pa
+        // keeps all species vapour over the operating range. Mirrors
+        // elyHanleyTransport.
+        const scalar pRefCpIg = 100.0;
         scalar CvIdeal = this->Cp(pRefCpIg, T) - this->R();
         scalar Cv = CvIdeal*this->W()*0.2388e-3;
 
@@ -539,6 +565,8 @@ inline void Foam::chungTransport<Thermo>::updateTRANS
     Pcmd_      = Pcmd;
     Mmd_       = Mmd;
     sigmd_     = sigmd;
+
+    cacheT_ = -1; // composition changed -> invalidate (p,T) cache
 }
 
 
@@ -657,6 +685,8 @@ inline void Foam::chungTransport<Thermo>::operator=
     Pcmd_      = ch.Pcmd_;
     Mmd_       = ch.Mmd_;
     sigmd_     = ch.sigmd_;
+
+    cacheT_ = -1; // invalidate (p,T) cache
 }
 
 
@@ -682,6 +712,8 @@ inline void Foam::chungTransport<Thermo>::operator+=
     Pcmd_      = ch.Pcmd_;
     Mmd_       = ch.Mmd_;
     sigmd_     = ch.sigmd_;
+
+    cacheT_ = -1; // invalidate (p,T) cache
 }
 
 

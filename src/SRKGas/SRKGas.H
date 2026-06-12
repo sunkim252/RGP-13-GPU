@@ -110,11 +110,23 @@ class SRKGas
         scalar coef2_;
         scalar coef3_;
 
-        //- Peneloux volume translation constant [m^3/kmol].
-        //  Effective specific volume: v_eff = v_SRK - c_.
+        //- Peneloux volume translation [m^3/kmol].
+        //  v_eff = v_SRK - c(T).  c_ is the constant / gas-baseline value.
         //  Default 0 preserves the original SRK behaviour.
         //  Reference: Peneloux, Rauzy & Freze, Fluid Phase Equilib. 8 (1982) 7-23.
         scalar c_;
+
+        //- Optional temperature-dependent Peneloux translation c(T) [m^3/kmol].
+        //  For strongly non-ideal fluids (e.g. H2O) a constant shift only
+        //  matches one T while the SRK liquid-density error grows with T.
+        //  Liquid branch c(T) = cq0_ + cq1_ T + cq2_ T^2 for T <= cTlo_;
+        //  smoothstep ramp to the gas baseline c_ over [cTlo_, cThi_];
+        //  c_ for T >= cThi_. Active only when cTlo_ > 0.
+        scalar cq0_;
+        scalar cq1_;
+        scalar cq2_;
+        scalar cTlo_;
+        scalar cThi_;
 
 
     // Private Member Functions
@@ -221,8 +233,18 @@ public:
             //  Reference: Soave, Chem. Eng. Sci. 27 (1972) 1197-1203.
             inline scalar lnPhi(const scalar p, const scalar T) const;
 
-            //- Access the Peneloux volume shift [m^3/kmol]
+            //- Access the Peneloux volume shift (baseline) [m^3/kmol]
             inline scalar c() const { return c_; }
+
+            //- Access the temperature-dependent Peneloux c(T) coefficients
+            inline scalar cq0()  const { return cq0_; }
+            inline scalar cq1()  const { return cq1_; }
+            inline scalar cq2()  const { return cq2_; }
+            inline scalar cTlo() const { return cTlo_; }
+            inline scalar cThi() const { return cThi_; }
+
+            //- Peneloux translation c(T) [m^3/kmol] (constant if cTlo_ <= 0)
+            inline scalar cAt(const scalar T) const;
 
             //- Update coefficients for mixture
             void updateEoS
@@ -231,7 +253,12 @@ public:
                 const scalar& coef1,
                 const scalar& coef2,
                 const scalar& coef3,
-                const scalar& c = 0
+                const scalar& c = 0,
+                const scalar& cq0 = 0,
+                const scalar& cq1 = 0,
+                const scalar& cq2 = 0,
+                const scalar& cTlo = 0,
+                const scalar& cThi = 0
             )
             {
                 b_ = b;
@@ -239,6 +266,11 @@ public:
                 coef2_ = coef2;
                 coef3_ = coef3;
                 c_ = c;
+                cq0_ = cq0;
+                cq1_ = cq1;
+                cq2_ = cq2;
+                cTlo_ = cTlo;
+                cThi_ = cThi;
             }
 
 

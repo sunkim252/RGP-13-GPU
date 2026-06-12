@@ -1,0 +1,21 @@
+FoamFile { format ascii; class dictionary; object physicalProperties; }
+
+// Real-fluid thermo: SRK EOS + Ely-Hanley transport. The 6 species
+// (N2, CO2, O2, CO, KERO, H2O) match the synthetic FGM table. fgmFluid marks
+// them all inactive and sets their mass fractions from the manifold each
+// iteration; the mixture then computes rho/T/mu/lambda.
+
+thermoType
+{
+    type            heRhoThermo;
+    mixture         SRKelyHanleyMixture;
+    transport       elyHanley;
+    thermo          janaf;
+    energy          absoluteEnthalpy;
+    equationOfState SRKGas;
+    specie          rfSpecie;
+}
+
+defaultSpecie N2;
+
+#include "thermo.compressibleGas4S"

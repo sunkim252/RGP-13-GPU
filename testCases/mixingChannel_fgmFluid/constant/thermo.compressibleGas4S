@@ -1,0 +1,301 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  6
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      thermo.compressibleGas;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+species         7 ( N2 CO2 O2 H2 CO KERO H2O );
+
+N2
+{
+    specie
+    {
+        molWeight       28.0134;
+    }
+    rfProperties
+    {
+	penelouxShift true;
+    	Tc 126.19; //K
+    	Pc 3.398e6; //Pa
+    	Vc 89.445; //cm^3/mol
+    	omega 0.039;
+    	kappai 0.0;
+    	miui 0.0;
+    	sigmvi 17.9;
+    }
+    thermodynamics
+    {
+        Tlow            10;
+        Thigh           5000;
+        Tcommon         1000;
+        highCpCoeffs    ( 2.92664 0.0014879768 -5.68476e-07 1.0097038e-10 -6.753351e-15 -922.7977 5.980528 );
+        lowCpCoeffs     ( 3.298677 0.0014082404 -3.963222e-06 5.641515e-09 -2.444854e-12 -1020.8999 3.950372 );
+    }
+    transport
+    {
+        As              1.401e-06;
+        Ts              107;
+    }
+    elements
+    {
+        N               2;
+    }
+}
+
+CO2
+{
+    specie
+    {
+        molWeight       44.00995;
+    }
+    rfProperties
+    {
+	penelouxShift true;
+    Tc 304.18;
+    Pc 7.38e6;
+    Vc 91.9;
+    omega 0.239;
+    kappai 0.0;
+    miui 0.0;
+    sigmvi 26.9;
+    }
+    thermodynamics
+    {
+        Tlow            10;
+        Thigh           5000;
+        Tcommon         1000;
+        highCpCoeffs    ( 3.85746029 0.00441437026 -2.21481404e-06 5.23490188e-10 -4.72084164e-14 -48759.166 2.27163806 );
+        lowCpCoeffs     ( 2.35677352 0.00898459677 -7.12356269e-06 2.45919022e-09 -1.43699548e-13 -48371.9697 9.90105222 );
+    }
+    transport
+    {
+        As              1.503e-06;
+        Ts              222;
+    }
+    elements
+    {
+        C               1;
+        O               2;
+    }
+}
+
+O2
+{
+    specie
+    {
+        molWeight       31.9988;
+    }
+    rfProperties
+    {
+	penelouxShift true;
+    Tc 154.58;
+    Pc 5.043e6;
+    Vc 73.529;
+    omega 0.025;
+    kappai 0.0;
+    miui 0.0;
+    sigmvi 16.6;
+    }
+    thermodynamics
+    {
+        Tlow            10;
+        Thigh           5000;
+        Tcommon         1000;
+        highCpCoeffs    ( 3.28253784 0.00148308754 -7.57966669e-07 2.09470555e-10 -2.16717794e-14 -1088.45772 5.45323129 );
+        lowCpCoeffs     ( 3.78245636 -0.00299673416 9.84730201e-06 -9.68129509e-09 3.24372837e-12 -1063.94356 3.65767573 );
+    }
+    transport
+    {
+        As              1.753e-06;
+        Ts              139;
+    }
+    elements
+    {
+        O               2;
+    }
+}
+
+H2
+{
+    specie
+    {
+        molWeight       2.01594;
+    }
+    rfProperties
+    {
+	penelouxShift true;
+    Tc 33.18;
+    Pc 1.293e6;
+    Vc 64.20;
+    omega -0.217;
+    kappai 0.0;
+    miui 0.0;
+    sigmvi 7.07;
+    }
+    thermodynamics
+    {
+        Tlow            10;
+        Thigh           5000;
+        Tcommon         1000;
+        highCpCoeffs    ( 3.3372792 -4.94024731e-05 4.99456778e-07 -1.79566394e-10 2.00255376e-14 -950.158922 -3.20502331 );
+        lowCpCoeffs     ( 2.34433112 0.00798052075 -1.9478151e-05 2.01572094e-08 -7.37611761e-12 -917.935173 0.683010238 );
+    }
+    transport
+    {
+        As              6.362e-07;
+        Ts              72;
+    }
+    elements
+    {
+        H               2;
+    }
+}
+
+CO
+{
+    specie
+    {
+        molWeight       28.01055;
+    }
+    rfProperties
+    {
+	penelouxShift true;
+    Tc 134.45;
+    Pc 3.49875e6;
+    Vc 90.09;
+    omega 0.025;
+    kappai 0.066;
+    miui 0.122;
+    sigmvi 21.98;
+    }
+    thermodynamics
+    {
+        Tlow            10;
+        Thigh           5000;
+        Tcommon         1000;
+        highCpCoeffs    ( 2.71518561 0.00206252743 -9.98825771e-07 2.30053008e-10 -2.03647716e-14 -14151.8724 7.81868772 );
+        lowCpCoeffs     ( 3.57953347 -0.00061035368 1.01681433e-06 9.07005884e-10 -9.04424499e-13 -14344.086 3.50840928 );
+    }
+    transport
+    {
+        As              1.512e-06;
+        Ts              120;
+    }
+    elements
+    {
+        C               1;
+        O               1;
+    }
+}
+
+KERO
+{
+    specie
+    {
+        molWeight       140.2709;
+    }
+    rfProperties
+    {
+	penelouxShift true;
+    	Tc 635.18;
+    	Pc 2.9675e6;
+    	Vc 599.986740237;
+    	omega 0.4674;
+    	kappai 0.0;
+    	miui 0.0;
+    	sigmvi 204.6;
+    }
+    thermodynamics
+    {
+        Tlow            10;
+        Thigh           5000;
+        Tcommon         1000;
+        highCpCoeffs    ( 22.0466998 0.056085716 -2.08755223e-05 3.56681805e-09 -2.29888568e-13 -36111.1981 -86.0141353 );
+        lowCpCoeffs     ( -4.15017414 0.128313358 -0.000108078472 6.53019457e-08 -2.0799948e-11 -28280.2613 50.8854391 );
+    }
+    transport
+    {
+        As              9.97764e-07;
+        Ts              632.70;
+    }
+    elements
+    {
+        C               10;
+        H               20;
+    }
+}
+
+H2O
+{
+    specie
+    {
+        molWeight       18.01534;
+    }
+    rfProperties
+    {
+	penelouxShift true;
+    Tc 647;
+    Pc 22.064e6;
+    Vc 55.866;
+    omega 0.344;
+    kappai 0.076;
+    miui 1.844;
+    sigmvi 12.7;
+    }
+    thermodynamics
+    {
+        Tlow            10;
+        Thigh           5000;
+        Tcommon         1000;
+        highCpCoeffs    ( 3.03399249 0.00217691804 -1.64072518e-07 -9.7041987e-11 1.68200992e-14 -30004.2971 4.9667701 );
+        lowCpCoeffs     ( 4.19864056 -0.0020364341 6.52040211e-06 -5.48797062e-09 1.77197817e-12 -30293.7267 -0.849032208 );
+    }
+    transport
+    {
+        As              2.978e-07;
+        Ts              1064;
+    }
+    elements
+    {
+        H               2;
+        O               1;
+    }
+}
+
+// SRK binary-interaction parameters k_ij  (a_ij = sqrt(a_i a_j)(1 - k_ij)).
+// Unlisted pairs default to 0. Read by SRK*Mixture from this (top-level) dict.
+// Provenance:
+//   N2_O2, N2_CO2        cryogenic-VLE compilations (Knapp et al. 1982 class)
+//   KERO_*               n-decane analog (M=140.3, Tc=635 K): N2/nC10 0.13,
+//                        CO2/nC10 0.114; O2/CO pairs = N2-analog estimates
+//   KERO_H2O             water/alkane strong nonideality (VLE-class ~0.45)
+//   CO2_H2O              T-dependent (0.07-0.3); combustion-range mean
+//   O2_H2O               repo reference value
+// Sensitivity @52-55 bar: mixing-layer rho up to -5.2% (O2/KERO 70/30, 200 K);
+// pure streams and hot products (1500 K) unaffected (0.0%).
+// H2 and remaining product pairs left 0: present only in hot low-density
+// regions where the attraction correction is negligible.
+binaryInteraction
+{
+    N2_O2    { kij -0.0119; }
+    N2_CO2   { kij -0.017;  }
+    O2_CO2   { kij  0.10;   }   // estimate
+    O2_H2O   { kij -0.015;  }
+    CO2_H2O  { kij  0.12;   }   // T-dependent; combustion mean
+    KERO_N2  { kij  0.13;   }   // nC10/N2
+    KERO_CO2 { kij  0.114;  }   // nC10/CO2
+    KERO_O2  { kij  0.10;   }   // estimate (N2 analog)
+    KERO_CO  { kij  0.10;   }   // estimate (CO ~ N2)
+    KERO_H2O { kij  0.45;   }   // water/alkane
+}

@@ -1,0 +1,14 @@
+// Placeholder initial composition (sum of Y must be > 0 at thermo
+// construction). fgmFluid overwrites all tabulated species from the manifold
+// on the first updateManifold() call, so this is only an initial seed.
+FoamFile { format ascii; class volScalarField; object O2; }
+dimensions [0 0 0 0 0 0 0];
+internalField uniform 1;
+boundaryField
+{
+    inlet { type fixedValue; value uniform 1; }
+    outlet { type zeroGradient; }
+    upperWall { type symmetry; }
+    lowerWall { type symmetry; }
+    frontAndBack { type empty; }
+}

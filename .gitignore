@@ -26,3 +26,9 @@ testCases/**/processor*
 testCases/**/postProcessing/
 testCases/**/[0-9]*[0-9]/
 testCases/**/[0-9]*e*/
+
+# Oversized generated FGM tables for the wang2015 LES cases (406/155/46/18 MB;
+# GitHub rejects files >100 MB). Rebuilt by tools/fgm_table_gen. The small
+# example tables in the other FGM cases stay tracked.
+testCases/wang2015_*/constant/fgmProperties
+testCases/wang2015_*/constant/fgmProperties.npz

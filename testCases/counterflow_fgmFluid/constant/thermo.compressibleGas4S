@@ -272,3 +272,30 @@ H2O
         O               1;
     }
 }
+
+// SRK binary-interaction parameters k_ij  (a_ij = sqrt(a_i a_j)(1 - k_ij)).
+// Unlisted pairs default to 0. Read by SRK*Mixture from this (top-level) dict.
+// Provenance:
+//   N2_O2, N2_CO2        cryogenic-VLE compilations (Knapp et al. 1982 class)
+//   KERO_*               n-decane analog (M=140.3, Tc=635 K): N2/nC10 0.13,
+//                        CO2/nC10 0.114; O2/CO pairs = N2-analog estimates
+//   KERO_H2O             water/alkane strong nonideality (VLE-class ~0.45)
+//   CO2_H2O              T-dependent (0.07-0.3); combustion-range mean
+//   O2_H2O               repo reference value
+// Sensitivity @52-55 bar: mixing-layer rho up to -5.2% (O2/KERO 70/30, 200 K);
+// pure streams and hot products (1500 K) unaffected (0.0%).
+// H2 and remaining product pairs left 0: present only in hot low-density
+// regions where the attraction correction is negligible.
+binaryInteraction
+{
+    N2_O2    { kij -0.0119; }
+    N2_CO2   { kij -0.017;  }
+    O2_CO2   { kij  0.10;   }   // estimate
+    O2_H2O   { kij -0.015;  }
+    CO2_H2O  { kij  0.12;   }   // T-dependent; combustion mean
+    KERO_N2  { kij  0.13;   }   // nC10/N2
+    KERO_CO2 { kij  0.114;  }   // nC10/CO2
+    KERO_O2  { kij  0.10;   }   // estimate (N2 analog)
+    KERO_CO  { kij  0.10;   }   // estimate (CO ~ N2)
+    KERO_H2O { kij  0.45;   }   // water/alkane
+}

@@ -153,6 +153,30 @@ protected:
             List<List<scalar>> Mmd_;
             List<List<scalar>> sigmd_;
 
+        //- Composition-only Pedersen quantities, precomputed in updateTRANS()
+        //  so they are NOT recomputed in pedersenMap() per (p,T) and per
+        //  mu()/kappa() call. Pure refactor; results unchanged.
+        //    mapTfac_  = Tc0/Tcmix,  mapPfac_ = Pc0_CH4/Pcmix
+        //    baseConst_= (Tcmix/Tc0)^(-1/6) (Pcmix/Pc0)^(2/3)
+        //    MWpow_    = MWmix^0.5173   (Pedersen alpha exponent on MW)
+            scalar mapTfac_;
+            scalar mapPfac_;
+            scalar baseConst_;
+            scalar MWpow_;
+
+        //- Single-entry (p,T) cache of the last pedersenMap() result. The
+        //  RhoFluidThermo cell loop evaluates mu(p,T) then kappa(p,T) with the
+        //  SAME (p,T) on one transportMixture, so the second call reuses the
+        //  first mapping (saves 2 methane SRK cubic solves per cell). Cache is
+        //  invalidated (cacheT_ < 0) on every composition change. mutable:
+        //  valid for OpenFOAM's serial per-process cell loop; NOT thread-safe
+        //  under a shared transport object.
+            mutable scalar cacheP_;
+            mutable scalar cacheT_;
+            mutable scalar cacheTRef_;
+            mutable scalar cacheRhoO_;
+            mutable scalar cacheBase_;
+
 
     // Protected Member Functions
 
@@ -257,6 +281,24 @@ protected:
         //  with F_eta = base*sqrt(MWmix/MO), F_lam = base*sqrt(MO/MWmix).
         //  MWmix is the Pedersen mixture molar weight.
         inline void pedersenMap
+        (
+            const scalar p,
+            const scalar T,
+            scalar& TRef,
+            scalar& rhoO,
+            scalar& base,
+            scalar& MWmix
+        ) const;
+
+        //- Recompute the composition-only Pedersen constants (mapTfac_,
+        //  mapPfac_, baseConst_, MWpow_) from the current critical-property
+        //  data. Called once per composition update (updateTRANS / ctor),
+        //  hoisting the O(N^2) combining rule + composition powers out of the
+        //  per-(p,T) pedersenMap() hot path. Also invalidates the (p,T) cache.
+        inline void updatePedersenConst();
+
+        //- pedersenMap() with a single-entry (p,T) cache (see cache members).
+        inline void pedersenMapCached
         (
             const scalar p,
             const scalar T,

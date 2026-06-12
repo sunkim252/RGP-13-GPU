@@ -1,0 +1,11 @@
+FoamFile { format ascii; class volVectorField; object U; }
+dimensions [0 1 -1 0 0 0 0];
+internalField uniform (0 0 0);
+boundaryField
+{
+    fuelInlet     { type fixedValue; value uniform ( 0.1  0 0); }
+    oxidizerInlet { type fixedValue; value uniform (-0.1  0 0); }
+    upperOutflow  { type pressureInletOutletVelocity; value uniform (0 0 0); }
+    lowerOutflow  { type pressureInletOutletVelocity; value uniform (0 0 0); }
+    frontAndBack  { type empty; }
+}

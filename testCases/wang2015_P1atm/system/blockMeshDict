@@ -1,0 +1,83 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  5                                     |
+|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+convertToMeters 1;
+
+vertices
+(
+    (0.00  0.000  0.0000)
+    (0.02  0.000  0.0000)
+    (0.02  0.005  0.0000)
+    (0.00  0.005  0.0000)
+    (0.00  0.000  0.0001)
+    (0.02  0.000  0.0001)
+    (0.02  0.005  0.0001)
+    (0.00  0.005  0.0001)
+
+
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (100 20 1) simpleGrading (1 1 1)
+);
+
+edges
+(
+);
+
+boundary
+(
+    // Opposed-jet counterflow: two opposite inlets along x (one fuel side,
+    // one oxidizer side); the y boundaries are outflows that vent the
+    // post-stagnation flow sideways. Matches the canonical 1-D counterflow
+    // diffusion flame for direct Cantera comparison.
+    fuelInlet
+    {
+        type patch;
+        faces ((0 4 7 3));   // x = 0  face
+    }
+    oxidizerInlet
+    {
+        type patch;
+        faces ((1 2 6 5));   // x = L  face
+    }
+    upperOutflow
+    {
+        type patch;
+        faces ((7 6 2 3));   // y = H  face
+    }
+    lowerOutflow
+    {
+        type patch;
+        faces ((0 1 5 4));   // y = 0  face
+    }
+    frontAndBack
+    {
+        type empty;
+        faces
+        (
+            (0 3 2 1)
+            (4 5 6 7)
+        );
+    }
+);
+
+mergePatchPairs
+(
+);
+
+// ************************************************************************* //

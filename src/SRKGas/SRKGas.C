@@ -37,7 +37,8 @@ Foam::SRKGas<Specie>::SRKGas
 )
 :
     Specie(name, dict),
-    c_(0)
+    c_(0),
+    cq0_(0), cq1_(0), cq2_(0), cTlo_(0), cThi_(0)
 {
     const scalar Tc = this->Tc();
     const scalar Pc = this->Pc();
@@ -75,6 +76,26 @@ Foam::SRKGas<Specie>::SRKGas
         const scalar Zra = 0.29056 - 0.08775*omega;
         c_ = 0.40768*(0.29441 - Zra)
             *Foam::constant::thermodynamic::RR*Tc/Pc;
+    }
+
+    // Optional temperature-dependent Peneloux translation c(T):
+    //   penelouxCoeffs (cq0 cq1 cq2 Tlo Thi);   // [m^3/kmol, ..., K, K]
+    // Liquid branch c(T) = cq0 + cq1 T + cq2 T^2 for T <= Tlo, smoothstep
+    // ramp to the gas baseline c (above) over [Tlo, Thi]. Calibrated for
+    // strongly non-ideal fluids (H2O) whose SRK liquid-density error grows
+    // with T; see test/proto_penelouxCT.py.
+    if (rfDict.found("penelouxCoeffs"))
+    {
+        const scalarList pc(rfDict.lookup<scalarList>("penelouxCoeffs"));
+        if (pc.size() != 5)
+        {
+            FatalErrorInFunction
+                << "penelouxCoeffs for " << name << " must have 5 entries "
+                << "(cq0 cq1 cq2 Tlo Thi); got " << pc.size()
+                << exit(FatalError);
+        }
+        cq0_ = pc[0]; cq1_ = pc[1]; cq2_ = pc[2];
+        cTlo_ = pc[3]; cThi_ = pc[4];
     }
 }
 

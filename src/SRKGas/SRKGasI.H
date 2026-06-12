@@ -109,7 +109,8 @@ inline Foam::SRKGas<Specie>::SRKGas
     coef1_(coef1),
     coef2_(coef2),
     coef3_(coef3),
-    c_(c)
+    c_(c),
+    cq0_(0), cq1_(0), cq2_(0), cTlo_(0), cThi_(0)
 {}
 
 
@@ -125,7 +126,9 @@ inline Foam::SRKGas<Specie>::SRKGas
     coef1_(srk.coef1_),
     coef2_(srk.coef2_),
     coef3_(srk.coef3_),
-    c_(srk.c_)
+    c_(srk.c_),
+    cq0_(srk.cq0_), cq1_(srk.cq1_), cq2_(srk.cq2_),
+    cTlo_(srk.cTlo_), cThi_(srk.cThi_)
 {}
 
 
@@ -143,6 +146,30 @@ Foam::SRKGas<Specie>::clone() const
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
 
 template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::cAt(const scalar T) const
+{
+    // Constant Peneloux unless a c(T) liquid branch is configured.
+    if (cTlo_ <= 0)
+    {
+        return c_;
+    }
+    if (T <= cTlo_)
+    {
+        return cq0_ + cq1_*T + cq2_*T*T;          // liquid quadratic
+    }
+    if (T >= cThi_)
+    {
+        return c_;                                 // gas baseline
+    }
+    // smoothstep ramp from the liquid value at cTlo_ to the gas baseline c_
+    const scalar cL = cq0_ + cq1_*cTlo_ + cq2_*cTlo_*cTlo_;
+    scalar s = (T - cTlo_)/(cThi_ - cTlo_);
+    s = s*s*(3.0 - 2.0*s);
+    return cL*(1.0 - s) + c_*s;
+}
+
+
+template<class Specie>
 inline Foam::scalar Foam::SRKGas<Specie>::rho
 (
     scalar p,
@@ -152,14 +179,15 @@ inline Foam::scalar Foam::SRKGas<Specie>::rho
     const scalar Zv = this->Z(p, T);
     const scalar rhoSRK = p/(Zv*this->R()*T);
 
-    // Peneloux volume translation: v_eff = v_SRK - c  (molar basis).
+    // Peneloux volume translation: v_eff = v_SRK - c(T)  (molar basis).
     // In specific quantities this gives
     //   rho_eff = rho_SRK / (1 - c * rho_SRK / W)
-    // where c_ has units of m^3/kmol and W of kg/kmol, so c_/W is m^3/kg.
+    // where c has units of m^3/kmol and W of kg/kmol, so c/W is m^3/kg.
     // Reference: Peneloux, Rauzy & Freze, Fluid Phase Equilib. 8 (1982) 7-23.
-    if (c_ != 0)
+    const scalar c = cAt(T);
+    if (c != 0)
     {
-        const scalar denom = 1.0 - c_*rhoSRK/this->W();
+        const scalar denom = 1.0 - c*rhoSRK/this->W();
         if (denom > small)
         {
             return rhoSRK/denom;

@@ -1,0 +1,23 @@
+FoamFile { format ascii; class dictionary; object physicalProperties; }
+
+// Wang-Huo-Yang 2015 verification @ 50 atm. Real-fluid thermo: SRK EOS +
+// Chung-Takahashi transport (matches the Cantera high-pressure-Chung used to
+// bake the flamelet properties). All 106 Wang-2011 surrogate species are
+// registered and marked inactive by fgmFluid; their mass fractions are set
+// from the 4-D FPV manifold each iteration, then the mixture computes
+// rho/T/mu/lambda.
+
+thermoType
+{
+    type            heRhoThermo;
+    mixture         SRKelyHanleyMixture;
+    transport       elyHanley;
+    thermo          janaf;
+    energy          absoluteEnthalpy;
+    equationOfState SRKGas;
+    specie          rfSpecie;
+}
+
+defaultSpecie N2;
+
+#include "thermo.wang2011"

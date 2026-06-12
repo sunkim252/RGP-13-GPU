@@ -116,8 +116,16 @@ private:
         List<List<scalar>> COEF2_;
         List<List<scalar>> COEF3_;
 
-        //- Per-species Peneloux volume shift [m^3/kmol]
+        //- Per-species Peneloux volume shift (baseline) [m^3/kmol]
         List<scalar> CM_;
+
+        //- Per-species temperature-dependent Peneloux c(T) coefficients
+        //  (cq0, cq1, cq2 [m^3/kmol], Tlo, Thi [K]); zero = constant Peneloux.
+        List<scalar> CMq0_;
+        List<scalar> CMq1_;
+        List<scalar> CMq2_;
+        List<scalar> CMTlo_;
+        List<scalar> CMThi_;
 
         //- Binary interaction matrix k_ij (1 - k_ij) applied to SRK
         //  cross terms a_ij and to ECS T_c,ij. Diagonal = 0.

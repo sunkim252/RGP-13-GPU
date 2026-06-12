@@ -139,6 +139,18 @@ protected:
             //- List of sigmd[i][j]
             List<List<scalar>> sigmd_;
 
+        //- Single-entry (p,T) cache of calculate()'s result so the consecutive
+        //  mu(p,T)/kappa(p,T) calls on one cell reuse one rho-cubic + Omega*
+        //  evaluation. Invalidated (cacheT_ < 0) on composition change.
+        //  mutable: valid for OpenFOAM's serial per-process cell loop.
+            mutable scalar cacheP_;
+            mutable scalar cacheT_;
+            mutable scalar cacheTstar_;
+            mutable scalar cacheMur_;
+            mutable scalar cacheEta0_;
+            mutable scalar cacheY_;
+            mutable scalar cacheG1_;
+
 
     // Protected Member Functions
 

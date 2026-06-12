@@ -84,7 +84,13 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         CEqn.solve("Yi");
         fvConstraints().constrain(C_);
 
-        C_ = max(C_, scalar(0));
+        // The transported progress variable is the NORMALIZED c in [0, 1]
+        // (table closure: omega = 0 at c = 1, the equilibrium/envelope
+        // boundary). The explicit source can step THROUGH the c = 1 zero in
+        // a single dt (omega ~ 1e4 1/s), so clamp both ends -- the standard
+        // practice layered on top of the equilibrium closure (Pierce 2004's
+        // library truncation; cf. solver-side bounding in tabulated codes).
+        C_ = max(min(C_, scalar(1)), scalar(0));
     }
 
 

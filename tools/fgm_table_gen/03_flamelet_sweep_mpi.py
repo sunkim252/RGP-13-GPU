@@ -300,28 +300,44 @@ def _lin_mid(a, b):
     return 0.5 * (a + b)
 
 
+RAMP_MAX_GRID = 250        # cap during P/T continuation
+FINAL_MAX_GRID = 5000      # effectively unrestricted at the final refine
+RAMP_MAX_SUBDIV = 16       # adaptive subdivision budget (per nominal step)
+
+
+def _set_grid_cap(flame, cap):
+    """Cap the reacting-domain grid size; ignore if API differs."""
+    try:
+        flame.set_max_grid_points(flame.flame, int(cap))
+    except Exception:
+        try:
+            flame.max_grid_points = int(cap)
+        except Exception as ex:
+            _log(f"[baseline] WARN: cannot set max_grid_points: {ex}")
+
+
 def _build_shared_baseline(gas, T_ox, log=0):
-    """Stage 1 + P ramp + T_ox ramp. Result: baseline at (P_OPER, T_ox, mdot=MDOT_INIT).
+    """Stage 1 + P ramp + T_ramps + final refine. Publication-grade target
+    (P=P_OPER, T_fuel=T_FUEL, T_ox=T_ox) with cost mitigations that do NOT
+    sacrifice the final-state accuracy:
 
-    Runs only on rank 0 (or in serial mode). All other ranks wait at a
-    barrier and load BASELINE_FILE afterwards.
+      - resume from BASELINE_FILE if present (no work redo);
+      - loose refine + max_grid_points cap during the ramps;
+      - Stage 5 restores tight refine + removes the grid cap, so the final
+        baseline is fully resolved;
+      - per-step checkpoint to BASELINE_FILE so any failure is recoverable;
+      - adaptive subdivision budget RAMP_MAX_SUBDIV for pseudo-critical T_ox.
 
-    Solver strategy:
-      - Loose refine_criteria during ramping (~50-80 pts, faster Jacobian).
-      - Finer P/T steps (factor 1.5x or smaller) so Newton bridges each gap.
-      - Final tight refine at baseline state.
+    Result: a publication-grade baseline at (P_OPER, T_FUEL, T_ox).
     """
     flame = ct.CounterflowDiffusionFlame(gas, width=DOMAIN_WIDTH)
     flame.transport_model = "mixture-averaged"
-    # Moderate refine during ramping: enough to resolve the (thinning) flame as
-    # pressure rises, but not so tight that each solve is expensive.
-    flame.set_refine_criteria(ratio=3.0, slope=0.15, curve=0.25, prune=0.03)
 
-    # ---- Checkpoint helper: save current baseline after every successful step
-    #      so a run that fails partway can still be recovered. The next
-    #      invocation's _baseline_cache_ok() will find this file and skip the
-    #      already-completed work; the case can then use it directly even at a
-    #      partial (T_ox/T_fuel) state with a warning. ----
+    # Loose refine during ramping so the flame doesn't pile on cells while
+    # crossing high-pressure / trans-critical regions. Stage 5 re-tightens.
+    flame.set_refine_criteria(ratio=4.5, slope=0.30, curve=0.50, prune=0.05)
+    _set_grid_cap(flame, RAMP_MAX_GRID)
+
     def save_partial(flame, label, v):
         try:
             desc = (f"partial baseline: last step {label}={v:.4g}; "
@@ -335,47 +351,80 @@ def _build_shared_baseline(gas, T_ox, log=0):
         except Exception as ex:
             _log(f"[baseline] WARN: checkpoint save failed: {ex}")
 
-    # ---- Stage 1: 1 atm, BOTH inlets hot (700 K) so fuel is gaseous + ignites ----
-    _log(f"[baseline] stage 1: P=1 atm, T_fuel=T_ox={T_HOT_START} K, mdot={MDOT_INIT}")
-    _configure(flame, P=1.0e5, T_fuel=T_HOT_START, T_ox=T_HOT_START, mdot=MDOT_INIT)
-    t0 = time.time()
-    flame.solve(loglevel=log, auto=True)
-    _log(f"[baseline]   stage1 OK  npts={flame.grid.size}  Tmax={flame.T.max():.1f} K  "
-         f"dt={time.time()-t0:.1f}s")
-    save_partial(flame, "stage1", 1.0e5)
+    # ---------- Resume from a previous partial baseline if available ----------
+    resumed = False
+    if BASELINE_FILE.exists():
+        try:
+            flame.restore(str(BASELINE_FILE), name=BASELINE_NAME)
+            resumed = True
+            _log(f"[baseline] RESUME from checkpoint: "
+                 f"P={flame.P/1e5:.2f} bar, "
+                 f"T_fuel={flame.fuel_inlet.T:.1f} K, "
+                 f"T_ox={flame.oxidizer_inlet.T:.1f} K, "
+                 f"npts={flame.grid.size}")
+        except Exception as ex:
+            _log(f"[baseline] checkpoint restore failed ({ex}); fresh start")
+            resumed = False
 
-    # ---- Stage 2: P ramp 1 atm -> P_OPER BEFORE cooling, so the fuel crosses
-    #      its critical pressure while still hot/gaseous. Adaptive subdivision. ----
-    _log(f"[baseline] stage 2: pressure ramp 1 atm -> {P_OPER/1e5:.0f} bar")
-    _adaptive_ramp(flame, lambda P: setattr(flame, "P", float(P)),
-                   v_from=1.0e5, v_to=P_OPER, midpoint=_geom_mid,
-                   n_steps=16, log=log, label="P", on_success=save_partial)
+    # ---------- Stage 1: 1 atm hot-inlet seed (skip on resume) ----------
+    if not resumed:
+        _log(f"[baseline] stage 1: P=1 atm, T_fuel=T_ox={T_HOT_START} K, "
+             f"mdot={MDOT_INIT}")
+        _configure(flame, P=1.0e5, T_fuel=T_HOT_START, T_ox=T_HOT_START,
+                   mdot=MDOT_INIT)
+        t0 = time.time()
+        flame.solve(loglevel=log, auto=True)
+        _log(f"[baseline]   stage1 OK  npts={flame.grid.size}  "
+             f"Tmax={flame.T.max():.1f} K  dt={time.time()-t0:.1f}s")
+        save_partial(flame, "stage1", 1.0e5)
 
-    # ---- Stage 3: cool fuel inlet T_HOT_START -> T_FUEL (single-phase at P_OPER)
-    #      Compressed schedule: fewer nominal steps, adaptive subdivision
-    #      absorbs any large jumps. ----
-    if T_FUEL < T_HOT_START - 1.0:
-        _log(f"[baseline] stage 3: cool fuel {T_HOT_START} -> {T_FUEL} K (3 steps + adaptive)")
+    # ---------- Stage 2: P ramp -> P_OPER (skip if already there) ----------
+    P_from = float(flame.P)
+    if P_from < P_OPER * 0.99:
+        # number of remaining geometric steps at the original ramp ratio (~1.33x)
+        n_full = 16
+        log_full = float(np.log(P_OPER / 1.0e5))
+        log_rem = float(np.log(P_OPER / max(P_from, 1.0)))
+        n_remain = max(2, int(np.ceil(n_full * log_rem / log_full)))
+        _log(f"[baseline] stage 2: pressure ramp {P_from/1e5:.2f} -> "
+             f"{P_OPER/1e5:.0f} bar ({n_remain} steps + adaptive)")
+        _adaptive_ramp(flame, lambda P: setattr(flame, "P", float(P)),
+                       v_from=P_from, v_to=P_OPER, midpoint=_geom_mid,
+                       n_steps=n_remain, log=log, label="P",
+                       on_success=save_partial, max_subdiv=RAMP_MAX_SUBDIV)
+
+    # ---------- Stage 3: cool fuel inlet (skip if already at target) ----------
+    Tf_from = float(flame.fuel_inlet.T)
+    if Tf_from > T_FUEL + 1.0:
+        n_remain = max(2, int(np.ceil((Tf_from - T_FUEL) / 140.0)))
+        _log(f"[baseline] stage 3: cool fuel {Tf_from:.0f} -> {T_FUEL} K "
+             f"({n_remain} steps + adaptive)")
         _adaptive_ramp(flame, lambda T: setattr(flame.fuel_inlet, "T", float(T)),
-                       v_from=T_HOT_START, v_to=T_FUEL, midpoint=_lin_mid,
-                       n_steps=3, log=log, label="T_fuel", on_success=save_partial)
+                       v_from=Tf_from, v_to=T_FUEL, midpoint=_lin_mid,
+                       n_steps=n_remain, log=log, label="T_fuel",
+                       on_success=save_partial, max_subdiv=RAMP_MAX_SUBDIV)
 
-    # ---- Stage 4: cool oxidizer inlet T_HOT_START -> T_ox
-    #      Compressed schedule (6 steps); subdivisions handle the
-    #      pseudo-critical jump around O2's critical point (~155 K). ----
-    if T_ox < T_HOT_START - 1.0:
-        _log(f"[baseline] stage 4: cool oxidizer {T_HOT_START} -> {T_ox} K (6 steps + adaptive)")
+    # ---------- Stage 4: cool oxidizer inlet (pseudo-critical region) ----------
+    Tox_from = float(flame.oxidizer_inlet.T)
+    if Tox_from > T_ox + 1.0:
+        # ~80 K per step on the linear schedule; adaptive will further refine
+        # the trans-critical band around O2's critical point (~155 K).
+        n_remain = max(3, int(np.ceil((Tox_from - T_ox) / 80.0)))
+        _log(f"[baseline] stage 4: cool oxidizer {Tox_from:.0f} -> {T_ox} K "
+             f"({n_remain} steps + adaptive, budget {RAMP_MAX_SUBDIV})")
         _adaptive_ramp(flame, lambda T: setattr(flame.oxidizer_inlet, "T", float(T)),
-                       v_from=T_HOT_START, v_to=T_ox, midpoint=_lin_mid,
-                       n_steps=6, log=log, label="T_ox", on_success=save_partial)
+                       v_from=Tox_from, v_to=T_ox, midpoint=_lin_mid,
+                       n_steps=n_remain, log=log, label="T_ox",
+                       on_success=save_partial, max_subdiv=RAMP_MAX_SUBDIV)
 
-    # ---- Stage 5: final tight refine at baseline state ----
-    _log("[baseline] stage 5: final tight refine")
+    # ---------- Stage 5: final tight refine (publication-grade) ----------
+    _log("[baseline] stage 5: final tight refine (grid cap removed)")
+    _set_grid_cap(flame, FINAL_MAX_GRID)
     flame.set_refine_criteria(ratio=2.0, slope=0.08, curve=0.15, prune=0.02)
     t0 = time.time()
     flame.solve(loglevel=log, auto=True)
-    _log(f"[baseline]   final OK  npts={flame.grid.size}  Tmax={flame.T.max():.1f} K  "
-         f"dt={time.time()-t0:.1f}s")
+    _log(f"[baseline]   final OK  npts={flame.grid.size}  "
+         f"Tmax={flame.T.max():.1f} K  dt={time.time()-t0:.1f}s")
     save_partial(flame, "final_refine", flame.P)
     return flame
 
@@ -433,10 +482,12 @@ def _save_flamelet_npz(flame, gas, mdot, idx):
 # ---------------------------- main ----------------------------
 
 def _baseline_cache_ok():
-    """Return True iff BASELINE_FILE has a usable BASELINE_NAME entry.
+    """True iff BASELINE_FILE holds a baseline AT THE TARGET STATE
+    (P==P_OPER, T_fuel==T_FUEL, T_ox==T_OX_TARGET).
 
-    Also logs the cached state (P, T_fuel, T_ox, npts) so the user can see
-    whether a partial / target baseline is being resumed.
+    Returns False for a partial baseline so the caller will dispatch into
+    _build_shared_baseline(), which resumes from the cached state instead
+    of redoing finished work.
     """
     if not BASELINE_FILE.exists():
         return False
@@ -452,12 +503,13 @@ def _baseline_cache_ok():
             or abs(Tf - T_FUEL) > 1.0
             or abs(Tox - T_OX_TARGET) > 1.0
         )
-        tag = "PARTIAL" if partial else "TARGET"
-        _log(f"baseline cache state ({tag}): P={P_bar:.2f} bar, "
-             f"T_fuel={Tf:.1f} K, T_ox={Tox:.1f} K, npts={f.grid.size}")
         if partial:
-            _log("  NOTE: sweep will operate at the cached state; the produced "
-                 "table is valid for that state, not the original target.")
+            _log(f"baseline cache PARTIAL ({P_bar:.2f} bar, "
+                 f"T_fuel={Tf:.1f} K, T_ox={Tox:.1f} K, npts={f.grid.size})"
+                 f" -> will RESUME build")
+            return False
+        _log(f"baseline cache at TARGET state ({P_bar:.2f} bar, "
+             f"T_fuel={Tf:.1f} K, T_ox={Tox:.1f} K, npts={f.grid.size})")
         return True
     except Exception:
         return False
