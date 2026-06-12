@@ -17,7 +17,8 @@ via `controlDict` — no patching of the OpenFOAM-13 source tree.
 | **Transport — Ely-Hanley path** | Ely-Hanley 1981a/b ECS, **Pedersen-Fredenslund mapping** | μ, κ via HMH methane reference; corresponding-states reference state from Pedersen critical-ratio mapping + rotational-coupling α with an SRK methane reference density (replaces the LCL shape factors — see [Model updates](#model-updates)); recommended for polar fluids (H₂O) |
 | **Mass diffusivity** | Fuller 1969 + Takahashi 1974 | Pressure-corrected binary D_ij; identical between the two transport paths |
 | **Mixture mixing rules** | Mole-weighted pair averages | Pre-computed at construction time; one matrix set per backend |
-| **Thermo** | NASA JANAF polynomials | 7-coefficient `janafThermo` with `sensibleEnthalpy` |
+| **Thermo** | NASA JANAF polynomials | 7-coefficient `janafThermo` with `sensibleEnthalpy` (`absoluteEnthalpy` for the FPV solver) |
+| **Combustion — FPV** | Flamelet/progress-variable (Pierce & Moin 2004) | 3-D table (Z̃, gZ ≡ normalized Z″², normalized c̃) with β-PDF(Z) × δ-PDF(c) closure; **burnt end closed at adiabatic chemical equilibrium / manifold envelope, so ω̇_c(c=1) = 0 and the transported c stays bounded in [0,1]**; dedicated `fgmFluid` solver module (Wang 2018 conservation↔table loop — species held inactive, composition imposed from the table, ρ/μ/κ recomputed by SRK + Chung/EH at run time); a 4-D (…, χ_st) layout is retained for a future unsteady-FPV extension — see [FPV combustion model](#fpv-combustion-model-fgmfluid) |
 
 ## Quick start
 
@@ -154,11 +155,18 @@ RGP-13-realFluid/
 │   │       └── (SRK methane reference density; C^2 quintic soft-clamp on T_o, ρ_o)
 │   ├── SRKchungTakaMixture/          mixture class for the Chung backend
 │   ├── SRKelyHanleyMixture/          mixture class for the Ely-Hanley backend
-│   ├── FGM/                          flamelet-generated-manifold combustion model
+│   ├── FGM/                          FGMTable: 3-D/4-D FPV lookup (tri-/quadrilinear), multi-field (sourcePV, T, Y_k)
 │   ├── include/                      forRealFluidGases* template-dispatch macros
 │   └── realFluidThermos.C            explicit template instantiation
+├── applications/modules/fgmFluid/    FPV solver module (transported Z̃ + normalized c̃,
+│                                       algebraic gZ closure, Pitsch-Steiner χ_st,
+│                                       inactive-species composition from the table)
+├── tools/fgm_table_gen/              Cantera FPV table generator (dual-gas flamelets,
+│                                       equilibrium/envelope closure — see its README)
 ├── testCases/
-│   └── bunsenFlame_FGM/              minimal FGM combustion test
+│   ├── bunsenFlame_FGM/              minimal premixed FGM combustion test
+│   ├── counterflow_fgmFluid/         1-D opposed-jet FPV verification case
+│   └── wang2015_P50atm/, _P1atm/     Wang-Huo-Yang (2015) pressure-sweep verification
 └── codeTemplates/                    OpenFOAM dynamicCode templates (carried over)
 ```
 
@@ -254,6 +262,44 @@ collision integral Ω* for Chung. Verified bit-for-bit identical to the
 pre-optimisation results (ρ/Cp exactly 0, μ/κ at floating-point reorder
 level). The cache is `mutable` and assumes OpenFOAM's serial per-process
 cell loop.
+
+### FPV combustion model (`fgmFluid`)
+
+Flamelet/progress-variable combustion for supercritical LOX/kerosene,
+verified end-to-end in a 1-D opposed-jet case at 50 atm
+(T_max = 3636 K burning, transported c̃ exactly bounded in [0, 1]).
+
+* **Manifold**: steady counterflow diffusion flamelets (Cantera, Wang 2011
+  skeletal kerosene, 106 sp) parameterized as a 3-D table
+  (Z̃, gZ, c̃) — the full strain family fills the (Z, c) plane. For *steady*
+  manifolds the progress variable and χ_st index the same one-parameter
+  family, so a χ axis is redundant; the 4-D (Z̃, gZ, c̃, χ_st) layout and the
+  solver-side Pitsch-Steiner χ_st closure are retained for a future
+  **unsteady-FPV** extension (Ihme & Pitsch 2008), where transient
+  extinction/re-ignition states populate the (c, χ) plane.
+* **Burnt-end closure / boundedness**: the table's c = 1 boundary is the
+  **adiabatic chemical equilibrium** (HP-equilibrate per Z̃; *not*
+  complete-combustion/Burke–Schumann, which is a non-physical ≈6000 K
+  state), generalized to the **manifold envelope**
+  `C_norm(Z) = max(C_eq, family max)` because cross-Z diffusion holds the
+  steady reaction zone a few % above the *local* equilibrium. ω̇_c ≡ 0 on
+  the c = 1 row, plus a solver-side clamp c ∈ [0, 1] (the explicit source
+  can step through the zero in one Δt) — the standard layering
+  (Pierce & Moin 2004 library truncation; van Oijen & de Goey 2000
+  equilibrium boundary; cf. ANSYS Fluent FGM, PelePhysics Manifold).
+* **Dual-gas flamelet generation** (`tools/fgm_table_gen/`): the flame
+  *structure* is solved ideal-gas + unity-Lewis (consistent with the
+  solver's unity-Schmidt c̃/Z̃ transport; the SRK steady Newton is
+  intractable on resolved grids at trans-critical conditions), then ρ, μ, κ,
+  c_p, ω̇_c and χ_st are **re-evaluated pointwise with SRK +
+  high-pressure-Chung** before tabulation — consistent with the run-time
+  thermophysics, and the same fidelity split as Zips, Müller & Pfitzner
+  (2018).
+* **JANAF pitfall**: the multicomponent mixture clamps the temperature
+  solve at the *minimum* `Thigh` over **all** species — kerosene-mechanism
+  intermediates fitted only to 3000 K pinned the whole flame at exactly
+  3000.0 K. The YAML→OpenFOAM converter floors `Thigh` at 5000 K
+  (benign: those intermediates vanish above ~1500 K).
 
 ## Numerical robustness (Ely-Hanley specifics)
 
