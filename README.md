@@ -12,9 +12,9 @@ via `controlDict` — no patching of the OpenFOAM-13 source tree.
 
 | Component | Backend | Notes |
 |---|---|---|
-| **Equation of state** | SRK (Soave 1972) | Optional Péneloux volume translation (Péneloux et al. 1982); optional binary-interaction matrix `k_ij` |
+| **Equation of state** | SRK (Soave 1972) | Optional Péneloux volume translation — constant or **temperature-dependent `c(T)`** (Péneloux et al. 1982); stable root by minimum fugacity; optional binary-interaction matrix `k_ij` |
 | **Transport — Chung path** | Chung-Lee-Starling 1988 | μ, κ from Lennard-Jones combining rules; non-polar / weakly-polar fluids |
-| **Transport — Ely-Hanley path** | Ely-Hanley 1981a/b ECS | μ, κ via methane reference + Leach-Chappelear-Leland 1968 shape factors + Ely 1981 Enskog X correction; recommended for polar fluids (H₂O) |
+| **Transport — Ely-Hanley path** | Ely-Hanley 1981a/b ECS, **Pedersen-Fredenslund mapping** | μ, κ via HMH methane reference; corresponding-states reference state from Pedersen critical-ratio mapping + rotational-coupling α with an SRK methane reference density (replaces the LCL shape factors — see [Model updates](#model-updates)); recommended for polar fluids (H₂O) |
 | **Mass diffusivity** | Fuller 1969 + Takahashi 1974 | Pressure-corrected binary D_ij; identical between the two transport paths |
 | **Mixture mixing rules** | Mole-weighted pair averages | Pre-computed at construction time; one matrix set per backend |
 | **Thermo** | NASA JANAF polynomials | 7-coefficient `janafThermo` with `sensibleEnthalpy` |
@@ -149,9 +149,9 @@ RGP-13-realFluid/
 │   ├── rfSpecie/                     base specie class with critical-property accessors
 │   ├── SRKGas/                       SRK equation of state + Péneloux shift
 │   ├── chungTransport/               Chung-Lee-Starling 1988 μ, κ
-│   ├── elyHanleyTransport/           Ely-Hanley ECS μ, κ (standalone, no Chung fallback)
+│   ├── elyHanleyTransport/           Ely-Hanley ECS μ, κ — Pedersen-Fredenslund mapping
 │   │       ├── elyHanleyTransport.{H,C,I.H}
-│   │       └── (C^2 quintic soft-clamp on V_r, T_r, ρ_r boundaries)
+│   │       └── (SRK methane reference density; C^2 quintic soft-clamp on T_o, ρ_o)
 │   ├── SRKchungTakaMixture/          mixture class for the Chung backend
 │   ├── SRKelyHanleyMixture/          mixture class for the Ely-Hanley backend
 │   ├── FGM/                          flamelet-generated-manifold combustion model
@@ -173,20 +173,106 @@ RGP-13-realFluid/
 The two backends are bit-identical for **non-polar** species; switching
 between them is safe for the LOX/LH₂ and LOX/CH₄ regimes.
 
+## Model updates
+
+Validated against NIST/REFPROP and CoolProp HEOS over 50–500 bar
+(`test/*_CT`, `test/*` Ely-Hanley sweeps). MAPE = mean absolute percentage
+error vs reference.
+
+### Ely-Hanley — Pedersen-Fredenslund corresponding states
+
+The reference-state mapping was replaced. The textbook **Leach-Chappelear-
+Leland (1968) shape factors** (`phiShape`/`thetaShape`, retained as dead code
+for provenance) pushed the methane reference into the wrong phase near a
+species' pseudo-critical line — e.g. LCL drove `T_o` below methane's `T_c`
+into the liquid branch while the target fluid was already gas-like, giving a
+spurious μ/κ "bump" (CO₂ ≈ 300–360 K, H₂O ≈ 700–800 K) and over-predicting μ
+by 3–4×.
+
+The current path uses the **Pedersen-Fredenslund** critical-ratio mapping:
+
+```
+T_Ref = T · Tc_CH4 / Tc_mix      P_Ref = p · Pc_CH4 / Pc_mix
+```
+
+so the methane reference changes phase at the *same reduced state* as the
+target, plus a Pedersen **rotational-coupling factor** `α = 1 + c·ρ_R^1.847·MW^k`.
+The methane reference **density** comes from the SRK EoS (Cardano cubic with
+minimum-fugacity root selection) rather than an ideal/empirical estimate, so
+the dense-liquid reference is physical (`X_η = 1`; the Ely Enskog correction
+is absorbed into α). The HMH (Hanley-McCarty-Haynes 1975 / 1977) methane
+reference μ/κ correlations are unchanged.
+
+μ MAPE, old LCL/Oefelein → Pedersen: **O₂ 33 → 2.9 %, CO₂ 67 → 5.9 %,
+H₂ 16 → 8.6 %, H₂O 86 → 23 %, KERO 219 → 27 %, n-C₁₂ 173 → 57 %**; κ
+improves comparably. The pseudo-critical bumps are removed.
+
+### Chung — discontinuity fix + acentric coefficient
+
+- **κ jump removed.** Chung's internal-mode α uses the *ideal-gas* Cv₀. The
+  thermo chain returns `Cp_real = Cp_ig + Cp_dep(SRK)`, so evaluating it at
+  1 atm picks up a compressed-liquid SRK departure below a species' 1-atm
+  boiling point (H₂O at 373 K, O₂ at 90 K) and produces a κ discontinuity
+  (e.g. H₂O at ≈ 380 K). `Cp_ig` is now taken at a low reference pressure
+  (`p_ref = 100 Pa`) where every species stays single-phase vapour. Mirrored
+  in the Ely-Hanley path.
+- **Acentric coefficient corrected** in the κ β-term to **1.3168** (Poling
+  5th ed. Eq. 10-3.14; the previous 1.1368 was a transposition — negligible
+  for low-ω O₂ but matters for H₂O ω = 0.344 and kerosene ω = 0.467).
+
+Current Chung MAPE (pressure-averaged): O₂ ρ 0.7 / μ 2.1 / κ 4.2 / Cp 0.6 %;
+CO₂ 1.3 / 2.7 / 7.6 / 1.0 %; H₂O 4.0 / 12 / 41 / 6.8 % (κ degrades for the
+strongly H-bonded liquid — use Ely-Hanley there).
+
+### EoS — temperature-dependent Péneloux `c(T)`
+
+A constant Péneloux shift matches one reference temperature, but the SRK
+liquid-density error grows with T (H₂O drifts to ≈ −10 % by 500 K even when
+calibrated at 300 K). An optional quadratic `c(T)` ramp closes this:
+
+```c++
+rfProperties
+{
+    c              5.9448e-3;                    // baseline shift [m^3/kmol]
+    penelouxCoeffs (9.6031e-3 -2.5316e-5 4.5560e-8 580 760); // cq0 cq1 cq2 Tlo Thi
+    // c(T) = cq0 + cq1·T + cq2·T^2 for T ≤ Tlo, smoothstep-ramped to the
+    // constant baseline c over [Tlo, Thi]; constant c above Thi.
+}
+```
+
+Applied to H₂O this brings the 300–1000 K liquid-density MAPE from 7.7 % to
+0.8 %. Species without `penelouxCoeffs` fall back to the constant `c`.
+
+### Hot-path optimisation (both backends, bit-identical)
+
+Composition-only quantities are precomputed once per cell in `updateTRANS`
+(Pedersen Tc_mix/Pc_mix combining loop, mixture constants), and the
+per-(p, T) reference evaluation is cached so the consecutive `mu(p,T)` and
+`kappa(p,T)` calls on one cell share a single solve — the Pedersen
+`srkMethaneRho` cubics for Ely-Hanley, and the `rho(p,T)` cubic plus
+collision integral Ω* for Chung. Verified bit-for-bit identical to the
+pre-optimisation results (ρ/Cp exactly 0, μ/κ at floating-point reorder
+level). The cache is `mutable` and assumes OpenFOAM's serial per-process
+cell loop.
+
 ## Numerical robustness (Ely-Hanley specifics)
 
-The textbook Leach 1968 / Hanley-McCarty-Haynes 1975 correlations
-diverge outside their fitted range. To keep μ(p, T), κ(p, T) C¹
-continuous on the entire CFD operating envelope the Ely-Hanley
-implementation applies **C² quintic Hermite soft-clamps** on:
+The Hanley-McCarty-Haynes methane reference μ/κ correlations diverge outside
+their fitted range. With the Pedersen mapping the reference state `(T_o, ρ_o)`
+comes from the SRK methane density and is physical, but to keep μ(p, T),
+κ(p, T) C¹/C² continuous on the entire CFD envelope two **C² quintic Hermite
+soft-clamps** (identity on the interior; value-, slope- and curvature-
+continuous at every junction) bound the reference state fed to the HMH
+correlation (`elyHanleyTransportI.H` `softClamp`):
 
-- shape-factor input `V_r, T_r ∈ [0.5, 2.0]`  (`elyHanleyTransportI.H` `phiShape`/`thetaShape`, half-width w = 0.25)
-- methane reference temperature `T_o ∈ [1, 10⁵] K` (loose hard guard only — Sutherland is bounded)
-- methane reduced density `ρ_r ∈ [0, 3]` for the cubic dense-correction (`muRef`/`lambdaRef`, half-width w = 0.30)
+- methane reference temperature `T_o ∈ [40, 2000] K` (half-width w = 30)
+- methane reference density `ρ_o ∈ [0, 569] kg/m³` (= 3.5·ρ_c,CH₄; half-width w = 80)
 
-Each soft-clamp is value-, slope-, and curvature-continuous at every
-junction. See `RGP-13_ECS_deviations.ipynb` (in the parent repo) for
-the full enumeration of corrections and their derivations.
+The earlier Leach-Chappelear-Leland shape-factor soft-clamps on `V_r, T_r`
+are no longer in the active path — the Pedersen critical-ratio mapping
+replaces them; `phiShape`/`thetaShape` remain only as dead code for
+provenance. See `RGP-13_ECS_deviations.ipynb` (in the parent repo) for the
+full enumeration of corrections and their derivations.
 
 ## References
 
@@ -230,6 +316,9 @@ the full enumeration of corrections and their derivations.
 13. Oefelein, J.C. *Advances in modeling supercritical fluid behavior
     and combustion in high-pressure propulsion systems*. AIAA Paper
     2019-0634 (SciTech 2019).
+14. Pedersen, K.S. & Fredenslund, Aa. *An improved corresponding states
+    model for the prediction of oil and gas viscosities and thermal
+    conductivities*. Chem. Eng. Sci. **42** (1987) 182.
 
 ## Acknowledgments
 
