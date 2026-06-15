@@ -44,7 +44,12 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
 
     // --- FGM manifold update: gZ, composition Y_k, PV source (from Z, C) ---
     updateManifold();
-    thermo_.normaliseY();
+    // NOTE: thermo_.normaliseY() REMOVED -- with every specie marked inactive
+    // it sets the default specie (N2) = 1 - sum(ACTIVE) = 1 (no active species),
+    // spuriously diluting the tabulated composition (which already sums to 1,
+    // with N2 = 0 from the table) by ~50% N2 after the mixture renormalises.
+    // The FGM manifold already delivers a normalised composition, so the call
+    // is unnecessary and corrupts it.
 
     // --- Mixture-fraction transport (conserved scalar, no source) ---
     {
@@ -94,37 +99,20 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     }
 
 
-    volScalarField& he = thermo_.he();
-
-    fvScalarMatrix EEqn
-    (
-        fvm::ddt(rho, he) + mvConvection->fvmDiv(phi, he)
-      + fvc::ddt(rho, K) + fvc::div(phi, K)
-      + pressureWork
-        (
-            he.name() == "e"
-          ? mvConvection->fvcDiv(phi, p/rho)()
-          : -dpdt
-        )
-      + thermophysicalTransport->divq(he)
-     ==
-        // No explicit Qdot: heat release is implicit in the tabulated
-        // composition when the thermo uses absolute enthalpy.
-        (
-            buoyancy.valid()
-          ? fvModels().source(rho, he) + rho*(U & buoyancy->g)
-          : fvModels().source(rho, he)
-        )
-    );
-
-    EEqn.relax();
-
-    fvConstraints().constrain(EEqn);
-
-    EEqn.solve();
-
-    fvConstraints().constrain(he);
-
+    // --- No transported energy equation (adiabatic FPV/FGM closure) ---
+    // The thermochemical state (T, he, Y) is a tabulated function of the
+    // manifold coordinates and was set in updateManifold() above: he has been
+    // re-seeded to he(p, T_table) on the looked-up composition. We therefore
+    // do NOT advance an EEqn for he here. The reason is essential, not an
+    // optimisation: under fully-compressible acoustics a transported he is
+    // perturbed off the manifold (the pressure-work/dilatation and convective
+    // fluxes inject/remove energy that the algebraic composition update does
+    // not see), so the he->T inversion drifts and the strained flame
+    // eventually collapses. flameletFoam/FPVFoam transport only Z and c and
+    // read T/he from the table for exactly this reason.
+    //
+    // thermo.correct() inverts the manifold he straight back to T_table and
+    // refreshes rho, psi, mu, ... at the new (p, T, Y) for the pressure solve.
     thermo_.correct();
 }
 

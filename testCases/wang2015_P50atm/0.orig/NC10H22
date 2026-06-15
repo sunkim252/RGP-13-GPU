@@ -1,0 +1,11 @@
+FoamFile { format ascii; class volScalarField; object NC10H22; }
+dimensions [0 0 0 0 0 0 0];
+internalField uniform 0;
+boundaryField
+{
+    fuelInlet     { type fixedValue; value uniform 0.76739; }
+    oxidizerInlet { type fixedValue; value uniform 0; }
+    upperOutflow  { type zeroGradient; }
+    lowerOutflow  { type zeroGradient; }
+    frontAndBack  { type empty; }
+}

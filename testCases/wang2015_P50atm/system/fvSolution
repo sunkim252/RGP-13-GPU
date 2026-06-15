@@ -16,4 +16,8 @@ PIMPLE
     nOuterCorrectors 1;
     nCorrectors 2;
     nNonOrthogonalCorrectors 0;
+    maxCo 0.4;
+    maxDeltaT 1e-4;
+    rDeltaTSmoothingCoeff 0.1;
+    rDeltaTDampingCoeff 0.5;
 }

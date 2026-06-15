@@ -3,8 +3,8 @@ dimensions [0 0 0 1 0 0 0];
 internalField uniform 1000;
 boundaryField
 {
-    fuelInlet     { type fixedValue; value uniform 1000; }
-    oxidizerInlet { type fixedValue; value uniform 1000; }
+    fuelInlet     { type fixedValue; value uniform 800; }
+    oxidizerInlet { type fixedValue; value uniform 800; }
     upperOutflow  { type zeroGradient; }
     lowerOutflow  { type zeroGradient; }
     frontAndBack  { type empty; }

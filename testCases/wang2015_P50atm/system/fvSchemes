@@ -1,6 +1,6 @@
 FoamFile { format ascii; class dictionary; object fvSchemes; }
 
-ddtSchemes { default Euler; }
+ddtSchemes { default localEuler; }
 gradSchemes { default Gauss linear; }
 divSchemes
 {

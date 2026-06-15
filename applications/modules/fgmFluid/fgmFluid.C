@@ -101,6 +101,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     Sct_(fgmTable_.lookupOrDefault<scalar>("Sct", 0.7)),
 
+    sourcePVscale_(fgmTable_.lookupOrDefault<scalar>("sourcePVscale", 1.0)),
+
     varModel_(varModel::laminar),
 
     thermophysicalTransport
@@ -198,6 +200,37 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     // Initialise the manifold-derived fields.
     updateManifold();
+
+    // Re-seed the energy field from (p, T) on the JUST-SET manifold
+    // composition. The base thermo constructed he() from the ON-DISK
+    // composition/T, but updateManifold() has now overwritten the composition
+    // with the tabulated Y_k. For a fresh (cold, c~0) start the two agree, but
+    // for any lit/burning initial field the manifold products carry a very
+    // different formation enthalpy than the (defaultSpecie-lumped) disk
+    // composition, leaving he() stale -- the first he->T inversion then fails
+    // to converge ("maximum number of iterations exceeded"). Recomputing he
+    // here makes a burning initial condition (seed c high) consistent, which
+    // is the only way to ignite the manifold (omega_C(c=0)=0 -> a cold seed
+    // cannot self-ignite, especially the weaker low-pressure source).
+    thermo_.he() = thermo_.he(thermo_.p(), thermo_.T());
+    thermo_.correct();
+
+    // [DIAG] Audit the realFluid EOS consistency at the initial state. The
+    // stock compressible pEqn assumes rho ~ psi*p (exact for ideal/PR gas);
+    // a large rho/(psi*p) deviation flags an inconsistent SRK compressibility.
+    {
+        const volScalarField rhoF(thermo_.rho());
+        const volScalarField& psiF = thermo_.psi();
+        const volScalarField& pF = thermo_.p();
+        const volScalarField& TF = thermo_.T();
+        Info<< "[DIAG] init rho[" << min(rhoF).value() << "," << max(rhoF).value()
+            << "] psi[" << min(psiF).value() << "," << max(psiF).value()
+            << "] p[" << min(pF).value() << "," << max(pF).value()
+            << "] T[" << min(TF).value() << "," << max(TF).value() << "]" << nl;
+        const volScalarField ratio(rhoF/(psiF*pF));
+        Info<< "[DIAG] init rho/(psi*p) [" << min(ratio).value() << ","
+            << max(ratio).value() << "]  (stock PR == 1)" << endl;
+    }
 }
 
 
@@ -307,6 +340,17 @@ void Foam::solvers::fgmFluid::updateManifold()
         Yname[k] = thermo_.species()[id];
     }
 
+    // Tabulated temperature: the FPV/FGM thermochemical state (T and the
+    // composition) is a FUNCTION of the manifold coordinates (Z, gZ, c, chi)
+    // -- it is LOOKED UP here, not advanced by a transported energy equation.
+    // This is the standard adiabatic flamelet coupling (cf. flameletFoam /
+    // FPVFoam, which transport only Z and c and read T/he from the table) and
+    // avoids the transported-enthalpy instability: an EEqn for he is, under
+    // fully-compressible acoustics, perturbed off the manifold so the he->T
+    // inversion drifts and the flame collapses. Reading T from the table keeps
+    // (T, Y) permanently consistent.
+    scalarField& Tc = thermo_.T().primitiveFieldRef();
+
     forAll(gZc, celli)
     {
         const scalar Zcl = max(min(Zc[celli], scalar(1)), scalar(0));
@@ -335,7 +379,9 @@ void Foam::solvers::fgmFluid::updateManifold()
         // 3-D interpolation so existing cases still run.
         if (useChi)
         {
-            srcc[celli] = rho_l*fgmTable_.interpolate(Zcl, gz, Ccl, chi_st);
+            srcc[celli] =
+                sourcePVscale_*rho_l*fgmTable_.interpolate(Zcl, gz, Ccl, chi_st);
+            Tc[celli] = fgmTable_.interpolateT(Zcl, gz, Ccl, chi_st);
             forAll(Yref, k)
             {
                 (*Yref[k])[celli] =
@@ -344,7 +390,9 @@ void Foam::solvers::fgmFluid::updateManifold()
         }
         else
         {
-            srcc[celli] = rho_l*fgmTable_.interpolate(Zcl, gz, Ccl);
+            srcc[celli] =
+                sourcePVscale_*rho_l*fgmTable_.interpolate(Zcl, gz, Ccl);
+            Tc[celli] = fgmTable_.interpolateT(Zcl, gz, Ccl);
             forAll(Yref, k)
             {
                 (*Yref[k])[celli] =
@@ -359,6 +407,16 @@ void Foam::solvers::fgmFluid::updateManifold()
     {
         Y_[tabSpecieIDs_[k]].correctBoundaryConditions();
     }
+
+    // Fixed-value T patches (the inlets) keep their prescribed temperature;
+    // zeroGradient/outflow patches extrapolate the just-set internal field.
+    thermo_.T().correctBoundaryConditions();
+
+    // Re-seed the energy field from (p, T_table) on the manifold composition.
+    // he is now a DIAGNOSTIC consistent with the looked-up (T, Y), not a
+    // transported variable -- thermo.correct() inverts it straight back to
+    // T_table, so the energy state can never drift off the manifold.
+    thermo_.he() = thermo_.he(thermo_.p(), thermo_.T());
 }
 
 

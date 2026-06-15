@@ -170,6 +170,32 @@ def load_flamelet_dir(dir_path):
     return fls, species
 
 
+def compute_hrr(fls, yaml_file, species, P):
+    """Attach a per-point volumetric heat-release rate [W/m^3] to each flamelet,
+    re-evaluated from the saved (T, Y) structure with the ideal-gas Cantera
+    mechanism (Cantera heat_release_rate = -sum_k h_k w_dot_k). Enables the
+    consumer to integrate the global q_dot for the Wang-2015 Fig.19c check."""
+    import cantera as ct
+    g = ct.Solution(str(yaml_file))
+    names = g.species_names
+    idx = {sp: names.index(sp) for sp in species if sp in names}
+    for fl in fls:
+        T = fl["T"]; n = len(T)
+        hrr = np.zeros(n)
+        Ymat = np.zeros((n, g.n_species))
+        for sp, j in idx.items():
+            Ymat[:, j] = fl["Y"][sp]
+        for i in range(n):
+            s = Ymat[i].sum()
+            if s <= 0:
+                continue
+            g.TPY = max(float(T[i]), 250.0), P, Ymat[i] / s
+            hrr[i] = g.heat_release_rate
+        fl["hrr"] = hrr
+    print(f"[hrr] volumetric heat-release rate for {len(fls)} flamelets "
+          f"(max {max(float(fl['hrr'].max()) for fl in fls):.3g} W/m^3)")
+
+
 # ----------------- chi_st grid + flamelet ranking -----------------
 
 def build_chi_axis(fls, n_chi=N_CHI):
@@ -222,6 +248,54 @@ def _laminar_one(Z, C, W, Zq, Cgrid, nonneg=True):
                 k = np.argmin((Z - ZZ[i, j])**2 + (C - CC[i, j])**2)
                 out[i, j] = W[k]
     return np.maximum(out, 0.0) if nonneg else out
+
+
+def _laminar_branch(Z, C, W, Zq, Cgrid):
+    """Burning-branch (upper-envelope) closure for the MULTI-VALUED source.
+
+    The flamelet family is an S-curve: at one (Z, c) several flamelets of
+    different strain coexist, with DIFFERENT omega_C (upper = burning branch,
+    lower = extinguishing). griddata(method='linear') triangulates the whole
+    concatenated cloud and LINEARLY BLENDS those branches, hollowing the source
+    wherever the cloud is dense and multi-valued. Verified culprit of the 10 atm
+    weak source: griddata gave peak omega_c(Zst)=1619 vs the true burning-branch
+    4571 (-2.8x); 1 atm / 50 atm clouds barely overlap in c so they were
+    unaffected (max-bin == griddata there). FPV (Pierce 2004) tabulates the
+    STABLE BURNING branch, so we take the per-cell MAX (the upper envelope) and
+    griddata-fill the empty cells. Used for omega_C / hrr only; T, Y_k are
+    effectively single-valued in (Z, c) and keep the smooth linear interpolant."""
+    nz, ncg = len(Zq), len(Cgrid)
+    # Smooth upper envelope: per grid node take the MAX over cloud points in a
+    # (dz, dc) neighborhood (not a single cell -- that spikes and the gap-fill
+    # then undershoots between spikes). The window picks the burning branch and
+    # spreads it across the c range the burning family actually occupies.
+    dz = 2.0 * (Zq[1] - Zq[0])
+    dc = 0.06
+    out = np.full((nz, ncg), np.nan)
+    for i, zq in enumerate(Zq):
+        zm = np.abs(Z - zq) <= dz
+        if not zm.any():
+            continue
+        Czi, Wzi = C[zm], W[zm]
+        for j, cq in enumerate(Cgrid):
+            m = np.abs(Czi - cq) <= dc
+            if m.any():
+                out[i, j] = Wzi[m].max()
+    filled = ~np.isnan(out)
+    if HAVE_SCIPY and not filled.all() and filled.any():
+        ZZ, CC = np.meshgrid(Zq, Cgrid, indexing="ij")
+        pts = np.column_stack([ZZ[filled], CC[filled]])
+        vals = out[filled]
+        out[~filled] = griddata(pts, vals,
+                                np.column_stack([ZZ[~filled], CC[~filled]]),
+                                method="linear")
+        nan2 = np.isnan(out)
+        if nan2.any():
+            out[nan2] = griddata(pts, vals,
+                                 np.column_stack([ZZ[nan2], CC[nan2]]),
+                                 method="nearest")
+    out[np.isnan(out)] = 0.0
+    return np.maximum(out, 0.0)
 
 
 # --------------------------- beta-PDF ---------------------------
@@ -285,13 +359,24 @@ def _norm_envelope(fls, eq, Zq, species):
     owner = C_f.argmax(axis=0)
     eq_owns = C_eq >= C_fam
     C_norm = np.maximum(np.maximum(C_eq, C_fam), CEQ_MIN) * (1.0 + 1.0e-3)
-    # c=1 boundary state: equilibrium where it owns the envelope, else the
-    # owning flamelet's local state; omega = 0 on the whole row regardless.
-    T1 = np.where(eq_owns, eq["T_eq"], T_f[owner, np.arange(N_ZQ)])
-    Y1 = {sp: np.where(eq_owns, eq["Y_eq"][sp],
-                       Y_f[sp][owner, np.arange(N_ZQ)])
-          for sp in species}
-    print(f"[build] C_norm envelope: eq owns {100*eq_owns.mean():.0f}% of Z, "
+    # c=1 boundary STATE = chemical equilibrium ALWAYS (Pierce & Moin 2004; van
+    # Oijen & de Goey 2000: "the manifold must match the equilibrium composition
+    # exactly" at the burnt end). The earlier code used the highest-C flamelet
+    # (envelope owner) wherever eq_owns is False, which is wrong on two counts:
+    #   (1) a finite-domain steady flamelet never fully reaches equilibrium, so
+    #       even the lowest-strain member sits 30-100 K BELOW T_eq at the burnt end;
+    #   (2) if the flamelet family carries a NOISY (under-converged) member, the
+    #       max-C owner can be a cool, CO-rich, half-extinguished state (observed:
+    #       chi=87 flamelet, T(Z_st)=2789 K vs T_eq=3794 K) -- this hollowed the
+    #       c=1 column and corrupted the whole high-c manifold.
+    # C_norm = max(C_eq, family envelope) still bounds the transported c in [0,1]
+    # (cross-Z diffusion pushes the flamelet product mass fraction above the LOCAL
+    # equilibrium on the rich side, so C_fam > C_eq there); only the c=1 STATE is
+    # pinned to equilibrium. omega = 0 on the whole c=1 row regardless.
+    T1 = np.asarray(eq["T_eq"], dtype=float).copy()
+    Y1 = {sp: np.asarray(eq["Y_eq"][sp], dtype=float).copy() for sp in species}
+    print(f"[build] C_norm envelope: eq owns {100*eq_owns.mean():.0f}% of Z "
+          f"(c=1 STATE forced to chemical equilibrium everywhere); "
           f"family/eq max ratio={np.max(C_fam/np.maximum(C_eq,CEQ_MIN)):.3f}")
     return C_norm, T1, Y1
 
@@ -325,14 +410,21 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False):
     C_axis = np.linspace(0.0, 1.0, N_C)
     C_norm, T1, Y1 = _norm_envelope(fls, eq, Zq, species)
 
-    field_names = ["omega_C", "T"] + [f"Y_{sp}" for sp in species]
+    # "hrr" (volumetric heat-release rate [W/m^3]) is tabulated when the
+    # flamelets carry it (added by compute_hrr); it lets a consumer integrate
+    # q_dot over the flame zone for the Wang-2015 Fig.19c comparison.
+    has_hrr = all("hrr" in fl for fl in fls)
+    field_names = ["omega_C", "T"] + (["hrr"] if has_hrr else []) \
+        + [f"Y_{sp}" for sp in species]
 
     # Boundary rows: c=1 -> envelope/equilibrium closure (omega=0),
-    # c=0 -> frozen mixing (omega=0).
+    # c=0 -> frozen mixing (omega=0). Both have zero net reaction => hrr=0.
     bZ = np.concatenate([Zq, Zq])
     bc = np.concatenate([np.ones(N_ZQ), np.zeros(N_ZQ)])
     bval = {"omega_C": np.zeros(2 * N_ZQ),
             "T": np.concatenate([T1, eq["T_u"]])}
+    if has_hrr:
+        bval["hrr"] = np.zeros(2 * N_ZQ)
     for sp in species:
         bval[f"Y_{sp}"] = np.concatenate([Y1[sp], eq["Y_u"][sp]])
 
@@ -350,6 +442,8 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False):
             W_l["omega_C"].append(np.where(Cn_at > CEQ_MIN,
                                            fl["omega_C"] / Cn_at, 0.0))
             W_l["T"].append(fl["T"])
+            if has_hrr:
+                W_l["hrr"].append(fl["hrr"])
             for sp in species:
                 W_l[f"Y_{sp}"].append(fl["Y"][sp])
         return (np.concatenate(Zs_l), np.concatenate(cs_l),
@@ -362,7 +456,14 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False):
               f"(c in [0,1], envelope-normalized), full family of "
               f"{len(fls)} flamelets fills (Z,c)")
         Zs, cs, Ws = _cloud(fls)
-        lam = {f: _laminar_one(Zs, cs, Ws[f], Zq, C_axis)[None, ...]
+        # Source fields (omega_C, hrr) are multi-valued on the S-curve -> use the
+        # burning-branch (upper-envelope) closure; griddata-linear blends the
+        # branches and hollowed the dense 10 atm source. T, Y_k are single-valued
+        # in (Z, c) and keep the smooth linear interpolant.
+        SRC_FIELDS = {"omega_C", "hrr"}
+        lam = {f: (_laminar_branch(Zs, cs, Ws[f], Zq, C_axis)
+                   if f in SRC_FIELDS
+                   else _laminar_one(Zs, cs, Ws[f], Zq, C_axis))[None, ...]
                for f in field_names}
         n_slices = 1
     else:
@@ -539,6 +640,11 @@ def main():
                         "meaningful once UNSTEADY flamelets populate the "
                         "(c,chi) plane; for steady families c and chi_st "
                         "are redundant.")
+    p.add_argument("--exclude-idx", default="",
+                   help="comma-separated flamelet indices (NNN in "
+                        "flamelet_NNN.npz) to drop before building -- used to "
+                        "remove half-transitioned outliers that break the "
+                        "monotonic T(c) envelope (Wang Fig18/19 low-P clean).")
     args = p.parse_args()
 
     fl_dir = Path(args.flamelet_dir)
@@ -548,6 +654,15 @@ def main():
 
     fls, species = load_flamelet_dir(fl_dir)
     print(f"[load] {len(fls)} flamelets; species count = {len(species)}")
+    if args.exclude_idx.strip():
+        drop = {int(x) for x in args.exclude_idx.replace(",", " ").split()}
+        def _fidx(fl):
+            import re as _re
+            m = _re.search(r"flamelet_(\d+)\.npz", Path(fl["path"]).name)
+            return int(m.group(1)) if m else -1
+        before = len(fls)
+        fls = [fl for fl in fls if _fidx(fl) not in drop]
+        print(f"[load] excluded idx {sorted(drop)}: {before} -> {len(fls)} flamelets")
     if args.species:
         want = set(args.species.split())
         missing = [s for s in want if s not in species]
@@ -561,6 +676,9 @@ def main():
     T_fuel = float(d0["T_fuel"]); T_ox = float(d0["T_ox"])
     meta = {"src": fl_dir.name, "P": P_ref,
             "closure": "envelope-normalized-c (eq + family max, omega(1)=0)"}
+
+    # Volumetric heat-release rate per flamelet point (Wang-2015 Fig.19c).
+    compute_hrr(fls, args.yaml_file, species, P_ref)
 
     # Equilibrium burnt-end closure on the internal Zq grid (same grid the
     # beta-PDF convolution integrates over).

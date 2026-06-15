@@ -10,8 +10,8 @@ FoamFile { format ascii; class dictionary; object physicalProperties; }
 thermoType
 {
     type            heRhoThermo;
-    mixture         SRKelyHanleyMixture;
-    transport       elyHanley;
+    mixture         SRKchungTakaMixture;
+    transport       chung;
     thermo          janaf;
     energy          absoluteEnthalpy;
     equationOfState SRKGas;

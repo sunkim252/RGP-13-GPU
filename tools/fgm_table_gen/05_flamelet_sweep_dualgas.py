@@ -366,18 +366,17 @@ def run(log=0, mdot_factor=1.25, mdot_max=20.0, restart=False,
             P0 = float(flame.P)
             _log(f"stage A: warm-start from {warm_from} "
                  f"(P={P0/1e5:.1f} bar) -> ramp to {P_OPER/1e5:.1f} bar")
-            # CRITICAL: re-impose the production refine criteria. The
-            # checkpoint restore leaves Cantera's loose defaults, whose
-            # aggressive prune collapsed the grid 152 -> 48 points during
-            # the first 150 atm ramp; the under-resolved peak then
-            # overshot ABOVE the adiabatic-equilibrium ceiling
-            # (Tmax 4082-4205 K vs ~3993 K at 152 bar) -- the same
-            # pathology as the retired stage-C refine.
-            flame.set_refine_criteria(**REFINE_COARSE)
-            try:
-                flame.set_max_grid_points(flame.flame, MAX_GRID_COARSE)
-            except Exception:
-                pass
+            # RAMP WITH auto=False ON THE INHERITED GRID. Cantera's
+            # solve(auto=True) regrids internally regardless of the refine
+            # criteria set on the Sim1D (verified: COARSE and FINAL criteria
+            # produced bit-identical 48-point grids), and the 48-point
+            # solution overshoots the adiabatic-equilibrium ceiling even
+            # after a converged unity-Le settle (4165 K vs the exact 3984 K
+            # at 152 bar) -- pure truncation error at the peak. auto=False
+            # keeps the donor checkpoint's ~152-point grid (refined for the
+            # 100 atm flame; the flame only thins ~(P ratio)^-1/2 ~ 20% per
+            # 1.5x pressure step, so the inherited clustering still resolves
+            # it), and each pressure step settles in multi-round fashion.
             try:
                 flame.max_time_step_count = 200
             except Exception:
@@ -386,34 +385,30 @@ def run(log=0, mdot_factor=1.25, mdot_max=20.0, restart=False,
             for Pt in np.geomspace(P0, P_OPER, nstep + 1)[1:]:
                 flame.P = float(Pt)
                 t0 = time.time()
-                try:
-                    flame.solve(loglevel=log, auto=True)
-                except ct.CanteraError:
-                    if flame.T.max() < 1500.0:
-                        raise
-                    _log(f"  P={Pt/1e5:.2f} bar: steady not declared; "
-                         f"accepting (Tmax={flame.T.max():.0f} K)")
+                Tprev = None
+                for rnd in range(1, 5):
+                    declared = True
+                    try:
+                        flame.solve(loglevel=log, auto=False)
+                    except ct.CanteraError:
+                        if flame.T.max() < 1500.0:
+                            raise
+                        declared = False
+                    Tm = float(flame.T.max())
+                    if declared or (Tprev is not None
+                                    and abs(Tm - Tprev) < 2.0):
+                        break
+                    Tprev = Tm
                 _log(f"  P-ramp {Pt/1e5:7.2f} bar npts={flame.grid.size} "
-                     f"Tmax={flame.T.max():.1f} K dt={time.time()-t0:.1f}s")
-            # Multi-round settle at the FIXED target pressure (the per-step
-            # accepts can leave a drifting transient; rounds continue until
-            # Cantera declares steady or Tmax is stationary -- the same
-            # recipe that re-converged the corrupted 10 atm idx=12 point).
-            Tprev = None
-            for rnd in range(1, 5):
-                declared = True
-                try:
-                    flame.solve(loglevel=log, auto=False)
-                except ct.CanteraError:
-                    if flame.T.max() < 1500.0:
-                        raise
-                    declared = False
-                Tm = float(flame.T.max())
-                _log(f"  target settle round {rnd}: declared={declared} "
-                     f"Tmax={Tm:.1f} K")
-                if declared or (Tprev is not None and abs(Tm - Tprev) < 2.0):
-                    break
-                Tprev = Tm
+                     f"Tmax={flame.T.max():.1f} K ({rnd} round(s), "
+                     f"dt={time.time()-t0:.1f}s)")
+            # NO extra mixture-averaged settle here: the ramp's final
+            # auto=True solve already adapted/converged at the target
+            # pressure, and additional MA pseudo-time on the thin flame only
+            # drifted the peak upward (+100 K per 200 steps, observed). Go
+            # straight to the unity-Le swap + multi-round settle below --
+            # under unity-Le the adiabatic-equilibrium ceiling is enforced
+            # thermodynamically (h(Z) linear).
         else:
             _log(f"stage A: ideal-gas converge directly @ "
                  f"{P_OPER/1e5:.1f} bar, T_inlets={T_HOT_START} K "

@@ -128,6 +128,13 @@ protected:
         //- Turbulent Schmidt number for the control-variable subgrid flux
         scalar Sct_;
 
+        //- Progress-variable source scale (default 1). Diagnostic/tuning knob
+        //  for the source-vs-diffusion balance of the burning branch: at low
+        //  pressure the tabulated omega_C is ~p^2 weaker and the FGM burning
+        //  branch can become unstable (Wang-2015 10 atm collapse). Set via
+        //  'sourcePVscale' in fgmProperties.
+        scalar sourcePVscale_;
+
         //- Mixture-fraction variance closure regime, auto-selected from the
         //  momentum-transport "simulationType":
         //    les     -> mixing length L = Delta = V^(1/3)   (subgrid filter)
