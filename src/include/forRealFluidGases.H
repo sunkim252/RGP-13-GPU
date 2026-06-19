@@ -31,6 +31,7 @@ License
 #include "janafThermo.H"
 
 #include "sensibleEnthalpy.H"
+#include "robustSensibleEnthalpy.H"
 #include "sensibleInternalEnergy.H"
 #include "absoluteEnthalpy.H"
 #include "absoluteInternalEnergy.H"
@@ -46,7 +47,7 @@ License
     forThermo(Mu, He, Cp, SRKGas, rfSpecie, Macro, Args)
 
 #define forRealFluidGasEnergiesAndThermos(Mu, Macro, Args...)                  \
-    forRealFluidGasEqns(Mu, sensibleEnthalpy, janafThermo, Macro, Args);      \
+    forRealFluidGasEqns(Mu, robustSensibleEnthalpy, janafThermo, Macro, Args);\
     forRealFluidGasEqns(Mu, sensibleInternalEnergy, janafThermo, Macro, Args);\
     forRealFluidGasEqns(Mu, absoluteEnthalpy, janafThermo, Macro, Args);      \
     forRealFluidGasEqns(Mu, absoluteInternalEnergy, janafThermo, Macro, Args)
