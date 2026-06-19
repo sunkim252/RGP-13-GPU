@@ -248,6 +248,24 @@ public:
             const List<List<scalar>>& sigmd
         );
 
+        //- Tier-0: lightweight update for the no-species-diffusion path.
+        //  Sets the scalar Chung params + Ymd_/Xmd_ (needed by mu/kappa) but
+        //  SKIPS the O(n^2) Tcmd_/Pcmd_/Mmd_/sigmd_ copies (only Dimix uses
+        //  them). mu/kappa stay bit-identical to the full updateTRANS path.
+        inline void updateTRANS_noDiffusion
+        (
+            const scalar& sigmaM,
+            const scalar& epsilonkM,
+            const scalar& MM,
+            const scalar& VcM,
+            const scalar& TcM,
+            const scalar& omegaM,
+            const scalar& miuiM,
+            const scalar& kappaiM,
+            const List<scalar>& Ymd,
+            const List<scalar>& Xmd
+        );
+
         //- Access functions for member data
         inline scalar sigmaM() const;
         inline scalar epsilonkM() const;

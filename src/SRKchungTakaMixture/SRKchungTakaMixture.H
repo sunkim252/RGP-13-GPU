@@ -53,6 +53,7 @@ SourceFiles
 
 #include "multicomponentMixture.H"
 #include "FieldListSlice.H"
+#include "Switch.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -125,6 +126,15 @@ private:
         List<scalar> ListPc_;
         List<List<scalar>> MMD_;
         List<List<scalar>> SIGMD_;
+
+        //- Tier-0: build/store the O(n^2) Takahashi binary-diffusion matrices
+        //  (Tcmd/Pcmd) only when species diffusivity (chungTransport::Dimix)
+        //  is actually consumed. FPV transports control variables (Z,C), not
+        //  per-species YEqns, and never calls Dimix, so 'speciesDiffusion off'
+        //  in physicalProperties skips this dead per-cell O(n^2) work. mu/kappa
+        //  are unaffected (they use only the scalar Chung params + Xmd_).
+        //  Default true preserves multicomponentFluid behaviour.
+        Switch computeSpeciesDiffusion_;
 
 
     // Private Member Functions

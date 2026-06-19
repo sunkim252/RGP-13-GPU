@@ -191,54 +191,68 @@ Foam::SRKchungTakaMixture<ThermoType>::calcMixture
         Yl[i] = X[i]*ListW_[i]/WmixCorrect;
     }
 
-    // Compute composition-dependent Tc and Pc for diffusivity (Takahashi)
-    // Exploit symmetry: TCMD[i][j] == TCMD[j][i]
-    List<List<scalar>> TCMD(nSpecies);
-    List<List<scalar>> PCMD(nSpecies);
-
-    // Pre-allocate inner lists
-    forAll(TCMD, i)
+    if (computeSpeciesDiffusion_)
     {
-        TCMD[i].setSize(nSpecies);
-        PCMD[i].setSize(nSpecies);
-    }
+        // Compute composition-dependent Tc and Pc for diffusivity (Takahashi)
+        // Exploit symmetry: TCMD[i][j] == TCMD[j][i]
+        List<List<scalar>> TCMD(nSpecies);
+        List<List<scalar>> PCMD(nSpecies);
 
-    for (label i = 0; i < nSpecies; i++)
-    {
-        // Diagonal
-        TCMD[i][i] = ListTc_[i];
-        if (TCMD[i][i] == 0) { TCMD[i][i] = 1e-40; }
-        PCMD[i][i] = ListPc_[i];
-        if (PCMD[i][i] == 0) { PCMD[i][i] = 1e-40; }
-
-        // Upper triangle, mirror to lower
-        for (label j = i + 1; j < nSpecies; j++)
+        // Pre-allocate inner lists
+        forAll(TCMD, i)
         {
-            const scalar XiPlusXj = X[i] + X[j];
-            const scalar invSum =
-                (XiPlusXj == 0) ? 0.0 : 1.0/XiPlusXj;
-
-            scalar tcVal =
-                (X[i]*ListTc_[i] + X[j]*ListTc_[j])*invSum;
-            if (tcVal == 0) { tcVal = 1e-40; }
-
-            scalar pcVal =
-                (X[i]*ListPc_[i] + X[j]*ListPc_[j])*invSum;
-            if (pcVal == 0) { pcVal = 1e-40; }
-
-            TCMD[i][j] = tcVal;
-            TCMD[j][i] = tcVal;
-            PCMD[i][j] = pcVal;
-            PCMD[j][i] = pcVal;
+            TCMD[i].setSize(nSpecies);
+            PCMD[i].setSize(nSpecies);
         }
-    }
 
-    // Update coefficients for mixture in Chung's model
-    mixture_.updateTRANS
-    (
-        sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM,
-        Yl, X, TCMD, PCMD, MMD_, SIGMD_
-    );
+        for (label i = 0; i < nSpecies; i++)
+        {
+            // Diagonal
+            TCMD[i][i] = ListTc_[i];
+            if (TCMD[i][i] == 0) { TCMD[i][i] = 1e-40; }
+            PCMD[i][i] = ListPc_[i];
+            if (PCMD[i][i] == 0) { PCMD[i][i] = 1e-40; }
+
+            // Upper triangle, mirror to lower
+            for (label j = i + 1; j < nSpecies; j++)
+            {
+                const scalar XiPlusXj = X[i] + X[j];
+                const scalar invSum =
+                    (XiPlusXj == 0) ? 0.0 : 1.0/XiPlusXj;
+
+                scalar tcVal =
+                    (X[i]*ListTc_[i] + X[j]*ListTc_[j])*invSum;
+                if (tcVal == 0) { tcVal = 1e-40; }
+
+                scalar pcVal =
+                    (X[i]*ListPc_[i] + X[j]*ListPc_[j])*invSum;
+                if (pcVal == 0) { pcVal = 1e-40; }
+
+                TCMD[i][j] = tcVal;
+                TCMD[j][i] = tcVal;
+                PCMD[i][j] = pcVal;
+                PCMD[j][i] = pcVal;
+            }
+        }
+
+        // Update coefficients for mixture in Chung's model
+        mixture_.updateTRANS
+        (
+            sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM,
+            Yl, X, TCMD, PCMD, MMD_, SIGMD_
+        );
+    }
+    else
+    {
+        // Tier-0: species diffusivity (Dimix) is never consumed (control-
+        // variable FPV, no per-species YEqn), so skip the O(n^2) Takahashi
+        // Tcmd/Pcmd build + copies. mu/kappa need only the scalar Chung
+        // params + Xmd_(=X)/Ymd_(=Yl) -> transport stays bit-identical.
+        mixture_.updateTRANS_noDiffusion
+        (
+            sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM, Yl, X
+        );
+    }
 
     return mixture_;
 }
@@ -274,9 +288,19 @@ Foam::SRKchungTakaMixture<ThermoType>::SRKchungTakaMixture
     ListTc_(numberOfSpecies_),
     ListPc_(numberOfSpecies_),
     MMD_(numberOfSpecies_),
-    SIGMD_(numberOfSpecies_)
+    SIGMD_(numberOfSpecies_),
+    computeSpeciesDiffusion_
+    (
+        dict.lookupOrDefault<Switch>("speciesDiffusion", true)
+    )
 {
     const scalar RR = Foam::constant::thermodynamic::RR;
+
+    Info<< "SRKchungTakaMixture: speciesDiffusion = "
+        << computeSpeciesDiffusion_
+        << " (Takahashi binary-diffusion matrices "
+        << (computeSpeciesDiffusion_ ? "built" : "SKIPPED [Tier-0]") << ")"
+        << endl;
 
     // Pre-compute single-species quantities
     forAll(BM_, i)

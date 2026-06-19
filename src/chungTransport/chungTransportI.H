@@ -570,6 +570,39 @@ inline void Foam::chungTransport<Thermo>::updateTRANS
 }
 
 
+template<class Thermo>
+inline void Foam::chungTransport<Thermo>::updateTRANS_noDiffusion
+(
+    const scalar& sigmaM,
+    const scalar& epsilonkM,
+    const scalar& MM,
+    const scalar& VcM,
+    const scalar& TcM,
+    const scalar& omegaM,
+    const scalar& miuiM,
+    const scalar& kappaiM,
+    const List<scalar>& Ymd,
+    const List<scalar>& Xmd
+)
+{
+    sigmaM_    = sigmaM;
+    epsilonkM_ = epsilonkM;
+    MM_        = MM;
+    VcM_       = VcM;
+    TcM_       = TcM;
+    omegaM_    = omegaM;
+    miuiM_     = miuiM;
+    kappaiM_   = kappaiM;
+    Ymd_       = Ymd;
+    Xmd_       = Xmd;
+    // Tcmd_/Pcmd_/Mmd_/sigmd_ deliberately NOT updated -- only Dimix reads
+    // them and the no-diffusion path never calls Dimix. Skips the O(n^2)
+    // matrix copies; mu/kappa use only the scalars above + Xmd_.
+
+    cacheT_ = -1; // composition changed -> invalidate (p,T) cache
+}
+
+
 // * * * * * * * * * * * * * * * Access Functions * * * * * * * * * * * * * * //
 
 template<class Thermo>

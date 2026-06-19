@@ -128,6 +128,14 @@ class SRKGas
         scalar cTlo_;
         scalar cThi_;
 
+        //- Tier-1 memoisation of the cubic-root solve: (p,T) -> Z, shared by
+        //  rho/psi/Cp/mu/kappa within one cell (each calls Z(p,T) at the same
+        //  state). Invalidated on updateEoS (composition change); sentinel
+        //  pZcache_ < 0 forces a first-call miss. mutable: Z() is const.
+        mutable scalar pZcache_ = -1;
+        mutable scalar TZcache_ = -1;
+        mutable scalar Zcache_ = 0;
+
 
     // Private Member Functions
 
@@ -271,6 +279,7 @@ public:
                 cq2_ = cq2;
                 cTlo_ = cTlo;
                 cThi_ = cThi;
+                pZcache_ = -1;  // composition changed -> invalidate Z(p,T) cache
             }
 
 

@@ -411,6 +411,13 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
     scalar T
 ) const
 {
+    // Tier-1: reuse the cubic root if (p,T) unchanged since the last solve
+    // (rho/psi/Cp/mu/kappa all query Z at the same cell state).
+    if (p == pZcache_ && T == TZcache_)
+    {
+        return Zcache_;
+    }
+
     const scalar aAlpha = coef1_ - coef2_*sqrt(T) + coef3_*T;
 
     const scalar A =
@@ -454,32 +461,21 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
             qm*cos((th + 4*pi)/3.0) - a2/3.0
         };
 
-        scalar best = great;
-        for (int i = 0; i < 3; i++)
-        {
-            const scalar Zi = r[i];
-
-            // Physical roots only: Z > B <=> v > b (above the covolume)
-            if (Zi > B)
-            {
-                const scalar lnPhi =
-                    Zi - 1.0 - log(max(Zi - B, scalar(1e-30)))
-                  - (A/B)*log(1.0 + B/Zi);
-
-                if (lnPhi < best)
-                {
-                    best = lnPhi;
-                    root = Zi;
-                }
-            }
-        }
-
-        // Fallback (no root above the covolume -- pathological inputs):
-        // retain the legacy largest-root behaviour.
-        if (root < 0)
-        {
-            root = max(r[0], max(r[1], r[2]));
-        }
+        // Always select the largest root (vapour branch), matching the OFv8
+        // soaveRedlichKwong reference. The max root is continuous in T, so the
+        // enthalpy->temperature Newton inversion (species::thermo::T) always
+        // converges -- proven robust in production (validated 67-day run).
+        //
+        // NOTE: this overestimates the specific volume of compressed-liquid
+        // states (e.g. cryogenic LOX well below Tc). The minimum-fugacity /
+        // smooth-blended root selection that corrected that density was
+        // reverted here because it makes Z (hence h) discontinuous across the
+        // saturation line, which breaks the T(h) inversion for cold dense
+        // mixing cells ("Maximum number of iterations exceeded"). Reconciling
+        // compressed-liquid density accuracy with inversion robustness (e.g.
+        // a robust bracketing T(h) solver, or a two-phase-aware enthalpy) is
+        // left as future work.
+        root = max(r[0], max(r[1], r[2]));
     }
     else
     {
@@ -508,6 +504,9 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
         root = S + Tl - a2/3.0;
     }
 
+    pZcache_ = p;
+    TZcache_ = T;
+    Zcache_ = root;
     return root;
 }
 
