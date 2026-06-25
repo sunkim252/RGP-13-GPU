@@ -712,12 +712,12 @@ inline void Foam::chungTransport<Thermo>::operator=
     omegaM_    = ch.omegaM_;
     miuiM_     = ch.miuiM_;
     kappaiM_   = ch.kappaiM_;
-    Ymd_       = ch.Ymd_;
-    Xmd_       = ch.Xmd_;
-    Tcmd_      = ch.Tcmd_;
-    Pcmd_      = ch.Pcmd_;
-    Mmd_       = ch.Mmd_;
-    sigmd_     = ch.sigmd_;
+    // Tier-3: Ymd_/Xmd_/Tcmd_/Pcmd_/Mmd_/sigmd_ deliberately NOT copied. The
+    // per-cell mixing mixture_ = sum Y_i*thermo_i only needs the base Thermo;
+    // these List members are authoritatively set afterwards by
+    // updateTRANS[_noDiffusion] (Xmd_/Ymd_/scalars) and the matrices are read
+    // only by Dimix (FPV never calls it). Skipping the ~106x per-cell deep List
+    // copies removes the dominant malloc/free churn (profiled ~62% of runtime).
 
     cacheT_ = -1; // invalidate (p,T) cache
 }
@@ -739,12 +739,9 @@ inline void Foam::chungTransport<Thermo>::operator+=
     omegaM_    = ch.omegaM_;
     miuiM_     = ch.miuiM_;
     kappaiM_   = ch.kappaiM_;
-    Ymd_       = ch.Ymd_;
-    Xmd_       = ch.Xmd_;
-    Tcmd_      = ch.Tcmd_;
-    Pcmd_      = ch.Pcmd_;
-    Mmd_       = ch.Mmd_;
-    sigmd_     = ch.sigmd_;
+    // Tier-3: see operator= -- the 6 List members (Ymd_/Xmd_/Tcmd_/Pcmd_/Mmd_/
+    // sigmd_) are set after mixing by updateTRANS[_noDiffusion] (or read only by
+    // the never-called Dimix), so the per-cell deep copies are pure dead work.
 
     cacheT_ = -1; // invalidate (p,T) cache
 }
@@ -785,12 +782,15 @@ inline Foam::chungTransport<Thermo> Foam::operator+
         ch1.omegaM_,
         ch1.miuiM_,
         ch1.kappaiM_,
-        ch1.Ymd_,
-        ch1.Xmd_,
-        ch1.Tcmd_,
-        ch1.Pcmd_,
-        ch1.Mmd_,
-        ch1.sigmd_
+        // Tier-3: empty List members -- the mixing temporary's Ymd_/Xmd_/Tcmd_/
+        // Pcmd_/Mmd_/sigmd_ are never read (set later by updateTRANS); passing
+        // empty Lists avoids copying the per-species matrices/vectors per cell.
+        List<scalar>(),
+        List<scalar>(),
+        List<List<scalar>>(),
+        List<List<scalar>>(),
+        List<List<scalar>>(),
+        List<List<scalar>>()
     );
 }
 
@@ -813,12 +813,15 @@ inline Foam::chungTransport<Thermo> Foam::operator*
         ch.omegaM_,
         ch.miuiM_,
         ch.kappaiM_,
-        ch.Ymd_,
-        ch.Xmd_,
-        ch.Tcmd_,
-        ch.Pcmd_,
-        ch.Mmd_,
-        ch.sigmd_
+        // Tier-3: empty List members (set later by updateTRANS) -- avoids the
+        // per-cell copy of the per-species matrices/vectors into the scaled
+        // mixing temporary.
+        List<scalar>(),
+        List<scalar>(),
+        List<List<scalar>>(),
+        List<List<scalar>>(),
+        List<List<scalar>>(),
+        List<List<scalar>>()
     );
 }
 
