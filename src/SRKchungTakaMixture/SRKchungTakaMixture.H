@@ -54,6 +54,8 @@ SourceFiles
 #include "multicomponentMixture.H"
 #include "FieldListSlice.H"
 #include "Switch.H"
+#include "PtrList.H"
+#include "tabulatedRealGasMixture.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -67,7 +69,8 @@ namespace Foam
 template<class ThermoType>
 class SRKchungTakaMixture
 :
-    public multicomponentMixture<ThermoType>
+    public multicomponentMixture<ThermoType>,
+    public tabulatedRealGasMixture
 {
 public:
 
@@ -137,7 +140,78 @@ private:
         Switch computeSpeciesDiffusion_;
 
 
+    // Tier-2 tabulated real-gas coefficients (FPV/FGM manifold lookup)
+
+        //- When true, calcMixture() replaces the per-cell O(n^2)
+        //  calculateRealGas() pair sum with a lookup of the 13 manifold
+        //  coefficients from coeffFields_, for internal-cell composition
+        //  slices only. Set/cleared via enable/disableCoeffTabulation().
+        mutable bool useTabulatedCoeffs_;
+
+        //- Internal field of the reference (species 0) mass-fraction field.
+        //  A composition slice whose &Y[0] lies within this field's contiguous
+        //  storage addresses an internal cell (celli recovered by offset; where
+        //  coeffFields_ are valid); anything else (patch faces, foreign field
+        //  sets) falls back to live mixing.
+        mutable const scalarField* refInternalField_;
+
+        //- Internal coefficient fields filled from the table by the solver,
+        //  in coeffNames() order (length nCoeffs_ when tabulation is active).
+        mutable List<const scalarField*> coeffFields_;
+
+        //- Remaining tabulated-vs-live consistency prints (decremented in
+        //  calcMixture); reset on enableCoeffTabulation().
+        mutable label coeffDiagCount_;
+
+        //- Opt-2 (patch-face tabulation): species-0 mass-fraction boundary
+        //  field per patch. A composition slice whose &Y[0] lies inside one of
+        //  these contiguous patch fields addresses that patch face (facei by
+        //  offset), so its coefficients are looked up from patchCoeffFields_
+        //  instead of rebuilt by the O(n^2) live mixing. Empty -> patch faces
+        //  fall back to live (pre-Opt-2 behaviour).
+        mutable List<const scalarField*> patchRefFields_;
+
+        //- Opt-2: per-patch, per-coefficient boundary fields filled from the
+        //  table by the solver (outer index = patch, inner = coeffNames()
+        //  order, length nCoeffs_).
+        mutable List<List<const scalarField*>> patchCoeffFields_;
+
+
+    // Opt-1 base-thermo blend node interpolation
+
+        //- Pre-blended base thermo at each manifold node (length nTot when
+        //  active). Built once at enable from the table node mass fractions, so
+        //  calcMixture interpolates the 16 bracketing corner mixtures instead of
+        //  summing the 106-species blend per internal cell. Bit-consistent: by
+        //  linearity sum_corner w*nodeMix == sum_species Y*thermo (FP order
+        //  apart), the same identity Tier-2 uses for its coefficients.
+        mutable PtrList<thermoMixtureType> nodeMixtures_;
+
+        //- Opt-1 active flag.
+        mutable bool useBaseBlendTab_;
+
+        //- Opt-1: the table (16-node stencil) and the manifold-coordinate
+        //  internal fields used to locate the stencil for a recovered cell.
+        mutable const FGMTable* fgmTablePtr_;
+        mutable const scalarField* ZfieldPtr_;
+        mutable const scalarField* gZfieldPtr_;
+        mutable const scalarField* CfieldPtr_;
+        mutable const scalarField* chiFieldPtr_;
+
+
     // Private Member Functions
+
+        //- Convert a mass-fraction composition (slice or list) to mole
+        //  fractions X and a non-negative mass-fraction copy Yl, using the
+        //  exact same arithmetic as the live calcMixture() path so the
+        //  tabulated coefficients stay bit-consistent.
+        template<class CompType>
+        void compositionToX
+        (
+            const CompType& Y,
+            List<scalar>& X,
+            List<scalar>& Yl
+        ) const;
 
         //- Calculate real-gas mixture parameters from mole fractions
         void calculateRealGas
@@ -216,6 +290,46 @@ public:
             const scalarFieldListSlice&,
             const thermoMixtureType&
         ) const;
+
+
+    // tabulatedRealGasMixture interface (Tier-2 manifold tabulation)
+
+        //- Compute the nCoeffs_ real-gas mixture coefficients from a mass-
+        //  fraction composition Y, in coeffNames() order. Reuses the exact
+        //  live mixing rules (compositionToX + calculateRealGas).
+        virtual void realGasCoeffs
+        (
+            const List<scalar>& Y,
+            List<scalar>& coeffs
+        ) const;
+
+        //- Enable the per-cell tabulated-coefficient lookup.
+        virtual void enableCoeffTabulation
+        (
+            const scalarField& refInternal,
+            const List<const scalarField*>& coeffFields
+        ) const;
+
+        //- Opt-2: enable the tabulated lookup on patch faces as well.
+        virtual void enablePatchCoeffTabulation
+        (
+            const List<const scalarField*>& patchRefs,
+            const List<List<const scalarField*>>& patchCoeffFields
+        ) const;
+
+        //- Opt-1: enable the base-thermo blend node interpolation.
+        virtual void enableBaseBlendTabulation
+        (
+            const List<List<scalar>>& nodeY,
+            const FGMTable& table,
+            const scalarField& Zfield,
+            const scalarField& gZfield,
+            const scalarField& Cfield,
+            const scalarField& chiField
+        ) const;
+
+        //- Disable the tabulated lookup (revert to live mixing).
+        virtual void disableCoeffTabulation() const;
 };
 
 

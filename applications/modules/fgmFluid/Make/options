@@ -1,5 +1,6 @@
 EXE_INC = \
     -I$(LIB_RGP13_SRC)/FGM \
+    -I$(LIB_RGP13_SRC)/SRKchungTakaMixture \
     -I$(FOAM_MODULES)/fluidSolver/lnInclude \
     -I$(FOAM_MODULES)/isothermalFluid/lnInclude \
     -I$(LIB_SRC)/MomentumTransportModels/momentumTransportModels/lnInclude \

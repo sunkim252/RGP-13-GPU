@@ -28,6 +28,8 @@ License
 #include "fvcGrad.H"
 #include "DynamicList.H"
 #include "addToRunTimeSelectionTable.H"
+#include "tabulatedRealGasMixture.H"
+#include "Switch.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -103,7 +105,14 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     sourcePVscale_(fgmTable_.lookupOrDefault<scalar>("sourcePVscale", 1.0)),
 
+    chiClampMin_(fgmTable_.lookupOrDefault<scalar>("chiClampMin", 0.0)),
+    chiClampMax_(fgmTable_.lookupOrDefault<scalar>("chiClampMax", GREAT)),
+
     varModel_(varModel::laminar),
+
+    tabRealGasCoeffs_(false),
+
+    tabLewis_(false),
 
     thermophysicalTransport
     (
@@ -193,10 +202,94 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
             << nl << endl;
     }
 
-    // Multivariate convection over the transported scalars (he, Z, C).
+    // Non-adiabatic FPV (method b): allocate and read the transported total
+    // enthalpy h. Must exist before the first updateManifold() so the defect
+    // coordinate dh = h - h_ad(Z) is available. Adiabatic (chi/3-D) tables skip
+    // this and leave hPtr_ null.
+    if (fgmTable_.useEnthalpy())
+    {
+        hPtr_.reset
+        (
+            new volScalarField
+            (
+                IOobject
+                (
+                    "h", runTime.name(), mesh,
+                    IOobject::MUST_READ, IOobject::AUTO_WRITE
+                ),
+                mesh
+            )
+        );
+        Info<< "fgmFluid: NON-ADIABATIC FPV -- transporting total enthalpy h"
+            << " (conserved scalar; T read from 4-D table at dh)" << nl << endl;
+    }
+
+    // Multivariate convection over the transported scalars (he, Z, C [, h]).
     fields.add(thermo.he());
     fields.add(Z_);
     fields.add(C_);
+    // Register total enthalpy in the multivariate set so mvConvection->fvmDiv
+    // (phi, h) in the non-adiabatic hEqn resolves the shared div(phi,Yi_h)
+    // scheme (otherwise the field is not found in the interpolation table).
+    if (fgmTable_.useEnthalpy())
+    {
+        fields.add(hPtr_());
+    }
+
+    // Tier-4: allocate the per-cell differential-diffusion Lewis-number fields
+    // for whichever control variables the table tabulates (Le_Z / Le_C). They
+    // are filled from the manifold in updateManifold() and consumed by Deff().
+    // Initialised to 1 (unity Lewis) so the first Deff("Z") -- called at the top
+    // of updateManifold() before the fill loop -- is well defined; thereafter
+    // each field carries the previous manifold update's Le (a one-iteration lag
+    // that is immaterial: Le enters only the weak Deff->chi->source coupling and
+    // converges over the outer correctors).
+    if (fgmTable_.hasLeField("Z"))
+    {
+        LeZField_.reset
+        (
+            new volScalarField
+            (
+                IOobject
+                (
+                    "FGM:Le_Z", runTime.name(), mesh,
+                    IOobject::NO_READ, IOobject::NO_WRITE
+                ),
+                mesh,
+                dimensionedScalar(dimless, 1)
+            )
+        );
+    }
+    if (fgmTable_.hasLeField("C"))
+    {
+        LeCField_.reset
+        (
+            new volScalarField
+            (
+                IOobject
+                (
+                    "FGM:Le_C", runTime.name(), mesh,
+                    IOobject::NO_READ, IOobject::NO_WRITE
+                ),
+                mesh,
+                dimensionedScalar(dimless, 1)
+            )
+        );
+    }
+    tabLewis_ = LeZField_.valid() || LeCField_.valid();
+    if (tabLewis_)
+    {
+        Info<< "fgmFluid: Tier-4 differential-diffusion ACTIVE -- per-cell "
+            << "tabulated Lewis numbers ["
+            << (LeZField_.valid() ? "Le_Z " : "")
+            << (LeCField_.valid() ? "Le_C" : "")
+            << "] from the manifold drive Deff (rho*D = mu/Le)" << nl << endl;
+    }
+
+    // Tier-2: enable the tabulated real-gas coefficient lookup (allocates the
+    // RG_* fields and arms the mixture). Must precede updateManifold() so the
+    // fields are filled before the first cell-mixture evaluation uses them.
+    setupRealGasCoeffTabulation();
 
     // Initialise the manifold-derived fields.
     updateManifold();
@@ -241,6 +334,158 @@ Foam::solvers::fgmFluid::~fgmFluid()
 
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
+
+void Foam::solvers::fgmFluid::setupRealGasCoeffTabulation()
+{
+    // Gate 1: the table must carry the pre-tabulated RG_* coefficients.
+    if (!fgmTable_.hasRealGasCoeffs())
+    {
+        return;
+    }
+
+    // Gate 2: the case may opt out ('tabulatedThermoCoeffs off').
+    const Switch want
+    (
+        fgmTable_.lookupOrDefault<Switch>("tabulatedThermoCoeffs", true)
+    );
+    if (!want)
+    {
+        Info<< "fgmFluid: table carries RG_* coefficients but "
+            << "'tabulatedThermoCoeffs off' -> live O(n^2) mixing retained"
+            << nl << endl;
+        return;
+    }
+
+    // Gate 3: the mixture must implement the tabulatedRealGasMixture hook
+    // (SRKchungTaka backend; the elyHanley backend does not yet).
+    const tabulatedRealGasMixture* hook =
+        dynamic_cast<const tabulatedRealGasMixture*>(&thermo_);
+    if (!hook)
+    {
+        Info<< "fgmFluid: table carries RG_* coefficients but the active "
+            << "mixture does not support tabulatedRealGasMixture -> live mixing"
+            << nl << endl;
+        return;
+    }
+
+    const label nCoeff = tabulatedRealGasMixture::nCoeffs_;
+    const wordList& cn = tabulatedRealGasMixture::coeffNames();
+
+    // Allocate the 13 per-cell coefficient fields (internal scratch: dimless,
+    // never read or written to disk) and collect pointers to their internal
+    // fields for the mixture lookup.
+    RGcoeffFields_.setSize(nCoeff);
+    List<const scalarField*> ptrs(nCoeff);
+    forAll(RGcoeffFields_, k)
+    {
+        RGcoeffFields_.set
+        (
+            k,
+            new volScalarField
+            (
+                IOobject
+                (
+                    "FGM:RG_" + cn[k],
+                    mesh.time().name(),
+                    mesh,
+                    IOobject::NO_READ,
+                    IOobject::NO_WRITE
+                ),
+                mesh,
+                dimensionedScalar(dimless, 0)
+            )
+        );
+        ptrs[k] = &RGcoeffFields_[k].primitiveField();
+    }
+
+    RGcoeffBuf_.setSize(nCoeff);
+
+    // Arm the mixture: species-0 internal field is the reference used to
+    // detect internal-cell composition slices.
+    hook->enableCoeffTabulation(Y_[0].primitiveField(), ptrs);
+    tabRealGasCoeffs_ = true;
+
+    // Opt-2: register the per-patch species-0 mass-fraction field (range key)
+    // and the per-patch coefficient boundary fields so the lookup covers
+    // boundary faces too -- the boundary values are filled in updateManifold().
+    {
+        const volScalarField::Boundary& Y0bf = Y_[0].boundaryField();
+        const volScalarField::Boundary& Zbf = Z_.boundaryField();
+        List<const scalarField*> patchRefs(Y0bf.size());
+        List<List<const scalarField*>> patchCoeffs(Y0bf.size());
+        forAll(Y0bf, p)
+        {
+            // Consistency gate: only tabulate patches whose composition IS the
+            // extrapolated internal manifold state, i.e. the boundary Y equals
+            // the manifold Y(Z_b,gZ_b,C_b) (zeroGradient walls / outflow). Skip
+            // Dirichlet-Z patches (inlets): their prescribed pure-stream Y sits
+            // off the (Z_b,gZ_b,C_b) manifold point once gZ_b develops, so the
+            // tabulated coeffs would not match the live mix -> keep them live.
+            if (Zbf[p].fixesValue())
+            {
+                patchRefs[p] = nullptr;
+                continue;
+            }
+            patchRefs[p] = &Y0bf[p];
+            patchCoeffs[p].setSize(nCoeff);
+            forAll(patchCoeffs[p], k)
+            {
+                patchCoeffs[p][k] = &RGcoeffFields_[k].boundaryField()[p];
+            }
+        }
+        hook->enablePatchCoeffTabulation(patchRefs, patchCoeffs);
+    }
+
+    // Opt-1: arm the base-thermo node interpolation (internal cells). Replaces
+    // the per-cell 106-species base blend with a 16-corner blend of pre-built
+    // node mixtures. Gated off for an enthalpy-defect table (whose 4th coord is
+    // dh, not the chi_st_ field passed here as the stencil's chi coordinate) and
+    // when the table does not tabulate every mixture species (then the per-node
+    // blend would be incomplete).
+    if (!fgmTable_.useEnthalpy())
+    {
+        const wordList& sp = thermo_.species();
+        bool haveAllY = true;
+        forAll(sp, s)
+        {
+            if (!fgmTable_.hasY(sp[s]))
+            {
+                haveAllY = false;
+                break;
+            }
+        }
+        if (haveAllY)
+        {
+            List<List<scalar>> nodeY(sp.size());
+            forAll(sp, s)
+            {
+                nodeY[s] = fgmTable_.Ynodes(sp[s]);
+            }
+            hook->enableBaseBlendTabulation
+            (
+                nodeY, fgmTable_,
+                Z_.primitiveField(), gZ_.primitiveField(),
+                C_.primitiveField(), chi_st_.primitiveField()
+            );
+        }
+        else
+        {
+            Info<< "fgmFluid: Opt-1 base-blend node interpolation skipped "
+                << "(table does not tabulate every mixture species)"
+                << nl << endl;
+        }
+    }
+    else
+    {
+        Info<< "fgmFluid: Opt-1 base-blend node interpolation skipped "
+            << "(enthalpy-defect table)" << nl << endl;
+    }
+
+    Info<< "fgmFluid: Tier-2 real-gas coefficient tabulation ACTIVE -- "
+        << nCoeff << " manifold coefficients (RG_*) looked up per cell; "
+        << "the O(n^2) calculateRealGas pair sum is skipped on internal cells"
+        << nl << endl;
+}
 
 Foam::tmp<Foam::scalarField>
 Foam::solvers::fgmFluid::varianceLengthSqr()
@@ -330,6 +575,16 @@ void Foam::solvers::fgmFluid::updateManifold()
     const scalar shape_Zst = max(Z_st_*(scalar(1) - Z_st_), SMALL);
     const bool useChi = fgmTable_.hasChi();
 
+    // Non-adiabatic FPV (method b): the 4-D table is indexed by the enthalpy
+    // defect dh = h - h_ad(Z), h_ad(Z) = (1-Z) hOx + Z hFuel (the conserved-
+    // scalar mixing line). Same quadrilinear lookup as chi; only the 4th
+    // coordinate differs.
+    const bool useH = fgmTable_.useEnthalpy();
+    const bool use4D = useChi || useH;
+    const scalar hOxb   = useH ? fgmTable_.hOx()   : 0;
+    const scalar hFuelb = useH ? fgmTable_.hFuel() : 0;
+    const scalarField* hcl = useH ? &hPtr_->primitiveField() : nullptr;
+
     // Hoist references to the tabulated species fields
     List<scalarField*> Yref(tabSpecieIDs_.size());
     List<word> Yname(tabSpecieIDs_.size());
@@ -339,6 +594,23 @@ void Foam::solvers::fgmFluid::updateManifold()
         Yref[k] = &Y_[id].primitiveFieldRef();
         Yname[k] = thermo_.species()[id];
     }
+
+    // Hoist references to the Tier-2 real-gas coefficient fields (filled below
+    // from the table so the mixture can look them up instead of rebuilding the
+    // O(n^2) pair sum per cell).
+    const bool fillRG = tabRealGasCoeffs_;
+    List<scalarField*> RGref(fillRG ? RGcoeffFields_.size() : 0);
+    forAll(RGref, k)
+    {
+        RGref[k] = &RGcoeffFields_[k].primitiveFieldRef();
+    }
+
+    // Hoist references to the Tier-4 Lewis-number fields (filled below from the
+    // manifold so Deff uses a per-cell Le(Z,gZ,c[,chi]) instead of a constant).
+    const bool fillLeZ = LeZField_.valid();
+    const bool fillLeC = LeCField_.valid();
+    scalarField* LeZc = fillLeZ ? &LeZField_->primitiveFieldRef() : nullptr;
+    scalarField* LeCc = fillLeC ? &LeCField_->primitiveFieldRef() : nullptr;
 
     // Tabulated temperature: the FPV/FGM thermochemical state (T and the
     // composition) is a FUNCTION of the manifold coordinates (Z, gZ, c, chi)
@@ -370,22 +642,37 @@ void Foam::solvers::fgmFluid::updateManifold()
         const scalar D = DeffZ[celli]/rho_l;
         const scalar chiTilde = scalar(2)*D*magSqrGradZ[celli];
         const scalar shape_cell = max(Zcl*(scalar(1) - Zcl), SMALL);
-        const scalar chi_st = chiTilde*shape_Zst/shape_cell;
+        // RUFPV limiting: clamp chi_st to the burning-branch window before the
+        // lookup, breaking the instantaneous-|grad Z|^2 source feedback (the
+        // documented cold-branch collapse of naive UFPV). Defaults pass through.
+        const scalar chi_st =
+            max(chiClampMin_,
+                min(chiClampMax_, chiTilde*shape_Zst/shape_cell));
         chic[celli] = chi_st;
 
+        // 4th manifold coordinate: chi_st (UFPV) or enthalpy defect (non-
+        // adiabatic). For an enthalpy table dh<0 in the cold preheat pulls T
+        // down off the 800 K adiabatic slice and (via the table's ignition
+        // gate) suppresses the source -> the cold dense-fluid zone is inert.
+        scalar coord4 = chi_st;
+        if (useH)
+        {
+            const scalar hAd = (scalar(1) - Zcl)*hOxb + Zcl*hFuelb;
+            coord4 = (*hcl)[celli] - hAd;
+        }
+
         // PV source: tabulated mass-fraction rate [1/s] -> volumetric.
-        // The 4-D lookup is used only when the table actually carries a
-        // chi axis (FGMTable::hasChi()); otherwise we keep the legacy
-        // 3-D interpolation so existing cases still run.
-        if (useChi)
+        // The 4-D lookup is used when the table carries a chi OR enthalpy axis;
+        // otherwise we keep the legacy 3-D interpolation so existing cases run.
+        if (use4D)
         {
             srcc[celli] =
-                sourcePVscale_*rho_l*fgmTable_.interpolate(Zcl, gz, Ccl, chi_st);
-            Tc[celli] = fgmTable_.interpolateT(Zcl, gz, Ccl, chi_st);
+                sourcePVscale_*rho_l*fgmTable_.interpolate(Zcl, gz, Ccl, coord4);
+            Tc[celli] = fgmTable_.interpolateT(Zcl, gz, Ccl, coord4);
             forAll(Yref, k)
             {
                 (*Yref[k])[celli] =
-                    fgmTable_.interpolateY(Yname[k], Zcl, gz, Ccl, chi_st);
+                    fgmTable_.interpolateY(Yname[k], Zcl, gz, Ccl, coord4);
             }
         }
         else
@@ -399,13 +686,84 @@ void Foam::solvers::fgmFluid::updateManifold()
                     fgmTable_.interpolateY(Yname[k], Zcl, gz, Ccl);
             }
         }
+
+        // Tier-2: per-cell real-gas mixture coefficients. coord4 is the chi/dh
+        // coordinate (ignored for a 3-D table, where the chi axis collapses).
+        if (fillRG)
+        {
+            fgmTable_.interpolateRealGasCoeffs
+            (
+                Zcl, gz, Ccl, coord4, RGcoeffBuf_
+            );
+            forAll(RGref, k)
+            {
+                (*RGref[k])[celli] = RGcoeffBuf_[k];
+            }
+        }
+
+        // Tier-4: per-cell differential-diffusion Lewis numbers. coord4 is the
+        // chi/dh coordinate (collapses for a 3-D table).
+        if (fillLeZ)
+        {
+            (*LeZc)[celli] = fgmTable_.interpolateLe("Z", Zcl, gz, Ccl, coord4);
+        }
+        if (fillLeC)
+        {
+            (*LeCc)[celli] = fgmTable_.interpolateLe("C", Zcl, gz, Ccl, coord4);
+        }
     }
 
     gZ_.correctBoundaryConditions();
     chi_st_.correctBoundaryConditions();
+    if (fillLeZ) { LeZField_->correctBoundaryConditions(); }
+    if (fillLeC) { LeCField_->correctBoundaryConditions(); }
     forAll(tabSpecieIDs_, k)
     {
         Y_[tabSpecieIDs_[k]].correctBoundaryConditions();
+    }
+
+    // Opt-2: fill the patch-face real-gas coefficients from the manifold so the
+    // mixture looks them up on boundary faces too (previously live O(n^2) on
+    // every boundary face). The boundary composition coordinates (Z, gZ, C,
+    // coord4) were just corrected above; the manifold Y(Z_b,gZ_b,C_b,coord4_b)
+    // matches the boundary Y the live path mixes (walls extrapolate the internal
+    // manifold state, inlets are pure streams at Z=0/1).
+    if (fillRG)
+    {
+        const volScalarField::Boundary& Zbf   = Z_.boundaryField();
+        const volScalarField::Boundary& gZbf  = gZ_.boundaryField();
+        const volScalarField::Boundary& Cbf   = C_.boundaryField();
+        const volScalarField::Boundary& chibf = chi_st_.boundaryField();
+        forAll(Zbf, patchi)
+        {
+            const fvPatchScalarField& Zp   = Zbf[patchi];
+            const fvPatchScalarField& gZp  = gZbf[patchi];
+            const fvPatchScalarField& Cp   = Cbf[patchi];
+            const fvPatchScalarField& chip = chibf[patchi];
+            const scalarField* hp =
+                useH ? &hPtr_->boundaryField()[patchi] : nullptr;
+            forAll(Zp, fi)
+            {
+                const scalar Zcl = max(min(Zp[fi], scalar(1)), scalar(0));
+                const scalar gz  = min(max(gZp[fi], scalar(0)), scalar(1));
+                const scalar Ccl = max(Cp[fi], scalar(0));
+                scalar coord4 = chip[fi];
+                if (useH)
+                {
+                    const scalar hAd = (scalar(1) - Zcl)*hOxb + Zcl*hFuelb;
+                    coord4 = (*hp)[fi] - hAd;
+                }
+                fgmTable_.interpolateRealGasCoeffs
+                (
+                    Zcl, gz, Ccl, coord4, RGcoeffBuf_
+                );
+                forAll(RGcoeffFields_, k)
+                {
+                    RGcoeffFields_[k].boundaryFieldRef()[patchi][fi] =
+                        RGcoeffBuf_[k];
+                }
+            }
+        }
     }
 
     // Fixed-value T patches (the inlets) keep their prescribed temperature;
@@ -420,16 +778,33 @@ void Foam::solvers::fgmFluid::updateManifold()
 }
 
 
+const Foam::volScalarField*
+Foam::solvers::fgmFluid::leField(const word& var) const
+{
+    if (var == "Z" && LeZField_.valid()) { return &LeZField_(); }
+    if (var == "C" && LeCField_.valid()) { return &LeCField_(); }
+    return nullptr;
+}
+
+
 Foam::tmp<Foam::volScalarField>
 Foam::solvers::fgmFluid::Deff(const word& var)
 {
-    const scalar Le = Le_.found(var) ? Le_[var] : 1.0;
+    // Turbulent subgrid contribution rho*nut/Sct [kg/m/s].
+    const volScalarField turb(rho*momentumTransport().nut()/Sct_);
 
-    // Laminar mass diffusivity rho*D_lam = mu/Le (unity-Lewis base scaled by
-    // the variable's Lewis number), plus the turbulent subgrid contribution
-    // rho*nut/Sct. All dynamic [kg/m/s]. Per-species Le slots in here for the
-    // future differential-diffusion extension.
-    return thermo.mu()/Le + rho*momentumTransport().nut()/Sct_;
+    // Laminar mass diffusivity rho*D_lam = mu/Le. Tier-4: when the manifold
+    // tabulates Le_<var>, use the per-cell Le(Z,gZ,c[,chi]) (differential
+    // diffusion baked in from the real-fluid flamelet transport); otherwise
+    // fall back to the constant Le_ scalar (default 1, unity Lewis).
+    const volScalarField* Lefld = leField(var);
+    if (Lefld != nullptr)
+    {
+        return thermo.mu()/(*Lefld) + turb;
+    }
+
+    const scalar Le = Le_.found(var) ? Le_[var] : 1.0;
+    return thermo.mu()/Le + turb;
 }
 
 

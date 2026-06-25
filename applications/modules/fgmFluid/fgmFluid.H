@@ -112,6 +112,16 @@ protected:
         //- Cached volumetric PV source rho*omega_C [kg/m^3/s]
         volScalarField sourcePV_;
 
+        //- Total (absolute) enthalpy h [J/kg], transported ONLY for the
+        //  non-adiabatic FPV table (method b). It is a CONSERVED scalar (no
+        //  reaction source: total enthalpy is invariant under reaction); the
+        //  manifold is then queried at the enthalpy defect
+        //  dh = h - ((1-Z) hOx + Z hFuel). Null for adiabatic (chi/3-D) tables.
+        //  Crucially T is still READ FROM THE TABLE (T(Z,gZ,c,dh)) -- h is a
+        //  coordinate, not inverted to T -- so the he<->T drift instability that
+        //  forbids a transported energy equation does NOT apply here.
+        autoPtr<volScalarField> hPtr_;
+
         //- LES mixture-fraction variance coefficient (Cv)
         scalar Cv_;
 
@@ -135,6 +145,19 @@ protected:
         //  'sourcePVscale' in fgmProperties.
         scalar sourcePVscale_;
 
+        //- RUFPV-style limiting of the scalar-dissipation table coordinate
+        //  (Gierth et al. 2022; Ihme & Pitsch). For a chi-axis (UFPV) table the
+        //  per-cell chi_st = 2 D |grad Z|^2 f(Z_st)/f(Z~) is clamped to
+        //  [chiClampMin_, chiClampMax_] BEFORE the source lookup. This breaks the
+        //  destabilising instantaneous-|grad Z|^2 feedback (cooling -> grad Z
+        //  relaxes -> chi drops -> tabulated source drops -> further cooling ->
+        //  spurious cold collapse): the floor keeps the source on the burning
+        //  branch; the cap (= chi_st,ign) excludes the extinguished branch.
+        //  Defaults (0, GREAT) = no clamp -> legacy behaviour. Set via
+        //  'chiClampMin'/'chiClampMax' in fgmProperties.
+        scalar chiClampMin_;
+        scalar chiClampMax_;
+
         //- Mixture-fraction variance closure regime, auto-selected from the
         //  momentum-transport "simulationType":
         //    les     -> mixing length L = Delta = V^(1/3)   (subgrid filter)
@@ -145,6 +168,32 @@ protected:
 
         //- Indices of thermo species that are tabulated as Y_<sp>
         labelList tabSpecieIDs_;
+
+        //- Tier-2: per-cell tabulated real-gas mixture coefficients (RG_*),
+        //  filled from fgmTable_ each updateManifold and looked up by the
+        //  SRKchungTaka mixture in place of the live O(n^2) pair mixing.
+        //  Empty unless the table carries the RG_* fields, the mixture
+        //  supports the hook, and 'tabulatedThermoCoeffs' is not disabled.
+        PtrList<volScalarField> RGcoeffFields_;
+
+        //- True when the tabulated-coefficient lookup is active.
+        bool tabRealGasCoeffs_;
+
+        //- Reusable per-cell scratch for the interpolated RG coefficients.
+        List<scalar> RGcoeffBuf_;
+
+        //- Tier-4: optional per-cell differential-diffusion Lewis-number fields
+        //  for the control variables Z and C, filled from fgmTable_ each
+        //  updateManifold. Null unless the table carries the corresponding
+        //  Le_<var> field; when present, Deff(var) uses the local
+        //  Le(Z,gZ,c[,chi]) in place of the constant Le_ scalar. This is the
+        //  standard differential-diffusion FGM closure (Le baked into the
+        //  manifold from the real-fluid flamelet transport).
+        autoPtr<volScalarField> LeZField_;
+        autoPtr<volScalarField> LeCField_;
+
+        //- True when at least one tabulated Lewis-number field is active.
+        bool tabLewis_;
 
         //- Multivariate convection field table (he, Z, C)
         multivariateSurfaceInterpolationScheme<scalar>::fieldTable fields;
@@ -167,11 +216,25 @@ private:
         //  the cached PV source from the FGM table.
         void updateManifold();
 
+        //- Tier-2 setup: if the table carries RG_* coefficients and the
+        //  mixture supports the tabulatedRealGasMixture hook, allocate the 13
+        //  per-cell coefficient fields and enable the mixture lookup. Must run
+        //  before the first updateManifold()/thermo correct so the fields are
+        //  filled before any cell mixture is evaluated through the lookup.
+        void setupRealGasCoeffTabulation();
+
+        //- Per-cell tabulated Lewis-number field for a control variable, or
+        //  nullptr when the table does not tabulate Le for it (constant Le_
+        //  fallback). Tier-4 differential-diffusion hook.
+        const volScalarField* leField(const word& var) const;
+
         //- Effective (dynamic) diffusivity [kg/m/s] for a transported control
         //  variable, using its Lewis number:
         //    Deff = alpha_laminar/Le + rho*nut/Sct
-        //  Le defaults to 1. This is the single extension point for non-unity
-        //  Lewis numbers and future per-species differential diffusion.
+        //  Le is a per-cell tabulated Le(Z,gZ,c[,chi]) when the table provides
+        //  Le_<var> (Tier-4 differential diffusion), else the constant Le_
+        //  scalar (default 1). The single extension point for non-unity and
+        //  per-species differential diffusion.
         tmp<volScalarField> Deff(const word& var);
 
         //- Mixture-fraction variance mixing-length squared L^2 [m^2] per cell,

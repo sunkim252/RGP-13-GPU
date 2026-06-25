@@ -90,6 +90,18 @@ class FGMTable
         //- True if a chi axis was provided in fgmProperties
         bool hasChi_;
 
+        //- True if the 4th axis is an enthalpy-defect axis (non-adiabatic FPV,
+        //  method b) rather than scalar dissipation. When set, the 4th
+        //  coordinate passed to interpolate() is the enthalpy defect
+        //  dh = h_total - ((1-Z) hOx + Z hFuel) and the same quadrilinear
+        //  machinery is reused (chi_axis_ then holds the dh axis [J/kg]).
+        bool useEnthalpy_;
+
+        //- Pure-stream total enthalpies at the flamelet boundary T [J/kg],
+        //  used to form the adiabatic reference mixing line h_ad(Z).
+        scalar hOx_;
+        scalar hFuel_;
+
         //- Mixture-fraction axis (Z~)
         List<scalar> Z_axis_;
 
@@ -115,6 +127,20 @@ class FGMTable
 
         //- Names of the tabulated species (order as in the 'species' entry)
         wordList speciesNames_;
+
+        //- Tier-2: optional pre-tabulated real-gas mixture coefficients, in
+        //  tabulatedRealGasMixture::coeffNames() order (table key
+        //  "RG_"+name). Each entry is a flat list of length nZ*nGz*nC*nChi.
+        //  Empty when the table does not carry the RG_* fields.
+        List<List<scalar>> RGcoeff_;
+
+        //- Tier-4: optional differential-diffusion Lewis-number fields, keyed
+        //  by control-variable name ("Z", "C"); dictionary key "Le_"+name.
+        //  Each entry is a flat list of length nZ*nGz*nC*nChi. When present the
+        //  solver applies a per-cell Le(Z,gZ,c[,chi]) to that variable's
+        //  laminar diffusivity (rho*D = mu/Le), generalising the constant 'Le'
+        //  sub-dict to the standard differential-diffusion FGM closure.
+        HashTable<List<scalar>> Le_tables_;
 
 
     // Private Member Functions
@@ -185,6 +211,56 @@ public:
                 scalar Z, scalar gZ, scalar C, scalar chi
             ) const;
 
+            //- Quadrilinear interpolation of the Tier-2 real-gas mixture
+            //  coefficients. Fills coeffs (resized to the number of RG_*
+            //  fields) in coeffNames() order. No-op if hasRealGasCoeffs() is
+            //  false.
+            void interpolateRealGasCoeffs
+            (
+                scalar Z, scalar gZ, scalar C, scalar chi,
+                List<scalar>& coeffs
+            ) const;
+
+            //- Quadrilinear interpolation of the Tier-4 tabulated Lewis number
+            //  Le_<var> for a control variable. Caller must check
+            //  hasLeField(var) first.
+            scalar interpolateLe
+            (
+                const word& var,
+                scalar Z, scalar gZ, scalar C, scalar chi
+            ) const;
+
+            //- Opt-1 (base-blend node interpolation): return the 16 surrounding
+            //  manifold node flat indices and their quadrilinear weights for
+            //  (Z,gZ,C,chi). nodes[m] and weights[m], m=0..15; sum(weights)=1.
+            //  For a 3-D table the chi axis collapses (the chi-high corners
+            //  duplicate the chi-low ones with weight 0). Lets a client blend
+            //  pre-tabulated node quantities instead of summing over species.
+            void interpStencil
+            (
+                scalar Z, scalar gZ, scalar C, scalar chi,
+                label nodes[16], scalar weights[16]
+            ) const;
+
+            //- Opt-1: total number of manifold nodes (nZ*nGz*nC*nChi).
+            inline label nTot() const
+            {
+                return nZ_*nGz_*nC_*nChi_;
+            }
+
+            //- Opt-1: the flat tabulated mass-fraction node list of a species
+            //  (length nTot), used to pre-blend the per-node base thermo.
+            inline const List<scalar>& Ynodes(const word& specie) const
+            {
+                return Y_tables_[specie];
+            }
+
+            //- Opt-1: true if the table tabulates this species' mass fraction.
+            inline bool hasY(const word& specie) const
+            {
+                return Y_tables_.found(specie);
+            }
+
         // 3-D legacy entry points
         //  Evaluate at chi = chi_axis_[0]. Required so that the original
         //  FGM combustion model and any existing case that still ships a
@@ -204,8 +280,31 @@ public:
 
             inline bool hasT() const { return !T_table_.empty(); }
 
+            //- True if the table carries the Tier-2 real-gas coefficient
+            //  fields (RG_*). The solver then enables the per-cell coefficient
+            //  lookup instead of the live O(n^2) mixing.
+            inline bool hasRealGasCoeffs() const
+            { return !RGcoeff_.empty(); }
+
+            //- True if the table carries a tabulated Lewis number Le_<var>
+            //  (Tier-4 differential diffusion). The solver then uses a per-cell
+            //  Le(Z,gZ,c[,chi]) for that variable instead of a constant.
+            inline bool hasLeField(const word& var) const
+            { return Le_tables_.found(var); }
+
             //- True if the table carries a chi_st axis (nChi > 1).
-            inline bool hasChi() const { return hasChi_; }
+            inline bool hasChi() const { return hasChi_ && !useEnthalpy_; }
+
+            //- True if the 4th axis is an enthalpy-defect axis (non-adiabatic
+            //  FPV). The solver then transports total enthalpy and forms the
+            //  defect coordinate; the table interpolation is unchanged.
+            inline bool useEnthalpy() const { return useEnthalpy_; }
+
+            //- Oxidizer-stream total enthalpy at the flamelet boundary [J/kg].
+            inline scalar hOx() const { return hOx_; }
+
+            //- Fuel-stream total enthalpy at the flamelet boundary [J/kg].
+            inline scalar hFuel() const { return hFuel_; }
 
         // Access
 

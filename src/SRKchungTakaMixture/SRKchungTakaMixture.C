@@ -25,8 +25,40 @@ License
 
 #include "SRKchungTakaMixture.H"
 #include "thermodynamicConstants.H"
+#include "FGMTable.H"
+#include <cstdint>
 
 // * * * * * * * * * * * * Private Member Functions * * * * * * * * * * * * * //
+
+template<class ThermoType>
+template<class CompType>
+void Foam::SRKchungTakaMixture<ThermoType>::compositionToX
+(
+    const CompType& Y,
+    List<scalar>& X,
+    List<scalar>& Yl
+) const
+{
+    const label nSpecies = Y.size();
+    X.setSize(nSpecies);
+    Yl.setSize(nSpecies);
+
+    scalar sumXb = 0.0;
+    forAll(X, i)
+    {
+        sumXb = sumXb + Y[i]/ListW_[i];
+    }
+    if (sumXb == 0) { sumXb = 1e-30; }
+
+    forAll(X, i)
+    {
+        X[i] = (Y[i]/ListW_[i])/sumXb;
+        Yl[i] = Y[i];
+        if (X[i] <= 0) { X[i] = 0; }
+        if (Yl[i] <= 0) { Yl[i] = 0; }
+    }
+}
+
 
 template<class ThermoType>
 void Foam::SRKchungTakaMixture<ThermoType>::calculateRealGas
@@ -130,44 +162,176 @@ Foam::SRKchungTakaMixture<ThermoType>::calcMixture
     const scalarFieldListSlice& Y
 ) const
 {
-    // Mass-fraction weighted mixing of base thermo coefficients
-    mixture_ = Y[0]*this->specieThermos()[0];
-
-    for (label n = 1; n < Y.size(); n++)
+    // Recover the internal cell index up front (if this slice is an internal
+    // cell): both the Opt-1 base-blend node interpolation and the Tier-2/Opt-2
+    // coefficient lookup key off it. &Y[0] is species 0 at the sliced element;
+    // for an internal cell it lies inside species 0's internal field, so celli
+    // is recovered by offset and the in-range test rejects patch faces / foreign
+    // field sets (different allocation). uintptr_t avoids pointer-provenance UB.
+    label celli = -1;
+    if (refInternalField_ != nullptr && refInternalField_->size() > 0)
     {
-        mixture_ += Y[n]*this->specieThermos()[n];
+        const std::uintptr_t y =
+            reinterpret_cast<std::uintptr_t>(&Y[0]);
+        const std::uintptr_t lo =
+            reinterpret_cast<std::uintptr_t>(refInternalField_->begin());
+        const std::uintptr_t hi =
+            lo + std::uintptr_t(refInternalField_->size())*sizeof(scalar);
+        if (y >= lo && y < hi)
+        {
+            celli = label((y - lo)/sizeof(scalar));
+        }
     }
 
-    // Convert mass fractions to mole fractions
+    // Mass-fraction weighted mixing of base thermo coefficients. Opt-1: for an
+    // internal cell with node interpolation armed, blend the 16 bracketing
+    // manifold-node mixtures (pre-built from the tabulated node Y) instead of
+    // the 106-species sum. Bit-consistent by linearity: the cell Y is itself the
+    // node interpolation of the table Y, so sum_corner w*nodeMix == sum_species
+    // Y*thermo (FP order apart). Falls back to the species blend on patch faces
+    // / when Opt-1 is off.
+    if (useBaseBlendTab_ && celli >= 0 && nodeMixtures_.size())
+    {
+        label nodes[16];
+        scalar weights[16];
+        fgmTablePtr_->interpStencil
+        (
+            (*ZfieldPtr_)[celli], (*gZfieldPtr_)[celli],
+            (*CfieldPtr_)[celli], (*chiFieldPtr_)[celli],
+            nodes, weights
+        );
+        mixture_ = weights[0]*nodeMixtures_[nodes[0]];
+        for (label m = 1; m < 16; m++)
+        {
+            if (weights[m] != scalar(0))
+            {
+                mixture_ += weights[m]*nodeMixtures_[nodes[m]];
+            }
+        }
+    }
+    else
+    {
+        mixture_ = Y[0]*this->specieThermos()[0];
+        for (label n = 1; n < Y.size(); n++)
+        {
+            mixture_ += Y[n]*this->specieThermos()[n];
+        }
+    }
+
+    // Convert mass fractions to mole fractions (shared with the tabulation
+    // utility via compositionToX so live and tabulated coefficients use an
+    // identical X).
     const label nSpecies = Y.size();
-    List<scalar> X(nSpecies);
-    List<scalar> Yl(nSpecies);
-    scalar sumXb = 0.0;
+    List<scalar> X;
+    List<scalar> Yl;
+    compositionToX(Y, X, Yl);
 
-    forAll(X, i)
-    {
-        sumXb = sumXb + Y[i]/ListW_[i];
-    }
-    if (sumXb == 0) { sumXb = 1e-30; }
-
-    forAll(X, i)
-    {
-        X[i] = (Y[i]/ListW_[i])/sumXb;
-        Yl[i] = Y[i];
-        if (X[i] <= 0) { X[i] = 0; }
-        if (Yl[i] <= 0) { Yl[i] = 0; }
-    }
-
-    // Calculate real-gas mixture parameters
+    // Real-gas mixture parameters: bM/coef1-3/cM (SRK) and sigmaM..kappaiM
+    // (Chung mu/kappa). These are pure functions of X and carry the O(n^2)
+    // pair-mixing cost. Tier-2: for an internal-cell composition slice they are
+    // looked up from the table-filled coeffFields_ instead of being rebuilt.
     scalar bM = 0, coef1 = 0, coef2 = 0, coef3 = 0, cM = 0;
     scalar sigmaM = 0, epsilonkM = 0, VcM = 0, TcM = 0;
     scalar omegaM = 0, MM = 0, miuiM = 0, kappaiM = 0;
 
-    calculateRealGas
-    (
-        X, bM, coef1, coef2, coef3, cM,
-        sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM
-    );
+    // Tier-2 coefficient lookup is valid for an internal-cell slice (celli was
+    // recovered up front, shared with the Opt-1 base blend above).
+    const bool useLookup =
+        useTabulatedCoeffs_ && coeffFields_.size() == nCoeffs_ && celli >= 0;
+
+    if (useLookup)
+    {
+        bM        = (*coeffFields_[0])[celli];
+        coef1     = (*coeffFields_[1])[celli];
+        coef2     = (*coeffFields_[2])[celli];
+        coef3     = (*coeffFields_[3])[celli];
+        cM        = (*coeffFields_[4])[celli];
+        sigmaM    = (*coeffFields_[5])[celli];
+        epsilonkM = (*coeffFields_[6])[celli];
+        MM        = (*coeffFields_[7])[celli];
+        VcM       = (*coeffFields_[8])[celli];
+        TcM       = (*coeffFields_[9])[celli];
+        omegaM    = (*coeffFields_[10])[celli];
+        miuiM     = (*coeffFields_[11])[celli];
+        kappaiM   = (*coeffFields_[12])[celli];
+
+        // One-off audit: compare looked-up vs freshly computed coefficients for
+        // the first few cells after enabling, to confirm bit-consistency of the
+        // tabulated path. Cheap (a handful of cells, once).
+        if (coeffDiagCount_ > 0)
+        {
+            scalar bMc=0, c1=0, c2=0, c3=0, cMc=0, sgM=0, epM=0, MMc=0,
+                   VcMc=0, TcMc=0, omM=0, miM=0, kaM=0;
+            calculateRealGas
+            (
+                X, bMc, c1, c2, c3, cMc,
+                sgM, epM, MMc, VcMc, TcMc, omM, miM, kaM
+            );
+            const scalar denom = max(mag(bMc), VSMALL);
+            Info<< "[Tier2-DIAG] cell " << celli << " tab/live:"
+                << " bM " << bM << "/" << bMc
+                << " sigmaM " << sigmaM << "/" << sgM
+                << " TcM " << TcM << "/" << TcMc
+                << " epsilonkM " << epsilonkM << "/" << epM
+                << " (relErr bM " << mag(bM - bMc)/denom << ")" << endl;
+            coeffDiagCount_--;
+        }
+    }
+    else
+    {
+        // Opt-2: patch-face tabulation. A patch composition slice has &Y[0]
+        // inside that patch's species-0 boundary field; recover facei by offset
+        // (same uintptr_t range trick as the internal cell above) and look the
+        // coefficients up from the table-filled boundary fields instead of the
+        // live O(n^2) pair sum. Falls through to live mixing for any slice that
+        // is neither an internal cell nor a registered patch face.
+        bool patchHit = false;
+        if (useTabulatedCoeffs_ && patchRefFields_.size())
+        {
+            const std::uintptr_t y =
+                reinterpret_cast<std::uintptr_t>(&Y[0]);
+            forAll(patchRefFields_, p)
+            {
+                const scalarField* pf = patchRefFields_[p];
+                if (pf == nullptr || pf->empty())
+                {
+                    continue;
+                }
+                const std::uintptr_t lo =
+                    reinterpret_cast<std::uintptr_t>(pf->begin());
+                const std::uintptr_t hi =
+                    lo + std::uintptr_t(pf->size())*sizeof(scalar);
+                if (y >= lo && y < hi)
+                {
+                    const label fi = label((y - lo)/sizeof(scalar));
+                    const List<const scalarField*>& pc = patchCoeffFields_[p];
+                    bM        = (*pc[0])[fi];
+                    coef1     = (*pc[1])[fi];
+                    coef2     = (*pc[2])[fi];
+                    coef3     = (*pc[3])[fi];
+                    cM        = (*pc[4])[fi];
+                    sigmaM    = (*pc[5])[fi];
+                    epsilonkM = (*pc[6])[fi];
+                    MM        = (*pc[7])[fi];
+                    VcM       = (*pc[8])[fi];
+                    TcM       = (*pc[9])[fi];
+                    omegaM    = (*pc[10])[fi];
+                    miuiM     = (*pc[11])[fi];
+                    kappaiM   = (*pc[12])[fi];
+                    patchHit = true;
+                    break;
+                }
+            }
+        }
+        if (!patchHit)
+        {
+            calculateRealGas
+            (
+                X, bM, coef1, coef2, coef3, cM,
+                sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM
+            );
+        }
+    }
 
     // Update coefficients for mixture in SRK
     mixture_.updateEoS(bM, coef1, coef2, coef3, cM);
@@ -292,7 +456,20 @@ Foam::SRKchungTakaMixture<ThermoType>::SRKchungTakaMixture
     computeSpeciesDiffusion_
     (
         dict.lookupOrDefault<Switch>("speciesDiffusion", true)
-    )
+    ),
+    useTabulatedCoeffs_(false),
+    refInternalField_(nullptr),
+    coeffFields_(),
+    coeffDiagCount_(0),
+    patchRefFields_(),
+    patchCoeffFields_(),
+    nodeMixtures_(),
+    useBaseBlendTab_(false),
+    fgmTablePtr_(nullptr),
+    ZfieldPtr_(nullptr),
+    gZfieldPtr_(nullptr),
+    CfieldPtr_(nullptr),
+    chiFieldPtr_(nullptr)
 {
     const scalar RR = Foam::constant::thermodynamic::RR;
 
@@ -599,6 +776,158 @@ Foam::SRKchungTakaMixture<ThermoType>::transportMixture
 ) const
 {
     return mixture;
+}
+
+
+// - - - - tabulatedRealGasMixture interface (Tier-2 manifold tabulation) - - //
+
+template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::realGasCoeffs
+(
+    const List<scalar>& Y,
+    List<scalar>& coeffs
+) const
+{
+    List<scalar> X;
+    List<scalar> Yl;
+    compositionToX(Y, X, Yl);
+
+    // calculateRealGas accumulates onto its outputs, so they must start at 0.
+    coeffs.setSize(nCoeffs_);
+    coeffs = scalar(0);
+    // Order MUST match coeffNames() and the lookup in calcMixture():
+    //   bM, coef1, coef2, coef3, cM,
+    //   sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM
+    calculateRealGas
+    (
+        X,
+        coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
+        coeffs[5], coeffs[6], coeffs[7], coeffs[8], coeffs[9], coeffs[10],
+        coeffs[11], coeffs[12]
+    );
+}
+
+
+template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::enableCoeffTabulation
+(
+    const scalarField& refInternal,
+    const List<const scalarField*>& coeffFields
+) const
+{
+    if (coeffFields.size() != nCoeffs_)
+    {
+        FatalErrorInFunction
+            << "expected " << label(nCoeffs_) << " coefficient fields, got "
+            << coeffFields.size() << exit(FatalError);
+    }
+    refInternalField_ = &refInternal;
+    coeffFields_ = coeffFields;
+    useTabulatedCoeffs_ = true;
+    coeffDiagCount_ = 3;
+
+    Info<< "SRKchungTakaMixture: Tier-2 tabulated real-gas coefficients ENABLED"
+        << " (per-cell calculateRealGas O(n^2) replaced by table lookup; "
+        << "patch faces use live mixing)" << endl;
+}
+
+
+template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::enablePatchCoeffTabulation
+(
+    const List<const scalarField*>& patchRefs,
+    const List<List<const scalarField*>>& patchCoeffFields
+) const
+{
+    if (patchRefs.size() != patchCoeffFields.size())
+    {
+        FatalErrorInFunction
+            << "patchRefs (" << patchRefs.size() << ") and patchCoeffFields ("
+            << patchCoeffFields.size() << ") size mismatch" << exit(FatalError);
+    }
+    patchRefFields_ = patchRefs;
+    patchCoeffFields_ = patchCoeffFields;
+
+    label nReg = 0;
+    forAll(patchRefFields_, p)
+    {
+        if (patchRefFields_[p] != nullptr && !patchRefFields_[p]->empty())
+        {
+            nReg++;
+        }
+    }
+
+    Info<< "SRKchungTakaMixture: Opt-2 patch-face coefficient lookup ENABLED ("
+        << nReg << " non-empty patches; live calculateRealGas now skipped on "
+        << "boundary faces too)" << endl;
+}
+
+
+template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::enableBaseBlendTabulation
+(
+    const List<List<scalar>>& nodeY,
+    const FGMTable& table,
+    const scalarField& Zfield,
+    const scalarField& gZfield,
+    const scalarField& Cfield,
+    const scalarField& chiField
+) const
+{
+    if (nodeY.size() != numberOfSpecies_)
+    {
+        FatalErrorInFunction
+            << "nodeY species (" << nodeY.size() << ") != numberOfSpecies ("
+            << numberOfSpecies_ << ")" << exit(FatalError);
+    }
+    const label nNodes = table.nTot();
+
+    // Pre-blend the base thermo at every manifold node:
+    //   nodeMix[n] = sum_species nodeY[species][n] * specieThermos()[species].
+    // Built once (reuses the Tier-3 cheap thermo operator+=); thereafter the
+    // per-internal-cell base blend is a 16-corner interpolation of these.
+    nodeMixtures_.clear();
+    nodeMixtures_.setSize(nNodes);
+    for (label n = 0; n < nNodes; n++)
+    {
+        thermoMixtureType m(nodeY[0][n]*this->specieThermos()[0]);
+        for (label s = 1; s < numberOfSpecies_; s++)
+        {
+            m += nodeY[s][n]*this->specieThermos()[s];
+        }
+        nodeMixtures_.set(n, new thermoMixtureType(m));
+    }
+
+    fgmTablePtr_ = &table;
+    ZfieldPtr_   = &Zfield;
+    gZfieldPtr_  = &gZfield;
+    CfieldPtr_   = &Cfield;
+    chiFieldPtr_ = &chiField;
+    useBaseBlendTab_ = true;
+
+    Info<< "SRKchungTakaMixture: Opt-1 base-thermo node interpolation ENABLED ("
+        << nNodes << " manifold nodes pre-blended; per-internal-cell "
+        << numberOfSpecies_ << "-species base blend replaced by 16-corner node "
+        << "blend)" << endl;
+}
+
+
+template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::disableCoeffTabulation() const
+{
+    useTabulatedCoeffs_ = false;
+    refInternalField_ = nullptr;
+    coeffFields_.clear();
+    coeffDiagCount_ = 0;
+    patchRefFields_.clear();
+    patchCoeffFields_.clear();
+    useBaseBlendTab_ = false;
+    nodeMixtures_.clear();
+    fgmTablePtr_ = nullptr;
+    ZfieldPtr_ = nullptr;
+    gZfieldPtr_ = nullptr;
+    CfieldPtr_ = nullptr;
+    chiFieldPtr_ = nullptr;
 }
 
 

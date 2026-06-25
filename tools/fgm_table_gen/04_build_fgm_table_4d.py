@@ -471,10 +471,24 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False):
         print(f"[build] UFPV chi-mode: nZ={N_Z} nGz={N_G} nC={N_C} "
               f"nChi={n_chi} chi=[{chi_axis[0]:.3g},{chi_axis[-1]:.3g}] 1/s")
         lam = {f: np.zeros((n_chi, N_ZQ, N_C)) for f in field_names}
+        # chi-WINDOW coverage fix (2026-06-21): a single chi flamelet is a 1-D
+        # curve in (Z,c), so _laminar_one nearest-extrapolates off it -> source
+        # coverage gaps -> the CFD extinguishes. Instead fill each chi slice from
+        # a CLOUD of flamelets within a log-chi window (overlapping adjacent
+        # slices) so the (Z,c) plane is covered while keeping the slice strain-
+        # local (window narrower than the global family -> no upper-envelope
+        # over-sourcing).
+        cw = (chi_axis[-1] / chi_axis[0]) ** (0.65 / max(n_chi - 1, 1))
         for iChi, chi_target in enumerate(chi_axis):
-            Zs, cs, Ws = _cloud([flamelet_at_chi(fls, chi_target)])
+            lo, hi = chi_target / cw, chi_target * cw
+            window = [fl for fl in fls if lo <= fl["chi_st"] <= hi]
+            if len(window) < 3:
+                window = sorted(fls, key=lambda fl: abs(
+                    np.log(max(fl["chi_st"], EPS)) - np.log(max(chi_target, EPS))))[:3]
+            Zs, cs, Ws = _cloud(window)
             for f in field_names:
                 lam[f][iChi] = _laminar_one(Zs, cs, Ws[f], Zq, C_axis)
+        print(f"[build] chi-window cw={cw:.2f}x, ~{len(window)} flamelets/slice")
         n_slices = n_chi
     print(f"[build] {len(field_names)} fields × {n_slices} slice(s) "
           f"in {time.time()-t0:.1f}s")
@@ -544,6 +558,11 @@ def write_fgm_dict(path, Z_axis, g_axis, C_axis, chi_axis, tables,
     nZ, nGz, nC = len(Z_axis), len(g_axis), len(C_axis)
     nChi = 1 if chi_axis is None else len(chi_axis)
 
+    # Tier-4: tabulated differential-diffusion Lewis numbers (flat Le_<var>
+    # fields). When present the solver applies a per-cell Le(Z,gZ,c[,chi]); the
+    # constant 'Le' sub-dict below is kept only as a fallback for older solvers.
+    has_le = ("Le_Z" in tables) and ("Le_C" in tables)
+
     blocks = []
     blocks.append(f"sourcePV\n(\n{_fmt(tables['omega_C'].reshape(-1))}\n);")
     if "T" in tables:
@@ -554,6 +573,9 @@ def write_fgm_dict(path, Z_axis, g_axis, C_axis, chi_axis, tables,
             blocks.append(
                 f"Y_{sp}\n(\n{_fmt(tables[f'Y_{sp}'].reshape(-1))}\n);"
             )
+    if has_le:
+        blocks.append(f"Le_Z\n(\n{_fmt(tables['Le_Z'].reshape(-1))}\n);")
+        blocks.append(f"Le_C\n(\n{_fmt(tables['Le_C'].reshape(-1))}\n);")
     body = "\n\n".join(blocks)
 
     if chi_axis is None:
@@ -567,13 +589,34 @@ def write_fgm_dict(path, Z_axis, g_axis, C_axis, chi_axis, tables,
         axes_blk = f"\nchi\n(\n{_fmt(chi_axis)}\n);\n"
         nchi_blk = f"nChi    {nChi};\n"
 
+    # Constant 'Le' sub-dict: the manifold-median Lewis numbers when Tier-4
+    # tabulated fields are present (kept only as a fallback for older solvers
+    # that ignore Le_Z/Le_C), otherwise the historical option-B constants.
+    le_meta = meta.get("le", None)
+    if has_le and le_meta is not None:
+        le_z_c, le_c_c = float(le_meta[0]), float(le_meta[1])
+        le_comment = (
+            "// Tier-4 DIFFERENTIAL DIFFUSION: per-cell Le_Z(Z,gZ,c)/Le_C tabulated\n"
+            "// below (real-fluid SRK+Chung/Takahashi). The solver uses those fields;\n"
+            "// this constant sub-dict is the manifold MEDIAN, a fallback for solvers\n"
+            "// that predate the tabulated-Le hook. Solver: rho*D_lam = mu/Le.")
+    else:
+        le_z_c, le_c_c = 0.63, 0.60
+        le_comment = (
+            "// Differential-diffusion Lewis numbers (option B, 2026-06-20). Solver uses\n"
+            "// rho*D_lam = mu/Le, i.e. these are effectively Schmidt numbers Sc = nu/D.\n"
+            "//   Sc_C ~= 0.60  (HRR-weighted, consistent across 1-150 atm; C diffuses ~alpha)\n"
+            "//   Sc_Z ~= 0.63 (= Pr; Z treated as conserved scalar at unity-Lewis-thermal,\n"
+            "//                 since the directly-computed Sc_Z is erratic, H/H2-dominated)\n"
+            "// Corrects the unity base (Le=1 -> D=nu=Pr*alpha, under-diffusing) to D~alpha.")
+
     header = f"""/*--------------------------------*- C++ -*----------------------------------*\\
 | FGM {kind} lookup table -- 04_build_fgm_table_4d.py
 | source: {meta.get('src','?')}
 | P_ref = {meta.get('P', float('nan')):.6g} Pa | closure: {meta.get('closure','?')}
 | c = C/C_norm(Z), C_norm = max(equilibrium, family envelope); omega(c=1)=0
 | flat C-order:  {idx}
-| tabulated: sourcePV (omega_c), T, Y_<species>
+| tabulated: sourcePV (omega_c), T, Y_<species>{', Le_Z, Le_C (Tier-4 diff-diff)' if has_le else ''}
 \\*---------------------------------------------------------------------------*/
 FoamFile
 {{
@@ -589,6 +632,13 @@ nZ      {nZ};
 nGz     {nGz};
 nC      {nC};
 {nchi_blk}
+{le_comment}
+Le
+{{
+    Z   {le_z_c:.6g};
+    C   {le_c_c:.6g};
+}}
+
 Z
 (
 {_fmt(Z_axis)}
@@ -615,6 +665,103 @@ C
     print(f"[write]   shape per field: ({nZ}, {nGz}, {nC}"
           + (f", {nChi})" if chi_axis is not None else ")")
           + f" = {nZ*nGz*nC*nChi} entries")
+
+
+def compute_lewis_tables(tables, species, P, srk_yaml,
+                         transport_model="high-pressure-Chung"):
+    """Tier-4: tabulate the differential-diffusion Lewis numbers Le_Z and Le_C
+    over the manifold from the REAL-FLUID (SRK + high-pressure-Chung/Takahashi)
+    transport evaluated at each node's tabulated (T, Y).
+
+    The solver applies rho*D_lam = mu/Le, so Le here acts as a Schmidt number
+    Sc = nu/D. The two control variables get a physically distinct, spatially
+    varying closure that generalises the old constant Sc_Z~0.63 / Sc_C~0.60:
+
+        Le_Z = Pr = mu*cp/lam = nu/alpha
+            Mixture fraction is a conserved scalar carried at unity THERMAL
+            Lewis number, so it diffuses like heat (D_Z = alpha). Le_Z is then
+            the local real-fluid Prandtl number.
+
+        Le_C = nu / D_C,
+            D_C = sum_{k in PV} Y_k D_k,mix / sum_{k in PV} Y_k
+            Progress variable diffuses with the PV-mass-weighted mixture-
+            averaged species diffusivity (Takahashi-corrected at high p).
+
+    Returns (Le_Z, Le_C) arrays shaped like tables['T'], plus (medZ, medC) the
+    manifold-median values used as the constant-Le fallback / degenerate fill.
+    """
+    import cantera as ct
+
+    gas = ct.Solution(srk_yaml)
+    gas.transport_model = transport_model
+    names = gas.species_names
+    sp_in_mech = [s for s in species if s in names]
+    missing = [s for s in species if s not in names]
+    if missing:
+        print(f"[lewis] WARNING: {len(missing)} tabulated species absent from "
+              f"{Path(srk_yaml).name}, treated as 0 in transport: {missing[:8]}"
+              + (" ..." if len(missing) > 8 else ""))
+    idx = {s: names.index(s) for s in sp_in_mech}
+    pv = [s for s in PV_SPECIES if s in idx]
+    if not pv:
+        raise SystemExit(f"[lewis] none of the PV species {PV_SPECIES} are in "
+                         f"{srk_yaml}; cannot define Le_C")
+    pv_cols = [idx[s] for s in pv]
+
+    T = np.asarray(tables["T"])
+    shape = T.shape
+    flatT = T.reshape(-1)
+    nNode = flatT.size
+
+    Ymat = np.zeros((nNode, gas.n_species))
+    for s in sp_in_mech:
+        Ymat[:, idx[s]] = np.asarray(tables[f"Y_{s}"]).reshape(-1)
+
+    LeZ = np.full(nNode, np.nan)
+    LeC = np.full(nNode, np.nan)
+    nfail = 0
+    for n in range(nNode):
+        Tn = float(flatT[n])
+        y = Ymat[n]
+        ssum = y.sum()
+        if not np.isfinite(Tn) or Tn < 200.0 or ssum <= 1e-8:
+            continue
+        try:
+            gas.TPY = max(Tn, 250.0), P, y / ssum
+            mu = gas.viscosity
+            lam = gas.thermal_conductivity
+            cp = gas.cp_mass
+            rho = gas.density
+            nu = mu / max(rho, 1e-30)
+            alpha = lam / max(rho * cp, 1e-30)
+            LeZ[n] = nu / max(alpha, 1e-30)                 # = Pr
+            Dk = np.clip(gas.mix_diff_coeffs, 1e-12, None)
+            ypv = y[pv_cols]
+            wsum = float(ypv.sum())
+            DC = (float((ypv * Dk[pv_cols]).sum() / wsum)
+                  if wsum > 1e-12 else float(alpha))
+            LeC[n] = nu / max(DC, 1e-30)
+        except Exception:
+            nfail += 1
+
+    # Robust fill: unconverged / degenerate corners (high-gZ, off-manifold c)
+    # take the manifold median; clamp to a sane Lewis window so the table never
+    # carries NaN/inf or a runaway diffusivity.
+    def _fill(a, lo, hi, fallback):
+        good = np.isfinite(a)
+        med = float(np.median(a[good])) if good.any() else fallback
+        nbad = int((~good).sum())
+        a[~good] = med
+        return np.clip(a, lo, hi), med, nbad
+
+    LeZ, medZ, nbadZ = _fill(LeZ, 0.1, 10.0, 0.63)
+    LeC, medC, nbadC = _fill(LeC, 0.1, 10.0, 0.60)
+    print(f"[lewis] real-fluid differential diffusion ({transport_model}) on "
+          f"{nNode} nodes: Le_Z med={medZ:.3f} [{LeZ.min():.2f},{LeZ.max():.2f}] "
+          f"Le_C med={medC:.3f} [{LeC.min():.2f},{LeC.max():.2f}]")
+    print(f"[lewis]   filled {nbadZ} degenerate Le_Z / {nbadC} Le_C nodes with "
+          f"median; {nfail} transport eval failures")
+    return LeZ.reshape(shape), LeC.reshape(shape), medZ, medC
 
 
 def main():
@@ -645,6 +792,16 @@ def main():
                         "flamelet_NNN.npz) to drop before building -- used to "
                         "remove half-transitioned outliers that break the "
                         "monotonic T(c) envelope (Wang Fig18/19 low-P clean).")
+    p.add_argument("--diff-diff-yaml", default=None,
+                   help="Tier-4 differential diffusion: SRK Cantera mechanism "
+                        "(e.g. data/wang2011_srk_v32.yaml). When given, the "
+                        "per-cell Lewis numbers Le_Z(Z,gZ,c[,chi]) and Le_C are "
+                        "tabulated from the real-fluid transport at each node's "
+                        "(T,Y) and written as Le_Z/Le_C fields. Omit to keep the "
+                        "legacy constant Le {Z;C} block.")
+    p.add_argument("--diff-diff-transport", default="high-pressure-Chung",
+                   help="Cantera transport model for the Tier-4 Le tabulation "
+                        "(default: high-pressure-Chung, matching the solver).")
     args = p.parse_args()
 
     fl_dir = Path(args.flamelet_dir)
@@ -688,6 +845,20 @@ def main():
     Z_axis, g_axis, C_axis, chi_axis, tables = build_tables(
         fls, species, n_chi=args.n_chi, eq=eq, chi_mode=args.chi_axis
     )
+
+    # Tier-4: optional real-fluid differential-diffusion Lewis-number tables.
+    if args.diff_diff_yaml:
+        if "T" not in tables:
+            raise SystemExit("[lewis] differential diffusion needs the T table")
+        LeZ, LeC, medZ, medC = compute_lewis_tables(
+            tables, species, P_ref, args.diff_diff_yaml,
+            transport_model=args.diff_diff_transport,
+        )
+        tables["Le_Z"] = LeZ
+        tables["Le_C"] = LeC
+        meta["le"] = (medZ, medC)
+        meta["closure"] += " + tabulated-Le(Z,c) [Tier-4 diff-diff]"
+
     for f, T in tables.items():
         print(f"[build]   {f}: range [{T.min():.3g}, {T.max():.3g}]")
 

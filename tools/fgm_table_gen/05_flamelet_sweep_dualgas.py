@@ -97,7 +97,7 @@ TRANSPORT_SRK   = swp.TRANSPORT_MODEL      # high-pressure-Chung
 # (FPVgen, IhmeGroup, offers unity-Lewis-number as a first-class option.)
 # Real-fluid properties (rho/lambda/mu/chi_st) are still re-evaluated with
 # SRK + high-pressure-Chung at save time (_save_flamelet_realfluid).
-TRANSPORT_IDEAL = "unity-Lewis-number"
+TRANSPORT_IDEAL = os.environ.get("FGM_STRUCT_TRANSPORT", "unity-Lewis-number")
 _log = swp._log
 
 IDEAL_YAML = DATA / "wang2011_ideal_v32.yaml"

@@ -24,6 +24,7 @@ License
 \*---------------------------------------------------------------------------*/
 
 #include "FGMTable.H"
+#include "tabulatedRealGasMixture.H"
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
@@ -49,6 +50,9 @@ Foam::FGMTable::FGMTable
     nC_(readLabel(lookup("nC"))),
     nChi_(1),
     hasChi_(false),
+    useEnthalpy_(false),
+    hOx_(0),
+    hFuel_(0),
     Z_axis_(lookup("Z")),
     gZ_axis_(lookup("gZ")),
     C_axis_(lookup("C")),
@@ -78,6 +82,30 @@ Foam::FGMTable::FGMTable
             }
             hasChi_ = true;
         }
+    }
+
+    // -------- optional enthalpy-defect axis (non-adiabatic FPV, method b) --------
+    // The 4th axis machinery is generic; here it carries the enthalpy defect
+    // dh [J/kg] instead of chi. Detected by 'fourthAxis enthalpy;'. We reuse the
+    // chi_axis_/nChi_ slots so interpolateTable() is unchanged, but flag
+    // useEnthalpy_ so the solver forms dh = h - ((1-Z)hOx + Z hFuel) per cell.
+    if (found("fourthAxis") && word(lookup("fourthAxis")) == "enthalpy")
+    {
+        nChi_ = readLabel(lookup("nH"));
+        chi_axis_ = List<scalar>(lookup("enthalpy"));
+        if (chi_axis_.size() != nChi_)
+        {
+            FatalErrorInFunction
+                << "enthalpy axis size " << chi_axis_.size()
+                << " != nH = " << nChi_ << exit(FatalError);
+        }
+        hOx_   = readScalar(lookup("hOx"));
+        hFuel_ = readScalar(lookup("hFuel"));
+        hasChi_ = true;          // use the 4-D interpolation path
+        useEnthalpy_ = true;
+        Info<< "    NON-ADIABATIC FPV: 4th axis = enthalpy defect, nH=" << nChi_
+            << "  dh=[" << chi_axis_[0] << "," << chi_axis_[nChi_-1] << "] J/kg"
+            << nl << "    hOx=" << hOx_ << " hFuel=" << hFuel_ << " J/kg" << endl;
     }
 
     Info<< "    axes: nZ=" << nZ_
@@ -153,6 +181,69 @@ Foam::FGMTable::FGMTable
             Y_tables_.insert(speciesNames_[i], tbl);
         }
         Info<< "    tabulated species: " << speciesNames_ << nl << endl;
+    }
+
+    // -------- optional Tier-2 real-gas mixture coefficient tables --------
+    // Pre-tabulated output of SRKchungTakaMixture::calculateRealGas, keyed
+    // RG_<name> in tabulatedRealGasMixture::coeffNames() order. All 13 must be
+    // present (and full length) for the solver to enable the lookup; otherwise
+    // the table is treated as a legacy (no-RG) table and live mixing is used.
+    {
+        const wordList& cn = tabulatedRealGasMixture::coeffNames();
+        bool hasAll = true;
+        forAll(cn, k)
+        {
+            if (!found("RG_" + cn[k])) { hasAll = false; break; }
+        }
+
+        if (hasAll)
+        {
+            RGcoeff_.setSize(cn.size());
+            forAll(cn, k)
+            {
+                const word key("RG_" + cn[k]);
+                List<scalar> tbl(lookup(key));
+                if (tbl.size() != nTot)
+                {
+                    FatalErrorInFunction
+                        << key << " size " << tbl.size() << " != " << nTot
+                        << exit(FatalError);
+                }
+                RGcoeff_[k] = tbl;
+            }
+            Info<< "    tabulated real-gas coefficients (Tier-2): "
+                << cn << nl << endl;
+        }
+    }
+
+    // -------- optional Tier-4 differential-diffusion Lewis-number tables --------
+    // Le_<var> flat fields (length nTot) for the control variables. When
+    // present the solver applies a per-cell Le(Z,gZ,c[,chi]) to that variable's
+    // laminar diffusivity (rho*D = mu/Le), the standard differential-diffusion
+    // FGM closure, generalising the constant 'Le' sub-dict. Each is independent:
+    // a table may carry Le_Z, Le_C, both, or neither.
+    {
+        const wordList leVars({word("Z"), word("C")});
+        forAll(leVars, k)
+        {
+            const word key("Le_" + leVars[k]);
+            if (found(key))
+            {
+                List<scalar> tbl(lookup(key));
+                if (tbl.size() != nTot)
+                {
+                    FatalErrorInFunction
+                        << key << " size " << tbl.size() << " != " << nTot
+                        << exit(FatalError);
+                }
+                Le_tables_.insert(leVars[k], tbl);
+            }
+        }
+        if (!Le_tables_.empty())
+        {
+            Info<< "    tabulated differential-diffusion Lewis numbers "
+                << "(Tier-4): " << Le_tables_.sortedToc() << nl << endl;
+        }
     }
 }
 
@@ -363,6 +454,92 @@ Foam::scalar Foam::FGMTable::interpolateY
             << exit(FatalError);
     }
     return interpolateTable(Y_tables_[specie], Z, gZ, C, chi_axis_[0]);
+}
+
+
+// -------- Tier-2 real-gas coefficient interpolation --------
+
+void Foam::FGMTable::interpolateRealGasCoeffs
+(
+    scalar Z, scalar gZ, scalar C, scalar chi,
+    List<scalar>& coeffs
+) const
+{
+    if (RGcoeff_.empty())
+    {
+        return;
+    }
+
+    coeffs.setSize(RGcoeff_.size());
+    forAll(RGcoeff_, k)
+    {
+        coeffs[k] = interpolateTable(RGcoeff_[k], Z, gZ, C, chi);
+    }
+}
+
+
+// -------- Opt-1 base-blend node interpolation stencil --------
+
+void Foam::FGMTable::interpStencil
+(
+    scalar Z, scalar gZ, scalar C, scalar chi,
+    label nodes[16], scalar weights[16]
+) const
+{
+    label iZ, iG, iC, iK;
+    scalar wZ, wG, wC, wK;
+
+    bracket(Z_axis_,   Z,   iZ, wZ);
+    bracket(gZ_axis_,  gZ,  iG, wG);
+    bracket(C_axis_,   C,   iC, wC);
+    bracket(chi_axis_, chi, iK, wK);
+
+    // Fold the chi-high neighbour to the same slice for a 3-D table (mirrors
+    // interpolateTable), so the chi-high corners are valid indices with the
+    // weight (1-wK)/wK distribution -- wK=0 here, so they contribute nothing.
+    const label iKp = (chi_axis_.size() >= 2) ? (iK + 1) : iK;
+
+    label m = 0;
+    for (label dZ = 0; dZ <= 1; dZ++)
+    {
+        const scalar fZ = dZ ? wZ : (scalar(1) - wZ);
+        for (label dG = 0; dG <= 1; dG++)
+        {
+            const scalar fG = dG ? wG : (scalar(1) - wG);
+            for (label dC = 0; dC <= 1; dC++)
+            {
+                const scalar fC = dC ? wC : (scalar(1) - wC);
+                for (label dK = 0; dK <= 1; dK++)
+                {
+                    const scalar fK = dK ? wK : (scalar(1) - wK);
+                    nodes[m] =
+                        flatIndex(iZ + dZ, iG + dG, iC + dC, dK ? iKp : iK);
+                    weights[m] = fZ*fG*fC*fK;
+                    m++;
+                }
+            }
+        }
+    }
+}
+
+
+// -------- Tier-4 differential-diffusion Lewis-number interpolation --------
+
+Foam::scalar Foam::FGMTable::interpolateLe
+(
+    const word& var,
+    scalar Z, scalar gZ, scalar C, scalar chi
+) const
+{
+    if (!Le_tables_.found(var))
+    {
+        FatalErrorInFunction
+            << "Lewis number Le_" << var
+            << " is not tabulated in fgmProperties." << nl
+            << "Available: " << Le_tables_.sortedToc()
+            << exit(FatalError);
+    }
+    return interpolateTable(Le_tables_[var], Z, gZ, C, chi);
 }
 
 

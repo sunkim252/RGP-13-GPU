@@ -98,6 +98,33 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         C_ = max(min(C_, scalar(1)), scalar(0));
     }
 
+    // --- Total-enthalpy transport (non-adiabatic FPV, method b) ---
+    // Total (absolute) enthalpy is a CONSERVED scalar (no reaction source:
+    // chemical heat release is internal to h), so this is a plain advection-
+    // diffusion equation -- NOT the unstable he equation. It carries the cold-
+    // inlet / heat-loss enthalpy in from the boundaries; the manifold lookup
+    // then reads T(Z,gZ,c,dh) at the local defect dh = h - h_ad(Z). T is taken
+    // from the table (not inverted from h), so the he<->T drift that forbids an
+    // EEqn does not occur. Solved only when the table carries an enthalpy axis.
+    if (fgmTable_.useEnthalpy())
+    {
+        volScalarField& h = hPtr_();
+        const volScalarField Dh("Dh", Deff("h"));
+        fvScalarMatrix hEqn
+        (
+            fvm::ddt(rho, h)
+          + mvConvection->fvmDiv(phi, h)
+          - fvm::laplacian(Dh, h)
+         ==
+            fvModels().source(rho, h)
+        );
+
+        hEqn.relax();
+        fvConstraints().constrain(hEqn);
+        hEqn.solve("Yi");
+        fvConstraints().constrain(h);
+    }
+
 
     // --- No transported energy equation (adiabatic FPV/FGM closure) ---
     // The thermochemical state (T, he, Y) is a tabulated function of the
