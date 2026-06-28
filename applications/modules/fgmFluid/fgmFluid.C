@@ -437,12 +437,14 @@ void Foam::solvers::fgmFluid::setupRealGasCoeffTabulation()
     }
 
     // Opt-1: arm the base-thermo node interpolation (internal cells). Replaces
-    // the per-cell 106-species base blend with a 16-corner blend of pre-built
-    // node mixtures. Gated off for an enthalpy-defect table (whose 4th coord is
-    // dh, not the chi_st_ field passed here as the stencil's chi coordinate) and
+    // the per-cell 106-species base blend with a corner blend of pre-built node
+    // mixtures. Valid for an enthalpy-defect (4-D) table too: the tabulated
+    // composition Y(Z,gZ,c,dh) is FROZEN across the dh axis (add_enthalpy_axis.py
+    // replicates Y along dh), so the per-node base thermo is identical along dh
+    // and the corner blend is exact regardless of the 4th-coord field passed to
+    // the stencil (chi_st_ here just selects an arbitrary dh slice). Skipped only
     // when the table does not tabulate every mixture species (then the per-node
     // blend would be incomplete).
-    if (!fgmTable_.useEnthalpy())
     {
         const wordList& sp = thermo_.species();
         bool haveAllY = true;
@@ -474,11 +476,6 @@ void Foam::solvers::fgmFluid::setupRealGasCoeffTabulation()
                 << "(table does not tabulate every mixture species)"
                 << nl << endl;
         }
-    }
-    else
-    {
-        Info<< "fgmFluid: Opt-1 base-blend node interpolation skipped "
-            << "(enthalpy-defect table)" << nl << endl;
     }
 
     Info<< "fgmFluid: Tier-2 real-gas coefficient tabulation ACTIVE -- "
