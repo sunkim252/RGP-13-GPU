@@ -26,6 +26,8 @@ License
 #include "fgmFluid.H"
 #include "fvcDdt.H"
 #include "fvmLaplacian.H"
+#include "fvcGrad.H"
+#include "zeroGradientFvPatchFields.H"
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
@@ -51,6 +53,48 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     // The FGM manifold already delivers a normalised composition, so the call
     // is unnecessary and corrupts it.
 
+    // --- Localized Artificial Diffusivity (LAD) -----------------------------
+    // Smear the steep transcritical density interface (recess-tip LOx/gas, rho
+    // jump ~60x at x~25 mm) with a density-gradient-sensed artificial mass
+    // diffusivity, damping at source the spurious pressure/velocity overshoots
+    // that throttle the time step (diagnosed bottleneck). Kawai, Terashima &
+    // Negishi, J. Comput. Phys. 300:116-135 (2015). Sized to the local cell,
+    //   Dart = LADCoeff * V^(2/3) * |U| * |grad(rho)|   [kg/(m s)],
+    // so the artificial diffusive time step stays of order the convective one
+    // and smooth regions (|grad(rho)| ~ 0) are untouched. LADCoeff is read
+    // from the PIMPLE dict each step (runTimeModifiable); default 0 = LAD off.
+    // The same Dart is added to the Z, C and h diffusivities so the manifold
+    // coordinates stay mutually consistent under the smoothing.
+    const scalar LADCoeff
+    (
+        pimple.dict().lookupOrDefault<scalar>("LADCoeff", scalar(0))
+    );
+    volScalarField Dart
+    (
+        IOobject
+        (
+            "Dart",
+            mesh.time().name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        mesh,
+        dimensionedScalar(dimensionSet(1, -1, -1, 0, 0, 0, 0), 0),
+        zeroGradientFvPatchScalarField::typeName
+    );
+    if (LADCoeff > 0)
+    {
+        const scalarField V23(pow(scalarField(mesh.V()), 2.0/3.0));
+        Dart.primitiveFieldRef() =
+            LADCoeff*V23
+           *mag(U_)().primitiveField()
+           *mag(fvc::grad(rho))().primitiveField();
+        Dart.correctBoundaryConditions();
+        Info<< "LAD: Dart max = " << gMax(Dart.primitiveField())
+            << " kg/(m s)" << endl;
+    }
+
     // --- Mixture-fraction transport (conserved scalar, no source) ---
     {
         const volScalarField DZ("DZ", Deff("Z"));
@@ -58,7 +102,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         (
             fvm::ddt(rho, Z_)
           + mvConvection->fvmDiv(phi, Z_)
-          - fvm::laplacian(DZ, Z_)
+          - fvm::laplacian(DZ + Dart, Z_)
          ==
             fvModels().source(rho, Z_)
         );
@@ -78,7 +122,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         (
             fvm::ddt(rho, C_)
           + mvConvection->fvmDiv(phi, C_)
-          - fvm::laplacian(DC, C_)
+          - fvm::laplacian(DC + Dart, C_)
          ==
             sourcePV_
           + fvModels().source(rho, C_)
@@ -114,7 +158,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         (
             fvm::ddt(rho, h)
           + mvConvection->fvmDiv(phi, h)
-          - fvm::laplacian(Dh, h)
+          - fvm::laplacian(Dh + Dart, h)
          ==
             fvModels().source(rho, h)
         );

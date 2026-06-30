@@ -395,10 +395,18 @@ inline Foam::scalar Foam::SRKGas<Specie>::psi
     scalar T
 ) const
 {
-    // psi = drho/dp |_T = rho/p (for ideal gas) generalises to 1/(Z R T).
-    // Peneloux is a pure volume shift and leaves (drho/dp)_T essentially
-    // unchanged to leading order; returning the SRK value keeps psi
-    // consistent with the existing compressibility routines.
+    // psi = drho/dp |_T, returned as the ideal-gas-like rho/p = 1/(Z R T),
+    // NOT the true SRK (drho/dp)_T -- deliberately. OpenFOAM's pressure
+    // equation (isothermalFluid::correctPressure) relies on psi as the
+    // diagonal regularisation psi*ddt(p); the true (tiny) dense-fluid drho/dp
+    // removes that regularisation, the pEqn collapses to the ill-conditioned
+    // incompressible-divergence limit, and the flux / LTS time scale blow up.
+    // Measured 2026-06-30 on rd0110_4Mv2_les: a centred-difference real
+    // (drho/dp)_T gave time scale 1.7e-14 vs 1.3e-10 for this rho/p form with
+    // SIMPLErho -- ~1e4x worse. The rho-vs-EOS inconsistency that the psi*dp
+    // density update (correctRho) introduces is instead cured by SIMPLErho
+    // (rho = thermo.rho() after the pressure solve), which keeps this
+    // regularising psi in the solve itself.
     const scalar Zv = this->Z(p, T);
     return 1.0/(Zv*this->R()*T);
 }
@@ -461,21 +469,41 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
             qm*cos((th + 4*pi)/3.0) - a2/3.0
         };
 
-        // Always select the largest root (vapour branch), matching the OFv8
-        // soaveRedlichKwong reference. The max root is continuous in T, so the
-        // enthalpy->temperature Newton inversion (species::thermo::T) always
-        // converges -- proven robust in production (validated 67-day run).
-        //
-        // NOTE: this overestimates the specific volume of compressed-liquid
-        // states (e.g. cryogenic LOX well below Tc). The minimum-fugacity /
-        // smooth-blended root selection that corrected that density was
-        // reverted here because it makes Z (hence h) discontinuous across the
-        // saturation line, which breaks the T(h) inversion for cold dense
-        // mixing cells ("Maximum number of iterations exceeded"). Reconciling
-        // compressed-liquid density accuracy with inversion robustness (e.g.
-        // a robust bracketing T(h) solver, or a two-phase-aware enthalpy) is
-        // left as future work.
-        root = max(r[0], max(r[1], r[2]));
+        const scalar Zmin = min(r[0], min(r[1], r[2]));
+        const scalar Zmax = max(r[0], max(r[1], r[2]));
+
+        if (stableRoot_)
+        {
+            // Minimum-fugacity (thermodynamically stable phase) selection.
+            // SRK fugacity coefficient
+            //   ln(phi) = Z - 1 - ln(Z - B) - (A/B) ln(1 + B/Z).
+            // The smaller ln(phi) (= smaller molar Gibbs) is the stable phase:
+            // the liquid root (Zmin) wins for p > psat(T), the vapour root
+            // (Zmax) for p < psat, and they coincide on the saturation line
+            // (Maxwell construction). This recovers the compressed-liquid
+            // density (e.g. cryogenic LOX at 100-120 K, p < psat) that the
+            // legacy max-root choice underestimates by up to an order of
+            // magnitude. Trade-off: Z (hence h) is discontinuous across the
+            // saturation line, so an h->T Newton inversion can fail ("Maximum
+            // number of iterations exceeded") -- safe for the fgmFluid path
+            // (T is read from the manifold table, not inverted from h).
+            const scalar lnPhiL =
+                (Zmin > B)
+              ? Zmin - 1 - log(Zmin - B) - (A/B)*log(1 + B/Zmin)
+              : GREAT;                  // liquid root below co-volume: reject
+            const scalar lnPhiV =
+                Zmax - 1 - log(Zmax - B) - (A/B)*log(1 + B/Zmax);
+            root = (lnPhiL <= lnPhiV) ? Zmin : Zmax;
+        }
+        else
+        {
+            // Legacy default: always the largest root (vapour branch), matching
+            // the OFv8 soaveRedlichKwong reference. Continuous in T, so the
+            // enthalpy->temperature Newton inversion (species::thermo::T) is
+            // robust (validated 67-day run), at the cost of compressed-liquid
+            // specific-volume accuracy. See SRKGas.H stableRoot_.
+            root = Zmax;
+        }
     }
     else
     {
