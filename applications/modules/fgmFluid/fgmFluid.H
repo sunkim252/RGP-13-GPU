@@ -282,6 +282,11 @@ public:
         //  and update thermophysical and transport properties
         virtual void thermophysicalPredictor();
 
+        //- Construct and solve the momentum equation, adding a localized
+        //  artificial (shear) viscosity (LADUCoeff) to damp the spurious
+        //  velocity overshoot at the transcritical density interface
+        virtual void momentumPredictor();
+
         //- Correct the thermophysical transport
         virtual void thermophysicalTransportCorrector();
 

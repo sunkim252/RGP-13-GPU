@@ -1,5 +1,6 @@
 fgmFluid.C
 setRDeltaT.C
 thermophysicalPredictor.C
+momentumPredictor.C
 
 LIB = $(FOAM_USER_LIBBIN)/libfgmFluid
