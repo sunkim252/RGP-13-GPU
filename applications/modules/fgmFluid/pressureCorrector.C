@@ -124,9 +124,15 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     (
         "phiHbyAv",
         fvc::flux(HbyA)
-      + rhorAUf*fvc::ddtCorr(U, phi/rhof)
+      + rhorAUf*fvc::ddtCorr(U, phi/rhof)   // volumetric transient Rhie-Chow
     );
     MRF.makeRelative(phiHbyAv);
+
+    // Update the pressure BCs for flux consistency (3D: waveTransmissive
+    // outlet, fixedFluxPressure walls). Volumetric-flux form: pass the
+    // volumetric predicted flux and the rAUf (velocity-level) coefficient,
+    // matching the pEqn's laplacian(rAUf, p).
+    constrainPressure(p, rho, U, phiHbyAv, rAUf, MRF);
 
     fvScalarMatrix pDDtEqn
     (
