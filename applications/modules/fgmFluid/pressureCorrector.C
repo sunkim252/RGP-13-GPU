@@ -98,37 +98,41 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         tUEqn.clear();
     }
 
-    surfaceScalarField phiHbyA
+    // --- PEP (pressure-evolution) pressure equation -------------------------
+    // Replace the base continuity pEqn's fvc::ddt(rho) -- whose Eulerian
+    // thermal density change radiates the spurious contact pressure spike --
+    // with the pressure-evolution form  psis*dp/dt + div(u) = 0, where psis =
+    // 1/(rho c^2) is the isentropic compressibility and div(u) is the
+    // VOLUMETRIC velocity divergence (NOT the mass-flux divergence). For a
+    // uniform-p, uniform-u contact div(u) = 0 and dp/dt = 0 by construction, so
+    // the density jump advects without radiating pressure (Terashima & Koshi,
+    // J. Comput. Phys. 231 (2012) 6907; Kai/Kurose PEQSI, Phys. Fluids 36
+    // (2024) 116104). ATTEMPT 1: ideal-gas isentropic compressibility
+    // 1/(gamma p) -- validates the STRUCTURE (spike removal); refined to the
+    // real SRK sound speed next. constrainPressure / MRF-mass / consistent
+    // branches dropped for this first cyclic-benchmark attempt.
+    const surfaceScalarField rAUf("rAUf", fvc::interpolate(rAU));
+    const volScalarField psis("psis", 1.0/(thermo.gamma()*p));
+
+    // Volumetric predicted face flux (no rho weighting) with transient
+    // Rhie-Chow (ddtCorr) on the volumetric flux phi/rhof.
+    surfaceScalarField phiHbyAv
     (
-        "phiHbyA",
-        rhof*fvc::flux(HbyA)
-      + rhorAUf*fvc::ddtCorr(rho, U, phi, rhoUf)
+        "phiHbyAv",
+        fvc::flux(HbyA)
+      + rhorAUf*fvc::ddtCorr(U, phi/rhof)
     );
-
-    MRF.makeRelative(rhof, phiHbyA);
-
-    if (pimple.consistent())
-    {
-        phiHbyA += (rhorAAtUf - rhorAUf)*fvc::snGrad(p)*mesh.magSf();
-        HbyA += (rAAtU - rAU)*fvc::grad(p);
-    }
-
-    // Update the pressure BCs to ensure flux consistency
-    constrainPressure(p, rho, U, phiHbyA, rhorAAtUf, MRF);
-
-    fvc::makeRelative(phiHbyA, rho, U);
+    MRF.makeRelative(phiHbyAv);
 
     fvScalarMatrix pDDtEqn
     (
-        fvc::ddt(rho) + psi*correction(fvm::ddt(p))
-      + fvc::div(phiHbyA)
-     ==
-        fvModels().sourceProxy(rho, p)
+        psis*fvm::ddt(p)
+      + fvc::div(phiHbyAv)
     );
 
     while (pimple.correctNonOrthogonal())
     {
-        fvScalarMatrix pEqn(pDDtEqn - fvm::laplacian(rhorAAtUf, p));
+        fvScalarMatrix pEqn(pDDtEqn - fvm::laplacian(rAUf, p));
 
         pEqn.setReference
         (
@@ -142,7 +146,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
         if (pimple.finalNonOrthogonalIter())
         {
-            phi = phiHbyA + pEqn.flux();
+            // Reconstruct the mass flux from the corrected volumetric flux
+            phi = rhof*(phiHbyAv + pEqn.flux());
         }
     }
 
