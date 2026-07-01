@@ -395,47 +395,25 @@ inline Foam::scalar Foam::SRKGas<Specie>::psi
     scalar T
 ) const
 {
-    // psi = drho/dp |_T, returned as the ideal-gas-like rho/p = 1/(Z R T),
-    // NOT the true SRK (drho/dp)_T -- deliberately. OpenFOAM's pressure
-    // equation (isothermalFluid::correctPressure) relies on psi as the
-    // diagonal regularisation psi*ddt(p); the true (tiny) dense-fluid drho/dp
-    // removes that regularisation, the pEqn collapses to the ill-conditioned
-    // incompressible-divergence limit, and the flux / LTS time scale blow up.
-    // Measured 2026-06-30 on rd0110_4Mv2_les: a centred-difference real
-    // (drho/dp)_T gave time scale 1.7e-14 vs 1.3e-10 for this rho/p form with
-    // SIMPLErho -- ~1e4x worse. The rho-vs-EOS inconsistency that the psi*dp
-    // density update (correctRho) introduces is instead cured by SIMPLErho
-    // (rho = thermo.rho() after the pressure solve), which keeps this
-    // regularising psi in the solve itself.
-    const scalar Zv = this->Z(p, T);
-    const scalar psiEos = 1.0/(Zv*this->R()*T);   // = rho/p
-
-    // --- A1: pressure-equilibrium regularisation (compressibility floor) ----
-    // At the dense transcritical interface a small continuity imbalance drives
-    // p -> huge (measured ~2e10 Pa at the injector). Then psi = rho/p -> tiny,
-    // which REMOVES the pressure equation's psi*correction(ddt(p)) diagonal
-    // regularisation, so the spike self-reinforces (positive feedback) and
-    // drives the spurious velocity overshoot. Hold the compressibility at its
-    // reference-state value rho/psiRefP for over-pressured cells (p > psiRefP)
-    // so the regularisation stays alive and a uniform-p contact is kept
-    // pressure-equilibrium-consistent. This is an artificial-compressibility
-    // floor (Chorin, J. Comput. Phys. 2 (1967) 12) and, unlike replacing psi
-    // by the true (tiny) drho/dp -- which destroys the regularisation and
-    // collapses the time step -- it only RAISES psi at over-pressured cells;
-    // gas/physical states (p < psiRefP) keep the exact rho/p. psiRefP is the
-    // operating pressure (hardcoded for this case; promote to static-from-dict
-    // once validated).
-    // A1 psi-floor (return psiEos*(p/psiRefP) for p > psiRefP) was TESTED
-    // 2026-07-01 and REVERTED: it cut the injector pressure spike (2e10 ->
-    // 1.4e9 -- the compressibility-floor mechanism works) but the |U| overshoot
-    // SPREAD (744/3592 vs 74/624 capped cells) and dt/continuity worsened.
-    // Reason: psi lives in the correction(ddt(p)) term, which vanishes at
-    // convergence, so raising it damps the pressure ITERATION, not the
-    // converged overshoot; and raising psi across all over-pressured cells
-    // perturbs the pressure-velocity balance broadly. A genuine
-    // pressure-equilibrium-preserving fix requires the discretisation
-    // (pressure-evolution, Terashima-Koshi), not a psi coefficient tweak.
-    return psiEos;   // = rho/p (unmodified)
+    // psi = (drho/dp)_T, the REAL SRK isothermal compressibility, from a
+    // forward finite difference of the Peneloux-corrected density rho(p,T) in
+    // p (floored positive). Required by the PEP pressure-evolution pEqn
+    // (fgmFluid::pressureCorrector), whose compressibility coefficient
+    // psis = psi/rho must reflect the true dense-fluid stiffness -- the
+    // ideal-gas rho/p is ~100x too soft for liquid LOX and mis-develops the
+    // pressure-velocity coupling (Attempt-1 symptom: cold slab warmed 143->286K).
+    //
+    // HISTORY: psi was held at rho/p = 1/(Z R T) while the OLD continuity pEqn
+    // (isothermalFluid::correctPressure) used it as the diagonal regularisation
+    // psi*ddt(p), which the tiny real drho/dp destroyed (Track B 2026-06-30:
+    // time scale 1.7e-14 vs 1.3e-10; the A1 compressibility floor was also
+    // tested and reverted). That pEqn is now OVERRIDDEN by the PEP scheme, so
+    // the real value is used here.
+    const scalar dp = 1e-3*p;
+    const scalar rho0 = this->rho(p, T);
+    const scalar rho1 = this->rho(p + dp, T);
+    const scalar dRhodP = (rho1 - rho0)/dp;
+    return max(dRhodP, 1e-3*rho0/p);   // floor at 0.1% of rho/p
 }
 
 

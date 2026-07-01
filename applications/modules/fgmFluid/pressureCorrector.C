@@ -112,7 +112,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // real SRK sound speed next. constrainPressure / MRF-mass / consistent
     // branches dropped for this first cyclic-benchmark attempt.
     const surfaceScalarField rAUf("rAUf", fvc::interpolate(rAU));
-    const volScalarField psis("psis", 1.0/(thermo.gamma()*p));
+    // ATTEMPT 2: real SRK isothermal compressibility psis = (drho/dp)_T/rho =
+    // kappa_T (thermo.psi() now returns the real (drho/dp)_T -- see SRKGasI.H).
+    // This supplies the true dense-fluid stiffness that the ideal-gas 1/(gamma
+    // p) lacked (~100x too soft for liquid LOX).
+    const volScalarField psis("psis", thermo.psi()/rho);
 
     // Volumetric predicted face flux (no rho weighting) with transient
     // Rhie-Chow (ddtCorr) on the volumetric flux phi/rhof.
