@@ -212,6 +212,12 @@ private:
         //- Set rDeltaT for LTS
         virtual void setRDeltaT();
 
+        //- Pressure-equilibrium-preserving pressure equation (called by the
+        //  overridden pressureCorrector). Replaces the base
+        //  isothermalFluid::correctPressure so the transcritical density
+        //  contact does not radiate a spurious pressure spike.
+        void correctPressurePEP();
+
         //- Update gZ, look up the manifold, set inactive-species Yi and
         //  the cached PV source from the FGM table.
         void updateManifold();
@@ -286,6 +292,12 @@ public:
         //  artificial (shear) viscosity (LADUCoeff) to damp the spurious
         //  velocity overshoot at the transcritical density interface
         virtual void momentumPredictor();
+
+        //- Construct and solve the pressure equation in the PISO loop using a
+        //  pressure-equilibrium-preserving (pressure-evolution) formulation
+        //  that removes the spurious pressure spike at the transcritical
+        //  density contact (see pressureCorrector.C).
+        virtual void pressureCorrector();
 
         //- Correct the thermophysical transport
         virtual void thermophysicalTransportCorrector();
