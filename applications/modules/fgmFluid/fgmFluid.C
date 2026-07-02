@@ -597,14 +597,28 @@ void Foam::solvers::fgmFluid::updateManifold()
     const scalar hFuelb = useH ? fgmTable_.hFuel() : 0;
     const scalarField* hcl = useH ? &hPtr_->primitiveField() : nullptr;
 
-    // Hoist references to the tabulated species fields
+    // Hoist references to the tabulated species fields AND their flat tables
+    // (resolving the by-name HashTable lookup once, not once per cell).
     List<scalarField*> Yref(tabSpecieIDs_.size());
-    List<word> Yname(tabSpecieIDs_.size());
+    List<const List<scalar>*> Ytbl(tabSpecieIDs_.size());
     forAll(tabSpecieIDs_, k)
     {
         const label id = tabSpecieIDs_[k];
         Yref[k] = &Y_[id].primitiveFieldRef();
-        Yname[k] = thermo_.species()[id];
+        Ytbl[k] = &fgmTable_.Ytable(thermo_.species()[id]);
+    }
+
+    // Hoist the remaining flat tables for the shared-stencil evaluation: all
+    // ~120+ fields (source, T, Y_k, RG_*, Le_*) are interpolated at the SAME
+    // manifold point per cell, so the 4-axis bracket is built once per cell
+    // (makeStencil) and reused -- bit-identical to the per-field lookups.
+    const List<scalar>& srcTbl = fgmTable_.sourcePVTable();
+    const List<scalar>& Ttbl = fgmTable_.Ttable();
+    if (Ttbl.empty())
+    {
+        FatalErrorInFunction
+            << "Temperature is not tabulated in fgmProperties."
+            << exit(FatalError);
     }
 
     // Hoist references to the Tier-2 real-gas coefficient fields (filled below
@@ -673,40 +687,45 @@ void Foam::solvers::fgmFluid::updateManifold()
             coord4 = (*hcl)[celli] - hAd;
         }
 
-        if (use4D)
+        // Shared stencil: ALL tabulated fields (source, T, Y_k, RG_*, Le_*)
+        // are interpolated at this one manifold point, so the 4-axis bracket
+        // and 16 corner indices are built ONCE and reused. A legacy 3-D query
+        // collapses the 4th axis exactly as before (coordinate chi_axis_[0]).
+        FGMTable::FGMStencil st;
+        fgmTable_.makeStencil
+        (
+            Zcl, gz, Ccl,
+            use4D ? coord4 : fgmTable_.chi0(),
+            st
+        );
+
+        // PV source: tabulated mass-fraction rate [1/s] -> volumetric.
+        srcc[celli] =
+            sourcePVscale_*rho_l*fgmTable_.interpolate(srcTbl, st);
+        Tc[celli] = fgmTable_.interpolate(Ttbl, st);
+        forAll(Yref, k)
         {
-            srcc[celli] =
-                sourcePVscale_*rho_l*fgmTable_.interpolate(Zcl, gz, Ccl, coord4);
-            Tc[celli] = fgmTable_.interpolateT(Zcl, gz, Ccl, coord4);
-            forAll(Yref, k)
-            {
-                (*Yref[k])[celli] =
-                    fgmTable_.interpolateY(Yname[k], Zcl, gz, Ccl, coord4);
-            }
+            (*Yref[k])[celli] = fgmTable_.interpolate(*Ytbl[k], st);
         }
-        else
-        {
-            srcc[celli] =
-                sourcePVscale_*rho_l*fgmTable_.interpolate(Zcl, gz, Ccl);
-            Tc[celli] = fgmTable_.interpolateT(Zcl, gz, Ccl);
-            forAll(Yref, k)
-            {
-                (*Yref[k])[celli] =
-                    fgmTable_.interpolateY(Yname[k], Zcl, gz, Ccl);
-            }
-        }
+
+        // Tier-2: per-cell real-gas mixture coefficients.
         if (fillRG)
         {
-            fgmTable_.interpolateRealGasCoeffs(Zcl, gz, Ccl, coord4, RGcoeffBuf_);
-            forAll(RGref, k) { (*RGref[k])[celli] = RGcoeffBuf_[k]; }
+            forAll(RGref, k)
+            {
+                (*RGref[k])[celli] =
+                    fgmTable_.interpolate(fgmTable_.RGtable(k), st);
+            }
         }
+
+        // Tier-4: per-cell differential-diffusion Lewis numbers.
         if (fillLeZ)
         {
-            (*LeZc)[celli] = fgmTable_.interpolateLe("Z", Zcl, gz, Ccl, coord4);
+            (*LeZc)[celli] = fgmTable_.interpolate(fgmTable_.LeTable("Z"), st);
         }
         if (fillLeC)
         {
-            (*LeCc)[celli] = fgmTable_.interpolateLe("C", Zcl, gz, Ccl, coord4);
+            (*LeCc)[celli] = fgmTable_.interpolate(fgmTable_.LeTable("C"), st);
         }
     }
 

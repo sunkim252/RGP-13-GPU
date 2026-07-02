@@ -300,51 +300,75 @@ void Foam::FGMTable::bracket
 }
 
 
-Foam::scalar Foam::FGMTable::interpolateTable
+void Foam::FGMTable::makeStencil
 (
-    const List<scalar>& table,
     scalar Z,
     scalar gZ,
     scalar C,
-    scalar chi
+    scalar chi,
+    FGMStencil& st
 ) const
 {
     label iZ, iG, iC, iK;
-    scalar wZ, wG, wC, wK;
 
-    bracket(Z_axis_,   Z,   iZ, wZ);
-    bracket(gZ_axis_,  gZ,  iG, wG);
-    bracket(C_axis_,   C,   iC, wC);
-    bracket(chi_axis_, chi, iK, wK);
+    bracket(Z_axis_,   Z,   iZ, st.wZ);
+    bracket(gZ_axis_,  gZ,  iG, st.wG);
+    bracket(C_axis_,   C,   iC, st.wC);
+    bracket(chi_axis_, chi, iK, st.wK);
 
     // If chi axis has length 1 the bracket above sets iK=0, wK=0, and we
     // need the iK+1 neighbour to fold to the same slice rather than walk
     // past the end of the array.
     const label iKp = (chi_axis_.size() >= 2) ? (iK + 1) : iK;
 
-    // Sample the 16 surrounding nodes.
-    #define _N(dZ, dG, dC, dK) \
-        table[flatIndex(iZ + (dZ), iG + (dG), iC + (dC), \
-                        (dK) ? iKp : iK)]
+    // Corner order = interpolateTable's c0000..c1111 (Z fastest, then gZ,
+    // then C; chi-low slice first).
+    label n = 0;
+    for (label dK = 0; dK < 2; dK++)
+    {
+        const label k = dK ? iKp : iK;
+        for (label dC = 0; dC < 2; dC++)
+        {
+            for (label dG = 0; dG < 2; dG++)
+            {
+                for (label dZ = 0; dZ < 2; dZ++)
+                {
+                    st.idx[n++] = flatIndex(iZ + dZ, iG + dG, iC + dC, k);
+                }
+            }
+        }
+    }
+}
 
-    const scalar c0000 = _N(0,0,0,0);
-    const scalar c1000 = _N(1,0,0,0);
-    const scalar c0100 = _N(0,1,0,0);
-    const scalar c1100 = _N(1,1,0,0);
-    const scalar c0010 = _N(0,0,1,0);
-    const scalar c1010 = _N(1,0,1,0);
-    const scalar c0110 = _N(0,1,1,0);
-    const scalar c1110 = _N(1,1,1,0);
-    const scalar c0001 = _N(0,0,0,1);
-    const scalar c1001 = _N(1,0,0,1);
-    const scalar c0101 = _N(0,1,0,1);
-    const scalar c1101 = _N(1,1,0,1);
-    const scalar c0011 = _N(0,0,1,1);
-    const scalar c1011 = _N(1,0,1,1);
-    const scalar c0111 = _N(0,1,1,1);
-    const scalar c1111 = _N(1,1,1,1);
 
-    #undef _N
+Foam::scalar Foam::FGMTable::interpolate
+(
+    const List<scalar>& table,
+    const FGMStencil& st
+) const
+{
+    const scalar wZ = st.wZ, wG = st.wG, wC = st.wC, wK = st.wK;
+
+    // Gather the 16 corners (same order as interpolateTable's c0000..c1111).
+    const scalar c0000 = table[st.idx[0]];
+    const scalar c1000 = table[st.idx[1]];
+    const scalar c0100 = table[st.idx[2]];
+    const scalar c1100 = table[st.idx[3]];
+    const scalar c0010 = table[st.idx[4]];
+    const scalar c1010 = table[st.idx[5]];
+    const scalar c0110 = table[st.idx[6]];
+    const scalar c1110 = table[st.idx[7]];
+    const scalar c0001 = table[st.idx[8]];
+    const scalar c1001 = table[st.idx[9]];
+    const scalar c0101 = table[st.idx[10]];
+    const scalar c1101 = table[st.idx[11]];
+    const scalar c0011 = table[st.idx[12]];
+    const scalar c1011 = table[st.idx[13]];
+    const scalar c0111 = table[st.idx[14]];
+    const scalar c1111 = table[st.idx[15]];
+
+    // Nested blend VERBATIM from the original interpolateTable -- keeps the
+    // floating-point evaluation order, hence bit-identical results.
 
     // Trilinear in (Z, gZ, C) at chi-low slice
     const scalar a00 = c0000*(1 - wZ) + c1000*wZ;
@@ -366,6 +390,23 @@ Foam::scalar Foam::FGMTable::interpolateTable
 
     // Linear in chi
     return A*(1 - wK) + B*wK;
+}
+
+
+Foam::scalar Foam::FGMTable::interpolateTable
+(
+    const List<scalar>& table,
+    scalar Z,
+    scalar gZ,
+    scalar C,
+    scalar chi
+) const
+{
+    // Single-field query: build the stencil and evaluate (the shared-stencil
+    // fast path is makeStencil once + interpolate per field).
+    FGMStencil st;
+    makeStencil(Z, gZ, C, chi, st);
+    return interpolate(table, st);
 }
 
 

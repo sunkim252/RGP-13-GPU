@@ -177,6 +177,21 @@ class FGMTable
 
 public:
 
+    //- Shared interpolation stencil: the 4-axis bracket + 16 corner flat
+    //  indices of ONE query point (Z,gZ,C,chi), reusable across every
+    //  tabulated field. updateManifold evaluates ~120+ fields (106 Y + 13
+    //  RG + Le + T + source) at the SAME point per cell; sharing the
+    //  bracket search + index computation removes that per-field
+    //  duplication. Corner order matches interpolateTable's c0000..c1111,
+    //  and interpolate(table, stencil) reproduces its nested-blend
+    //  arithmetic verbatim -- results are bit-identical.
+    struct FGMStencil
+    {
+        label idx[16];
+        scalar wZ, wG, wC, wK;
+    };
+
+
     // Constructors
 
         //- Construct from mesh
@@ -229,6 +244,44 @@ public:
                 const word& var,
                 scalar Z, scalar gZ, scalar C, scalar chi
             ) const;
+
+        // Shared-stencil entry points (fast path for many-field queries)
+
+            //- Build the interpolation stencil for one query point.
+            void makeStencil
+            (
+                scalar Z, scalar gZ, scalar C, scalar chi,
+                FGMStencil& st
+            ) const;
+
+            //- Evaluate an arbitrary flat table on a prebuilt stencil
+            //  (bit-identical to interpolateTable at the same point).
+            scalar interpolate
+            (
+                const List<scalar>& table,
+                const FGMStencil& st
+            ) const;
+
+            //- Direct table access for hoisting out of cell loops.
+            inline const List<scalar>& sourcePVTable() const
+            { return sourcePV_; }
+
+            inline const List<scalar>& Ttable() const
+            { return T_table_; }
+
+            inline const List<scalar>& Ytable(const word& sp) const
+            { return Y_tables_[sp]; }
+
+            inline label nRGcoeffs() const { return RGcoeff_.size(); }
+
+            inline const List<scalar>& RGtable(const label k) const
+            { return RGcoeff_[k]; }
+
+            inline const List<scalar>& LeTable(const word& var) const
+            { return Le_tables_[var]; }
+
+            //- The 4th-axis coordinate a legacy 3-D query collapses to.
+            inline scalar chi0() const { return chi_axis_[0]; }
 
             //- Opt-1 (base-blend node interpolation): return the 16 surrounding
             //  manifold node flat indices and their quadrilinear weights for
