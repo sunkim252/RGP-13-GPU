@@ -41,6 +41,7 @@ Description
 #include "List.H"
 #include "word.H"
 #include "scalarField.H"
+#include "labelList.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -133,6 +134,31 @@ public:
             const scalarField& chiField
         ) const
         {}
+
+        //- Tier-4: evaluate the differential-diffusion Lewis numbers of the
+        //  control variables from a mass-fraction composition Y at (p, T),
+        //  using the EXACT live mixture transport (Chung/Takahashi) so the
+        //  tabulated Le divides the SOLVER's own mu back into the solver's
+        //  own diffusivities (bit-consistent, unlike an external Cantera
+        //  evaluation whose dense-liquid Chung deviates):
+        //      LeZ = Pr = mu*Cp/kappa        (Z diffuses like heat: D_Z=alpha)
+        //      LeC = nu/D_C,  D_C = PV-mass-weighted mixture-avg Dimix
+        //  pvIds lists the progress-variable species (mixture order); if their
+        //  local mass sums to ~0, D_C falls back to alpha (LeC = LeZ).
+        //  Returns false when the backend does not implement the evaluation
+        //  (default), or when the state evaluation is degenerate.
+        virtual bool lewisNumbers
+        (
+            const List<scalar>& Y,
+            const scalar p,
+            const scalar T,
+            const labelList& pvIds,
+            scalar& LeZ,
+            scalar& LeC
+        ) const
+        {
+            return false;
+        }
 
         //- Disable the tabulated lookup (revert to live O(n^2) mixing).
         virtual void disableCoeffTabulation() const = 0;

@@ -931,4 +931,130 @@ void Foam::SRKchungTakaMixture<ThermoType>::disableCoeffTabulation() const
 }
 
 
+template<class ThermoType>
+bool Foam::SRKchungTakaMixture<ThermoType>::lewisNumbers
+(
+    const List<scalar>& Y,
+    const scalar p,
+    const scalar T,
+    const labelList& pvIds,
+    scalar& LeZ,
+    scalar& LeC
+) const
+{
+    const label nSpecies = Y.size();
+
+    // Base thermo blend (mass-fraction weighted), as in calcMixture -- the
+    // real Cp needs the blended janaf coefficients under the SRK departure.
+    mixture_ = Y[0]*this->specieThermos()[0];
+    for (label n = 1; n < nSpecies; n++)
+    {
+        mixture_ += Y[n]*this->specieThermos()[n];
+    }
+
+    // Identical X conversion and real-gas mixing to the live path.
+    List<scalar> X;
+    List<scalar> Yl;
+    compositionToX(Y, X, Yl);
+
+    scalar bM = 0, coef1 = 0, coef2 = 0, coef3 = 0, cM = 0;
+    scalar sigmaM = 0, epsilonkM = 0, VcM = 0, TcM = 0;
+    scalar omegaM = 0, MM = 0, miuiM = 0, kappaiM = 0;
+    calculateRealGas
+    (
+        X, bM, coef1, coef2, coef3, cM,
+        sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM
+    );
+    mixture_.updateEoS(bM, coef1, coef2, coef3, cM);
+
+    // X/Yl regularisation, identical to calcMixture.
+    scalar WmixCorrect = 0.0, sumXcorrected = 0.0;
+    forAll(X, i)
+    {
+        X[i] = X[i] + 1e-40;
+        sumXcorrected = sumXcorrected + X[i];
+    }
+    forAll(X, i)
+    {
+        X[i] = X[i]/sumXcorrected;
+        WmixCorrect = WmixCorrect + X[i]*ListW_[i];
+    }
+    forAll(Yl, i)
+    {
+        Yl[i] = X[i]*ListW_[i]/WmixCorrect;
+    }
+
+    // Full Takahashi matrices: Dimix is needed here, so build them
+    // regardless of the Tier-0 speciesDiffusion gate (offline utility path,
+    // not the per-cell hot loop).
+    List<List<scalar>> TCMD(nSpecies);
+    List<List<scalar>> PCMD(nSpecies);
+    forAll(TCMD, i)
+    {
+        TCMD[i].setSize(nSpecies);
+        PCMD[i].setSize(nSpecies);
+    }
+    for (label i = 0; i < nSpecies; i++)
+    {
+        TCMD[i][i] = (ListTc_[i] == 0) ? 1e-40 : ListTc_[i];
+        PCMD[i][i] = (ListPc_[i] == 0) ? 1e-40 : ListPc_[i];
+
+        for (label j = i + 1; j < nSpecies; j++)
+        {
+            const scalar XiPlusXj = X[i] + X[j];
+            const scalar invSum = (XiPlusXj == 0) ? 0.0 : 1.0/XiPlusXj;
+
+            scalar tcVal = (X[i]*ListTc_[i] + X[j]*ListTc_[j])*invSum;
+            if (tcVal == 0) { tcVal = 1e-40; }
+            scalar pcVal = (X[i]*ListPc_[i] + X[j]*ListPc_[j])*invSum;
+            if (pcVal == 0) { pcVal = 1e-40; }
+
+            TCMD[i][j] = tcVal;
+            TCMD[j][i] = tcVal;
+            PCMD[i][j] = pcVal;
+            PCMD[j][i] = pcVal;
+        }
+    }
+
+    mixture_.updateTRANS
+    (
+        sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM,
+        Yl, X, TCMD, PCMD, MMD_, SIGMD_
+    );
+
+    // Live-transport evaluation at (p, T): exactly what the solver would
+    // compute for this composition.
+    const scalar mu = mixture_.mu(p, T);
+    const scalar kappa = mixture_.kappa(p, T);
+    const scalar Cp = mixture_.Cp(p, T);
+    const scalar rho = mixture_.rho(p, T);
+
+    if (!(mu > 0) || !(kappa > 0) || !(Cp > 0) || !(rho > 0))
+    {
+        return false;
+    }
+
+    LeZ = mu*Cp/kappa;                       // Pr = nu/alpha
+    const scalar nu = mu/rho;
+    const scalar alpha = kappa/(rho*Cp);
+
+    // PV-mass-weighted mixture-averaged diffusivity for the progress variable.
+    scalar wsum = 0, DC = 0;
+    forAll(pvIds, k)
+    {
+        const label i = pvIds[k];
+        const scalar w = max(Yl[i], scalar(0));
+        if (w > 0)
+        {
+            wsum += w;
+            DC += w*mixture_.Dimix(i, p, T);
+        }
+    }
+    DC = (wsum > 1e-12) ? DC/wsum : alpha;
+    LeC = nu/max(DC, VSMALL);
+
+    return true;
+}
+
+
 // ************************************************************************* //

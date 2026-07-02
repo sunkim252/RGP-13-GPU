@@ -328,6 +328,21 @@ public:
             const scalarField& chiField
         ) const;
 
+        //- Tier-4: differential-diffusion Lewis numbers from a composition at
+        //  (p, T) with the exact live transport (Chung mu/kappa/Cp + Takahashi
+        //  Dimix). LeZ = Pr; LeC = nu/D_C (PV-mass-weighted Dimix). Builds the
+        //  full Takahashi matrices regardless of the speciesDiffusion switch
+        //  (utility-only path). Returns false on a degenerate state.
+        virtual bool lewisNumbers
+        (
+            const List<scalar>& Y,
+            const scalar p,
+            const scalar T,
+            const labelList& pvIds,
+            scalar& LeZ,
+            scalar& LeC
+        ) const;
+
         //- Disable the tabulated lookup (revert to live mixing).
         virtual void disableCoeffTabulation() const;
 };

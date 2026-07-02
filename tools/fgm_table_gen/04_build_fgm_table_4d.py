@@ -668,7 +668,8 @@ C
 
 
 def compute_lewis_tables(tables, species, P, srk_yaml,
-                         transport_model="high-pressure-Chung"):
+                         transport_model="high-pressure-Chung",
+                         Tmin_skip=200.0, Tmin_eval=250.0):
     """Tier-4: tabulate the differential-diffusion Lewis numbers Le_Z and Le_C
     over the manifold from the REAL-FLUID (SRK + high-pressure-Chung/Takahashi)
     transport evaluated at each node's tabulated (T, Y).
@@ -720,14 +721,18 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
     LeZ = np.full(nNode, np.nan)
     LeC = np.full(nNode, np.nan)
     nfail = 0
+    t0 = time.time()
     for n in range(nNode):
+        if n and n % 25000 == 0:
+            print(f"[lewis]   {n}/{nNode} nodes "
+                  f"({time.time()-t0:.0f}s, {nfail} fails)", flush=True)
         Tn = float(flatT[n])
         y = Ymat[n]
         ssum = y.sum()
-        if not np.isfinite(Tn) or Tn < 200.0 or ssum <= 1e-8:
+        if not np.isfinite(Tn) or Tn < Tmin_skip or ssum <= 1e-8:
             continue
         try:
-            gas.TPY = max(Tn, 250.0), P, y / ssum
+            gas.TPY = max(Tn, Tmin_eval), P, y / ssum
             mu = gas.viscosity
             lam = gas.thermal_conductivity
             cp = gas.cp_mass
