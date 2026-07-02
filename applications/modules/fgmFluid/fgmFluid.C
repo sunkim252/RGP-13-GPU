@@ -308,6 +308,21 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     thermo_.he() = thermo_.he(thermo_.p(), thermo_.T());
     thermo_.correct();
 
+    // CONSISTENT START (2026-07-02): the base solver constructed the
+    // transported density rho_ and the face flux phi_ from the ON-DISK thermo
+    // state (species reset to O2, file T), but updateManifold() + the he
+    // re-seed above have moved the thermo to the manifold-consistent state.
+    // Leaving rho_ at the disk state makes the first steps "rebind" mass:
+    // the conservative ddt(rho, X) transport rescales every transported
+    // scalar by the density-correction ratio (observed: a Z=1, h=-1.75e6
+    // cold kerosene core diluted to Z=0.123 within 25 steps -- Z and h both
+    // scaled by exactly the same factor -- while rho corrected itself).
+    // Align rho_ and phi_ with the seeded thermo so transport starts
+    // mass-consistent and initial scalar cores are preserved.
+    rho_ = thermo_.rho();
+    rho_.correctBoundaryConditions();
+    phi_ = linearInterpolate(rho_*U_) & mesh.Sf();
+
     // [DIAG] Audit the realFluid EOS consistency at the initial state. The
     // stock compressible pEqn assumes rho ~ psi*p (exact for ideal/PR gas);
     // a large rho/(psi*p) deviation flags an inconsistent SRK compressibility.
@@ -658,9 +673,6 @@ void Foam::solvers::fgmFluid::updateManifold()
             coord4 = (*hcl)[celli] - hAd;
         }
 
-        // PV source: tabulated mass-fraction rate [1/s] -> volumetric.
-        // The 4-D lookup is used when the table carries a chi OR enthalpy axis;
-        // otherwise we keep the legacy 3-D interpolation so existing cases run.
         if (use4D)
         {
             srcc[celli] =
@@ -683,23 +695,11 @@ void Foam::solvers::fgmFluid::updateManifold()
                     fgmTable_.interpolateY(Yname[k], Zcl, gz, Ccl);
             }
         }
-
-        // Tier-2: per-cell real-gas mixture coefficients. coord4 is the chi/dh
-        // coordinate (ignored for a 3-D table, where the chi axis collapses).
         if (fillRG)
         {
-            fgmTable_.interpolateRealGasCoeffs
-            (
-                Zcl, gz, Ccl, coord4, RGcoeffBuf_
-            );
-            forAll(RGref, k)
-            {
-                (*RGref[k])[celli] = RGcoeffBuf_[k];
-            }
+            fgmTable_.interpolateRealGasCoeffs(Zcl, gz, Ccl, coord4, RGcoeffBuf_);
+            forAll(RGref, k) { (*RGref[k])[celli] = RGcoeffBuf_[k]; }
         }
-
-        // Tier-4: per-cell differential-diffusion Lewis numbers. coord4 is the
-        // chi/dh coordinate (collapses for a 3-D table).
         if (fillLeZ)
         {
             (*LeZc)[celli] = fgmTable_.interpolateLe("Z", Zcl, gz, Ccl, coord4);
