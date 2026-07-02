@@ -27,6 +27,12 @@ License
 #include "IOstreams.H"
 #include "Switch.H"
 
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+template<class Specie>
+bool Foam::SRKGas<Specie>::stableRoot_ = false;
+
+
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
 template<class Specie>
@@ -96,6 +102,20 @@ Foam::SRKGas<Specie>::SRKGas
         }
         cq0_ = pc[0]; cq1_ = pc[1]; cq2_ = pc[2];
         cTlo_ = pc[3]; cThi_ = pc[4];
+    }
+
+    // Optional minimum-fugacity (thermodynamically stable) cubic-root
+    // selection. Global static: a single 'stableRoot on;' in any species'
+    // rfProperties switches the whole mixture (see SRKGas::Z).
+    if (rfDict.lookupOrDefault<Switch>("stableRoot", false))
+    {
+        if (!stableRoot_)
+        {
+            Info<< "SRKGas: stableRoot ON -- cubic root selected by minimum "
+                << "fugacity (stable phase); recovers compressed-liquid density "
+                << "in the subcritical 3-root regime." << endl;
+        }
+        stableRoot_ = true;
     }
 }
 

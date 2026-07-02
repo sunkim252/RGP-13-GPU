@@ -136,6 +136,19 @@ class SRKGas
         mutable scalar TZcache_ = -1;
         mutable scalar Zcache_ = 0;
 
+        //- Cubic root-selection policy (global EoS option). false (default):
+        //  always take the largest root (vapour branch) -- continuous in T,
+        //  keeps the h->T inversion robust, but overestimates compressed-liquid
+        //  specific volume in the 3-root (subcritical) regime. true: select the
+        //  thermodynamically stable phase by minimum fugacity (liquid root for
+        //  p > psat, vapour for p < psat), recovering the correct compressed-
+        //  liquid density at the cost of a Z (hence h) discontinuity across the
+        //  saturation line. Set by 'stableRoot on;' in any species' rfProperties
+        //  (static, so a single entry switches the whole mixture). Intended for
+        //  the fgmFluid path, where T is read from the manifold table so the
+        //  saturation-line h discontinuity does not feed an h->T Newton solve.
+        static bool stableRoot_;
+
 
     // Private Member Functions
 
