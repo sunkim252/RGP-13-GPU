@@ -27,6 +27,7 @@ License
 #include "fvmDiv.H"
 #include "fvmLaplacian.H"
 #include "fvcGrad.H"
+#include "fvcDiv.H"
 #include "zeroGradientFvPatchFields.H"
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
@@ -78,12 +79,51 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             << " kg/(m s)" << endl;
     }
 
+    // Artificial BULK viscosity (Cook-Cabot) -- damps the DILATATIONAL /
+    // compressive part directly, targeting the injector pressure oscillation
+    // (p +/- spike and |U| overshoot at the fine tangential-hole cells) that
+    // the shear muArt and the Rhie-Chow fixes do not reach. Dilatation-sensed
+    //   betaArt = LADbulkCoeff * rho * V^(2/3) * |div U|   [kg/(m s)]
+    // added as -grad(betaArt*div(U)) to the momentum. Cook & Cabot, J. Comput.
+    // Phys. 195 (2004) 594; Kawai, Terashima & Negishi, J. Comput. Phys. 300
+    // (2015) 116. Read each step (runTimeModifiable); default 0 = off.
+    const scalar LADbulkCoeff
+    (
+        pimple.dict().lookupOrDefault<scalar>("LADbulkCoeff", scalar(0))
+    );
+    const volScalarField divU(fvc::div(U));
+    volScalarField betaArt
+    (
+        IOobject
+        (
+            "betaArt",
+            mesh.time().name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        mesh,
+        dimensionedScalar(dimensionSet(1, -1, -1, 0, 0, 0, 0), 0),
+        zeroGradientFvPatchScalarField::typeName
+    );
+    if (LADbulkCoeff > 0)
+    {
+        const scalarField V23(pow(scalarField(mesh.V()), 2.0/3.0));
+        betaArt.primitiveFieldRef() =
+            LADbulkCoeff*rho.primitiveField()*V23
+           *mag(divU.primitiveField());
+        betaArt.correctBoundaryConditions();
+        Info<< "LAD-bulk: betaArt max = " << gMax(betaArt.primitiveField())
+            << " kg/(m s)" << endl;
+    }
+
     tUEqn =
     (
         fvm::ddt(rho, U) + fvm::div(phi, U)
       + MRF.DDt(rho, U)
       + momentumTransport->divDevTau(U)
       - fvm::laplacian(muArt, U)
+      - fvc::grad(betaArt*divU)
      ==
         fvModels().source(rho, U)
     );

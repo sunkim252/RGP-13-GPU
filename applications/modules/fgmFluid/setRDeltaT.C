@@ -44,9 +44,42 @@ void Foam::solvers::fgmFluid::setRDeltaT()
         // Maximum flow Courant number
         const scalar maxCo(pimpleDict.lookup<scalar>("maxCo"));
 
+        // Volumetric (face-density-consistent) Courant option. The stock
+        // mass-residence form sum|phi|/(V rho_cell) divides the MASS flux
+        // (carrying the face/upwind density) by the CELL density: at a hot
+        // flame cell (rho ~ 5) fed by dense-fluid faces (rho ~ 800-1100) this
+        // over-restricts the local time scale by rho_f/rho_c ~ O(100)
+        // (observed 280x at the recess-tip flame annulus: rDeltaT 4.7e9 vs
+        // velocity CFL 1.7e7). The volumetric form sum(|phi|/rho_f)/V is the
+        // actual face-transit CFL (|U_f| A / V) and removes the density-
+        // contrast amplification. Switch 'volumetricCourant' (default off =
+        // stock behaviour), read each step (runTimeModifiable).
+        const Switch volumetricCourant
+        (
+            pimpleDict.lookupOrDefault<Switch>("volumetricCourant", false)
+        );
+
         // Set the reciprocal time-step from the local Courant number
-        rDeltaT.internalFieldRef() =
-            fvc::surfaceSum(mag(phi))/((2*maxCo)*mesh.V()*rho());
+        if (volumetricCourant)
+        {
+            // Face density floored: a corrupted/near-zero rho would make
+            // the volumetric flux blow up (guard, not a physics clamp).
+            const surfaceScalarField rhof
+            (
+                max
+                (
+                    fvc::interpolate(rho_),
+                    dimensionedScalar(dimDensity, scalar(1e-2))
+                )
+            );
+            rDeltaT.internalFieldRef() =
+                fvc::surfaceSum(mag(phi)/rhof)/((2*maxCo)*mesh.V());
+        }
+        else
+        {
+            rDeltaT.internalFieldRef() =
+                fvc::surfaceSum(mag(phi))/((2*maxCo)*mesh.V()*rho());
+        }
 
         // Clip to user-defined maximum and minimum time-steps
         scalar minRDeltaT = gMin(rDeltaT.primitiveField());

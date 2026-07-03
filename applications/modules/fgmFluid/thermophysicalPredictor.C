@@ -25,6 +25,8 @@ License
 
 #include "fgmFluid.H"
 #include "fvcDdt.H"
+#include "fvcDiv.H"
+#include "fvmSup.H"
 #include "fvmLaplacian.H"
 #include "fvcGrad.H"
 #include "zeroGradientFvPatchFields.H"
@@ -95,6 +97,36 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             << " kg/(m s)" << endl;
     }
 
+    // Continuity-error compensation for the manifold scalars (Z, C, h).
+    // The conservative ddt(rho,phi)+div(phi,phi) pair rebinds any LOCAL
+    // continuity residual into the transported scalar: at a flame-zone
+    // pressure spike the step-to-step density churn drives h (and Z, C)
+    // out of physical bounds (observed: h to the manifold dh floor -> T
+    // pinned at the 80 K table edge -> rho ~1300 pockets beside the flame
+    // -> the density contrast re-excites the spike). Subtracting
+    // phi*(ddt(rho)+div(phi)) turns the equations into the bounded pure-
+    // advection form rho*Dphi/Dt (identical when continuity is satisfied,
+    // bounded when it is not) -- the standard bounded-transport correction.
+    // Switch 'contErrCompensation' (PIMPLE dict, default on; read each step).
+    // NOTE: a DISCONTINUOUS field seed (e.g. an igniter kernel written by
+    // setFields) creates a locally huge contErr for a few steps; the Sp term
+    // then dominates/flips the matrix diagonal and wipes the seeded scalar.
+    // Disable while seeding, or keep off if it proves harmful.
+    const Switch contErrComp
+    (
+        pimple.dict().lookupOrDefault<Switch>("contErrCompensation", true)
+    );
+    const volScalarField contErr
+    (
+        "contErr",
+        contErrComp
+      ? (fvc::ddt(rho) + fvc::div(phi))()
+      : volScalarField::New
+        (
+            "zeroContErr", mesh, dimensionedScalar(dimDensity/dimTime, 0)
+        )()
+    );
+
     // --- Mixture-fraction transport (conserved scalar, no source) ---
     {
         const volScalarField DZ("DZ", Deff("Z"));
@@ -102,6 +134,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         (
             fvm::ddt(rho, Z_)
           + mvConvection->fvmDiv(phi, Z_)
+          - fvm::Sp(contErr, Z_)
           - fvm::laplacian(DZ + Dart, Z_)
          ==
             fvModels().source(rho, Z_)
@@ -122,6 +155,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         (
             fvm::ddt(rho, C_)
           + mvConvection->fvmDiv(phi, C_)
+          - fvm::Sp(contErr, C_)
           - fvm::laplacian(DC + Dart, C_)
          ==
             sourcePV_
@@ -158,6 +192,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         (
             fvm::ddt(rho, h)
           + mvConvection->fvmDiv(phi, h)
+          - fvm::Sp(contErr, h)
           - fvm::laplacian(Dh + Dart, h)
          ==
             fvModels().source(rho, h)
@@ -167,6 +202,34 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         fvConstraints().constrain(hEqn);
         hEqn.solve("Yi");
         fvConstraints().constrain(h);
+
+        // Bound h to the manifold-representable enthalpy band
+        // [hAd(Z)+dh_min, hAd(Z)+dh_max] -- the same table-consistency
+        // bounding applied to C above. Outside the band T/composition already
+        // clamp at the table edge, but the TRANSPORTED h keeps drifting: at a
+        // flame-zone pressure spike the step-to-step density churn makes the
+        // conservative ddt(rho,h) rebind mass and corrupt h (observed 2026-07:
+        // h below the dh floor -> T pinned at the 80 K table edge -> EOS rho
+        // ~1300 pockets BESIDE ~100 kg/m3 flame gas at the faceplate wall ->
+        // the density contrast re-excites the pressure spike, closing a
+        // self-sustaining loop). Bounding h severs that feedback leg.
+        {
+            const List<scalar>& dhAxis = fgmTable_.chiAxis();
+            const scalar dhMin = min(dhAxis.first(), dhAxis.last());
+            const scalar dhMax = max(dhAxis.first(), dhAxis.last());
+            const scalar hOxb = fgmTable_.hOx();
+            const scalar hFuelb = fgmTable_.hFuel();
+
+            scalarField& hc = h.primitiveFieldRef();
+            const scalarField& Zbnd = Z_.primitiveField();
+            forAll(hc, celli)
+            {
+                const scalar Zi = max(min(Zbnd[celli], scalar(1)), scalar(0));
+                const scalar hAd = (scalar(1) - Zi)*hOxb + Zi*hFuelb;
+                hc[celli] = max(min(hc[celli], hAd + dhMax), hAd + dhMin);
+            }
+            h.correctBoundaryConditions();
+        }
     }
 
 

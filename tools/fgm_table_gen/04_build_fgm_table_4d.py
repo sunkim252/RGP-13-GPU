@@ -295,7 +295,17 @@ def _laminar_branch(Z, C, W, Zq, Cgrid):
                                  np.column_stack([ZZ[nan2], CC[nan2]]),
                                  method="nearest")
     out[np.isnan(out)] = 0.0
-    return np.maximum(out, 0.0)
+    # NEGATIVE source is kept (2026-07-03): near/above local equilibrium the
+    # net PV production is genuinely negative (recombination back toward
+    # equilibrium; with differential diffusion the cloud reaches c up to
+    # ~1.06). Clipping it to 0 punched exact-zero holes with sharp edges into
+    # the MA table wherever the envelope window held only near-equilibrium
+    # points (Z~0.3-0.5, c>0.9), stalling c progression there. A (small)
+    # negative source is the physically correct relaxation sink and is
+    # STABILISING in the CFD: it pulls c back toward equilibrium instead of
+    # letting it pile up at the c=1 clamp. omega(c=1)~0 still holds to within
+    # the recombination scale.
+    return out
 
 
 # --------------------------- beta-PDF ---------------------------

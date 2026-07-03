@@ -176,6 +176,15 @@ inline Foam::scalar Foam::SRKGas<Specie>::rho
     scalar T
 ) const
 {
+    // RE-DIAGNOSIS TEST (2026-07-02): EOS-internal pressure floor to guarantee
+    // POSITIVE density. rho = p/(Zv R T) ~ p, so a negative-pressure undershoot
+    // in the pEqn (swirl low-p core + stiff cold LOX) yields a NEGATIVE density
+    // (min rho = -1133 kg/m3 observed at the injector) -> garbage mass flux
+    // rho*U -> runaway growing spike -> dt collapse/crash. Flooring p only
+    // INSIDE the EOS keeps rho>0 and breaks the feedback WITHOUT changing the
+    // solved p field (unlike the ping-ponging limitPressure clamp). Floor 1e4
+    // Pa (0.1 bar); operating p = 5.25e6, so only near-/sub-zero cells are hit.
+    p = max(p, scalar(1e4));
     const scalar Zv = this->Z(p, T);
     const scalar rhoSRK = p/(Zv*this->R()*T);
 
@@ -409,6 +418,7 @@ inline Foam::scalar Foam::SRKGas<Specie>::psi
     // time scale 1.7e-14 vs 1.3e-10; the A1 compressibility floor was also
     // tested and reverted). That pEqn is now OVERRIDDEN by the PEP scheme, so
     // the real value is used here.
+    p = max(p, scalar(1e4));   // RE-DIAGNOSIS TEST: EOS-internal p-floor (see rho())
     const scalar dp = 1e-3*p;
     const scalar rho0 = this->rho(p, T);
     const scalar rho1 = this->rho(p + dp, T);

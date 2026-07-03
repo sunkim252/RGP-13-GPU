@@ -284,6 +284,11 @@ def _save_flamelet_realfluid(flame, srk_gas, out_dir, idx):
         "npts": np.asarray(int(n)),
         "Tmax": np.asarray(float(T.max())),
         "idx": np.asarray(int(idx)),
+        # provenance: which STRUCTURE transport produced this flamelet
+        # (unity-Lewis vs mixture-averaged families are physically different
+        # manifolds; earlier files lacked this and needed forensic T_max
+        # signatures to attribute).
+        "struct_transport": np.asarray(TRANSPORT_IDEAL),
     }
     for sp in srk_gas.species_names:
         arrs[f"Y_{sp}"] = Yall[fgas.species_index(sp)]
@@ -323,6 +328,15 @@ def run(log=0, mdot_factor=1.25, mdot_max=20.0, restart=False,
     # "dualgas" name for back-compat; any other pressure gets a P-tag.
     p_atm = P_OPER / 101325.0
     tag = "" if abs(P_OPER - 52.5e5) < 1e3 else f"_P{p_atm:g}atm"
+    # Non-default STRUCTURE transport gets its own family/checkpoint dirs --
+    # without this an MA regeneration at 52.5 bar would OVERWRITE the
+    # unity-Le production family in the untagged "flamelets_dualgas" dir and
+    # resume from its unity-Le checkpoints.
+    if TRANSPORT_IDEAL != "unity-Lewis-number":
+        tslug = {"mixture-averaged": "MA",
+                 "multicomponent": "MC"}.get(TRANSPORT_IDEAL,
+                                             TRANSPORT_IDEAL.replace("-", ""))
+        tag += f"_{tslug}"
     out_dir = DATA / f"flamelets_dualgas{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     CKPT = DATA / f"ckpt_dualgas{tag}"

@@ -26,7 +26,10 @@ def rd(fld):
 T = rd('T'); hrr = rd('hrr'); C = rd('C')
 if T is None:
     sys.exit(f"no reconstructed T at {case}/{t} (run reconstructPar first)")
-j = ny // 2
+# auto-pick the hottest y-row (robust to any y-localization; with the
+# symmetryPlane axis the flame is y-uniform so any row works, but the axis
+# row j=0 has zero radial strain = cleanest 1-D counterflow).
+j = int(np.argmax([T[jj*nx:(jj+1)*nx].max() for jj in range(ny)]))
 xc = (np.arange(nx) + 0.5) * (Lx / nx)
 Tline = T[j*nx:(j+1)*nx]
 Tmax = Tline.max(); Tinlet = Tline[[0, -1]].min()
