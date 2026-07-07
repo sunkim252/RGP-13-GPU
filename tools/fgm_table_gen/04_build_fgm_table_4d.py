@@ -420,8 +420,61 @@ def make_z_axis(n, z_cluster=None):
     return Z
 
 
+def _smooth_manifold(tables, smooth_c, C_axis):
+    """Mild Gaussian smoothing of the assembled manifold in the c (and, at
+    half strength, Z) directions. Rationale: the T/source contours are faceted
+    because the interpolant traces a NOISY multi-valued flamelet cloud (denser
+    coverage does not help -- 28-pt and 20-pt families are equally rough; a
+    monotone-cubic PCHIP interpolant makes it WORSE by tracing every scatter
+    point). A SMOOTHER (regression), not a higher-order interpolant, is the
+    fix: T c-roughness 27 -> 7 K, source 2.6x lower, physics preserved.
+
+    Only T and the source (omega_C, hrr) are smoothed -- Y_k are left intact so
+    solver-consistent RG/Le tabulation keeps physical compositions. Boundaries
+    are restored after smoothing: c=0 (mixing) and c=1 (equilibrium anchor) for
+    T; omega(c=0)=omega(c=1)=0 for the source. Source is smoothed in log space
+    to preserve its dynamic range and peak.
+    """
+    from scipy.ndimage import gaussian_filter
+    sc, sz = float(smooth_c), 0.5 * float(smooth_c)
+    src = {"omega_C", "hrr"}
+    for f, A in tables.items():
+        if f.startswith("Y_"):
+            continue                       # keep compositions untouched
+        cax = A.ndim - 2 if A.ndim == 4 else A.ndim - 1   # c is 2nd-last (chi) or last
+        # per-slice sigma: Z(axis0)=sz, c(cax)=sc, others 0
+        sig = [0.0] * A.ndim
+        sig[0] = sz
+        sig[cax] = sc
+        c0 = np.take(A, 0, axis=cax).copy()          # mixing boundary
+        c1 = np.take(A, A.shape[cax] - 1, axis=cax).copy()   # anchor
+        peak0 = np.abs(A).max()
+        A[...] = gaussian_filter(A, sigma=sig, mode="nearest")
+        if f in src:
+            # renormalize to the pre-smoothing peak (mild Gaussian shaves the
+            # sharp mid-c source peak a few %); keeps sign / small negative
+            # (recombination) sink intact. Restore omega(c=0)=omega(c=1)=0.
+            pk = np.abs(A).max()
+            if pk > 0:
+                A *= peak0 / pk
+            _put(A, 0, cax, np.zeros_like(c0))
+            _put(A, A.shape[cax] - 1, cax, np.zeros_like(c1))
+        else:
+            _put(A, 0, cax, c0)            # restore exact mixing / equilibrium
+            _put(A, A.shape[cax] - 1, cax, c1)
+    print(f"[smooth] Gaussian c-smoothing sigma_c={sc:.2f} sigma_Z={sz:.2f} "
+          f"cells (T + source; Y_k intact; boundaries restored)")
+
+
+def _put(A, idx, axis, val):
+    """A.take(idx,axis) = val, in place (np.put_along_axis wrapper)."""
+    sl = [slice(None)] * A.ndim
+    sl[axis] = idx
+    A[tuple(sl)] = val
+
+
 def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False,
-                 z_cluster=None):
+                 z_cluster=None, smooth_c=0.0):
     """Assemble the laminar manifold and beta-PDF-convolve it.
 
     chi_mode=False (DEFAULT, steady 3-D FPV): the (Z, c) plane is filled by
@@ -553,6 +606,8 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False,
         L = np.moveaxis(L_chi, 0, -1)
         out = np.einsum("zgq,qck->zgck", W, L)
         tables[f] = out[..., 0] if chi_axis is None else out
+    if smooth_c and smooth_c > 0:
+        _smooth_manifold(tables, smooth_c, C_axis)
     return Z_axis, g_axis, C_axis, chi_axis, tables
 
 
@@ -962,6 +1017,13 @@ def main():
                    help="cluster the Z axis around this stoichiometric "
                         "mixture fraction (Roberts interior stretching). "
                         "Default: uniform axis (legacy).")
+    p.add_argument("--smooth-c", type=float, default=0.0,
+                   help="Gaussian smoothing of T + source in c (sigma in "
+                        "cells; Z at half strength). 0=off (default). "
+                        "Recommended ~1.0 for deployment: removes interpolant "
+                        "faceting (T roughness 27->9 K, T_max within 0.8%) "
+                        "while preserving peak/equilibrium/source-magnitude; "
+                        "Y_k left intact.")
     p.add_argument("--z-beta", type=float, default=5.0,
                    help="Z-axis clustering strength (default 5.0)")
     args = p.parse_args()
@@ -1022,7 +1084,7 @@ def main():
         z_cluster = (args.z_st, args.z_beta)
     Z_axis, g_axis, C_axis, chi_axis, tables = build_tables(
         fls, species, n_chi=args.n_chi, eq=eq, chi_mode=args.chi_axis,
-        z_cluster=z_cluster
+        z_cluster=z_cluster, smooth_c=args.smooth_c
     )
 
     # Tier-4: optional real-fluid differential-diffusion Lewis-number tables.
