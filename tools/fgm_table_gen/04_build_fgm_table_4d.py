@@ -365,6 +365,15 @@ def _norm_envelope(fls, eq, Zq, species):
         T_f[i] = np.interp(Zq, Zs, fl["T"][o])
         for sp in species:
             Y_f[sp][i] = np.interp(Zq, Zs, fl["Y"][sp][o])
+        # a flamelet contributes to the envelope only within its own Z range
+        # (edge extrapolation is harmless for full-span counterflow families
+        # but corrupts C_norm for premixed flamelets, which live at a single
+        # Z: their stoichiometric C would otherwise be claimed at every Z)
+        span = (Zq >= Zs[0] - 1e-9) & (Zq <= Zs[-1] + 1e-9)
+        if not span.all():
+            pad = 0.5 * (Zq[1] - Zq[0])
+            span = (Zq >= Zs[0] - pad) & (Zq <= Zs[-1] + pad)
+            C_f[i][~span] = 0.0
     C_fam = C_f.max(axis=0)
     owner = C_f.argmax(axis=0)
     eq_owns = C_eq >= C_fam
@@ -391,7 +400,28 @@ def _norm_envelope(fls, eq, Zq, species):
     return C_norm, T1, Y1
 
 
-def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False):
+def make_z_axis(n, z_cluster=None):
+    """Z axis: uniform by default; with z_cluster=(Z_st, beta) an
+    Eriksson/Roberts interior-point clustering concentrates nodes around
+    Z_st (needed for H2/O2, Z_st~0.11, where a uniform 51-pt grid puts only
+    ~6 nodes across the whole flame). The solver's FGMTable::bracket() does
+    a general linear scan, so non-uniform axes are supported as-is."""
+    if not z_cluster:
+        return np.linspace(0.0, 1.0, n)
+    z_st, beta = z_cluster
+    eta = np.linspace(0.0, 1.0, n)
+    eta0 = (1.0 / (2.0 * beta)) * np.log(
+        (1.0 + (np.exp(beta) - 1.0) * z_st)
+        / (1.0 + (np.exp(-beta) - 1.0) * z_st))
+    Z = z_st * (1.0 + np.sinh(beta * (eta - eta0)) / np.sinh(beta * eta0))
+    Z[0], Z[-1] = 0.0, 1.0
+    print(f"[grid] Z axis clustered at Z_st={z_st} (beta={beta}): "
+          f"{int((Z <= 2.5 * z_st).sum())}/{n} nodes below 2.5*Z_st")
+    return Z
+
+
+def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False,
+                 z_cluster=None):
     """Assemble the laminar manifold and beta-PDF-convolve it.
 
     chi_mode=False (DEFAULT, steady 3-D FPV): the (Z, c) plane is filled by
@@ -407,7 +437,7 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False):
     the (c, chi) plane off the steady S-curve and the 4th axis becomes
     meaningful. The flamelet npz format (chi_st per file) already supports
     this."""
-    Z_axis = np.linspace(0.0, 1.0, N_Z)
+    Z_axis = make_z_axis(N_Z, z_cluster)
     g_axis = np.linspace(0.0, G_MAX, N_G)
     Zq = np.linspace(0.0, 1.0, N_ZQ)
 
@@ -419,6 +449,10 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False):
     # C axis = NORMALIZED progress variable c = C/C_norm(Z) in [0, 1].
     C_axis = np.linspace(0.0, 1.0, N_C)
     C_norm, T1, Y1 = _norm_envelope(fls, eq, Zq, species)
+    # expose the actual normalization to npz consumers (a-priori checks
+    # de-normalize with THIS, not C_eq -- they differ wherever the family
+    # envelope owns the bound, strongly so for H2/O2 differential diffusion)
+    eq["C_norm_Zq"] = C_norm.copy()
 
     # "hrr" (volumetric heat-release rate [W/m^3]) is tabulated when the
     # flamelets carry it (added by compute_hrr); it lets a consumer integrate
@@ -529,10 +563,11 @@ def _fmt(arr):
 
 
 def write_fgm_npz(path, Z_axis, g_axis, C_axis, chi_axis, tables,
-                  species, meta, eq=None):
+                  species, meta, eq=None, fourth_kind=None):
     """Companion of write_fgm_dict: same data in a single .npz so Python
     consumers (e.g. apriori_check_4d.py) can reload the 4-D arrays without
-    re-parsing the OpenFOAM dictionary."""
+    re-parsing the OpenFOAM dictionary. fourth_kind='dilution' also stores
+    the 4th axis under 'W_axis' (its physical name) for analysis clarity."""
     arrs = {
         "Z_axis":   np.asarray(Z_axis),
         "gZ_axis":  np.asarray(g_axis),
@@ -543,12 +578,17 @@ def write_fgm_npz(path, Z_axis, g_axis, C_axis, chi_axis, tables,
         "P":        np.asarray(meta.get("P", float("nan"))),
         "src":      np.array(meta.get("src", "?"), dtype=object),
         "closure":  np.array(meta.get("closure", "raw-C"), dtype=object),
+        "fourth_kind": np.array(fourth_kind or "chi", dtype=object),
     }
+    if fourth_kind == "dilution" and chi_axis is not None:
+        arrs["W_axis"] = np.asarray(chi_axis)
     if eq is not None:
         # Diagnostics for a-priori checks: C is normalized in the table, so
         # consumers need Yc_eq(Z) (and the boundary states) to de-normalize.
         arrs["Zq_eq"] = np.linspace(0.0, 1.0, len(eq["C_eq"]))
         arrs["C_eq"] = np.asarray(eq["C_eq"])
+        if "C_norm_Zq" in eq:
+            arrs["C_norm"] = np.asarray(eq["C_norm_Zq"])
         arrs["T_eq"] = np.asarray(eq["T_eq"])
         arrs["T_u"] = np.asarray(eq["T_u"])
     for name, T in tables.items():
@@ -561,10 +601,17 @@ def write_fgm_npz(path, Z_axis, g_axis, C_axis, chi_axis, tables,
 
 
 def write_fgm_dict(path, Z_axis, g_axis, C_axis, chi_axis, tables,
-                   species, meta):
+                   species, meta, fourth_kind=None):
     """chi_axis=None writes a 3-D (Z, gZ, c) table -- no nChi/chi entries,
     so the solver's FGMTable takes its 3-D legacy path automatically. A
-    chi_axis writes the 4-D layout (kept for the future UFPV manifold)."""
+    chi_axis writes the 4-D layout.
+
+    fourth_kind selects what the 4th axis MEANS (the array/flat-order code is
+    identical -- 4th axis innermost -- only the emitted keywords + header text
+    change so the solver's generic 4th-axis machinery reads the right one):
+      None       -> chi_st (UFPV)         : nChi + chi(...)
+      'dilution' -> steam-in-oxidiser W   : fourthAxis dilution; nW + W(...)
+    """
     nZ, nGz, nC = len(Z_axis), len(g_axis), len(C_axis)
     nChi = 1 if chi_axis is None else len(chi_axis)
 
@@ -592,6 +639,16 @@ def write_fgm_dict(path, Z_axis, g_axis, C_axis, chi_axis, tables,
         kind = "3-D (steady FPV: Z~, gZ, c)"
         idx = "idx = (iZ*nGz + iGz)*nC + iC"
         axes_blk = ""
+        nchi_blk = ""
+    elif fourth_kind == "dilution":
+        # 4th axis = steam-in-oxidiser mole fraction W. Reuses the generic
+        # 4th-axis slot (nChi/chi machinery) but tags it 'dilution' so the
+        # solver forms the local W from a transported steam-dilution scalar
+        # (analogous to the 'enthalpy' 4th-axis defect path). Innermost axis.
+        kind = "4-D (steam-diluted FPV: Z~, gZ, c, W)"
+        idx = "idx = ((iZ*nGz + iGz)*nC + iC)*nW + iW"
+        axes_blk = (f"\nfourthAxis  dilution;\nnW      {nChi};\n"
+                    f"W\n(\n{_fmt(chi_axis)}\n);\n")
         nchi_blk = ""
     else:
         kind = "4-D (UFPV: Z~, gZ, c, chi_st)"
@@ -679,7 +736,9 @@ C
 
 def compute_lewis_tables(tables, species, P, srk_yaml,
                          transport_model="high-pressure-Chung",
-                         Tmin_skip=200.0, Tmin_eval=250.0):
+                         Tmin_skip=200.0, Tmin_eval=250.0,
+                         soret=False, Z_axis=None, C_axis=None,
+                         C_norm=None, x_fuel=None, x_ox=None):
     """Tier-4: tabulate the differential-diffusion Lewis numbers Le_Z and Le_C
     over the manifold from the REAL-FLUID (SRK + high-pressure-Chung/Takahashi)
     transport evaluated at each node's tabulated (T, Y).
@@ -697,6 +756,19 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
             D_C = sum_{k in PV} Y_k D_k,mix / sum_{k in PV} Y_k
             Progress variable diffuses with the PV-mass-weighted mixture-
             averaged species diffusivity (Takahashi-corrected at high p).
+
+    soret=True folds the thermal-diffusion (Soret) flux of each control
+    variable into an EFFECTIVE Lewis number, so the solver captures Soret with
+    NO extra transport term (the Le fields already feed D=nu/Le). On the
+    manifold T=T(Z,gZ,c[,W]) so grad(T)=(dT/dZ)grad Z+(dT/dc)grad c: the Soret
+    mass flux j^S = -(D^T/T)grad T projects onto each variable's own gradient
+    (diagonal approximation; the Z<->c cross term is level-3 future work):
+        D_C,eff = D_C   + (D^T_C /(rho T C_norm)) (dT/dc)
+        D_Z,eff = alpha + (D^T_Z /(rho T))        (dT/dZ)
+    D^T_C = sum_{PV} D^T_k ; D^T_Z = (sum_k b_k D^T_k)/dbeta, b_k the Bilger
+    coefficient (2 nH_k - nO_k)/M_k, dbeta = beta_fuel - beta_ox. Requires the
+    grid axes + C_norm(Z) + stream compositions. Falls back to the diagonal
+    (Soret-off) Le wherever the correction is unavailable/unphysical.
 
     Returns (Le_Z, Le_C) arrays shaped like tables['T'], plus (medZ, medC) the
     manifold-median values used as the constant-Le fallback / degenerate fill.
@@ -728,6 +800,34 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
     for s in sp_in_mech:
         Ymat[:, idx[s]] = np.asarray(tables[f"Y_{s}"]).reshape(-1)
 
+    # ---- Soret setup: manifold gradients + Bilger coefficients ----
+    do_soret = bool(soret) and Z_axis is not None and C_axis is not None
+    if do_soret:
+        # dT/dc (axis 2 = C) and dT/dZ (axis 0 = Z), flattened to node order
+        dTdc_f = np.gradient(T, np.asarray(C_axis), axis=2).reshape(-1)
+        dTdZ_f = np.gradient(T, np.asarray(Z_axis), axis=0).reshape(-1)
+        # C_norm(Z) broadcast to the table shape (default 1 -> no rescale)
+        if C_norm is not None:
+            cn = np.asarray(C_norm)
+            bshape = [1] * T.ndim; bshape[0] = shape[0]
+            Cn_f = np.broadcast_to(cn.reshape(bshape), shape).reshape(-1)
+        else:
+            Cn_f = np.ones(nNode)
+        Mk = gas.molecular_weights
+        nH = np.array([gas.n_atoms(k, "H") for k in range(gas.n_species)])
+        nO = np.array([gas.n_atoms(k, "O") for k in range(gas.n_species)])
+        b_k = (2.0 * nH - nO) / Mk                         # Bilger coeff
+        def _beta(xstr):
+            gas.TPX = 300.0, P, xstr
+            return float(np.dot(b_k, gas.Y))
+        try:
+            dbeta = _beta(x_fuel) - _beta(x_ox)
+        except Exception:
+            dbeta = None
+        if not dbeta or abs(dbeta) < 1e-9:
+            do_soret = "C-only"           # Z-Soret needs a valid dbeta
+        soret_dc = np.zeros(nNode); soret_dz = np.zeros(nNode)
+
     LeZ = np.full(nNode, np.nan)
     LeC = np.full(nNode, np.nan)
     nfail = 0
@@ -749,12 +849,32 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
             rho = gas.density
             nu = mu / max(rho, 1e-30)
             alpha = lam / max(rho * cp, 1e-30)
-            LeZ[n] = nu / max(alpha, 1e-30)                 # = Pr
             Dk = np.clip(gas.mix_diff_coeffs, 1e-12, None)
             ypv = y[pv_cols]
             wsum = float(ypv.sum())
             DC = (float((ypv * Dk[pv_cols]).sum() / wsum)
                   if wsum > 1e-12 else float(alpha))
+            DZ = alpha                                      # D_Z = alpha (Pr)
+            if do_soret:
+                DT = gas.thermal_diff_coeffs               # [kg/m/s]
+                # Diagonal projection of the Soret flux onto each variable's own
+                # gradient. LIMITED to [-50%, +100%] of the base diffusivity:
+                # the projection is a leading-order correction, and the large H2
+                # Soret can otherwise drive the effective D singular (D<=0) where
+                # dT/dZ opposes -- that pathology belongs to the explicit
+                # cross-term (level 3), not to an effective-Le fold.
+                def _lim(dD, base):
+                    return base * (1.0 + min(1.0, max(-0.5, dD / max(base, 1e-30))))
+                DTc = float(DT[pv_cols].sum())
+                dDC = DTc * dTdc_f[n] / (max(rho, 1e-30) * max(Tn, 1e-30)
+                                         * max(Cn_f[n], 1e-6))
+                DC = _lim(dDC, DC)
+                if do_soret is True:       # Z-Soret only with a valid dbeta
+                    DTz = float(np.dot(b_k, DT)) / dbeta
+                    dDZ = DTz * dTdZ_f[n] / (max(rho, 1e-30) * max(Tn, 1e-30))
+                    DZ = _lim(dDZ, DZ)
+                DC = max(DC, 1e-30); DZ = max(DZ, 1e-30)
+            LeZ[n] = nu / max(DZ, 1e-30)
             LeC[n] = nu / max(DC, 1e-30)
         except Exception:
             nfail += 1
@@ -771,7 +891,10 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
 
     LeZ, medZ, nbadZ = _fill(LeZ, 0.1, 10.0, 0.63)
     LeC, medC, nbadC = _fill(LeC, 0.1, 10.0, 0.60)
-    print(f"[lewis] real-fluid differential diffusion ({transport_model}) on "
+    stag = ("OFF" if not do_soret else
+            ("PV-only (no dbeta)" if do_soret == "C-only" else "Z+C"))
+    print(f"[lewis] real-fluid differential diffusion ({transport_model}, "
+          f"Soret={stag}) on "
           f"{nNode} nodes: Le_Z med={medZ:.3f} [{LeZ.min():.2f},{LeZ.max():.2f}] "
           f"Le_C med={medC:.3f} [{LeC.min():.2f},{LeC.max():.2f}]")
     print(f"[lewis]   filled {nbadZ} degenerate Le_Z / {nbadC} Le_C nodes with "
@@ -817,7 +940,44 @@ def main():
     p.add_argument("--diff-diff-transport", default="high-pressure-Chung",
                    help="Cantera transport model for the Tier-4 Le tabulation "
                         "(default: high-pressure-Chung, matching the solver).")
+    p.add_argument("--soret-le", action="store_true",
+                   help="fold the thermal-diffusion (Soret) flux of Z and c "
+                        "into the tabulated effective Le_Z/Le_C (manifold-"
+                        "projected). Captures Soret with NO extra solver term. "
+                        "Default OFF (diagonal mixture-averaged Le only).")
+    p.add_argument("--x-fuel", default=None,
+                   help="fuel-stream mole-fraction string for the equilibrium "
+                        "closure (default: kerosene surrogate). E.g. 'H2:1.0' "
+                        "for the H2/O2 campaign.")
+    p.add_argument("--x-ox", default=None,
+                   help="oxidizer-stream mole-fraction string (default "
+                        "'O2:1.0'). E.g. 'O2:0.7, H2O:0.3' for steam-diluted "
+                        "oxy-hydrogen tables.")
+    p.add_argument("--pv-species", default=None,
+                   help="space/comma-separated progress-variable species, "
+                        "overriding the kerosene default CO2 CO H2O H2. Must "
+                        "match the C saved by the flamelet sweep (e.g. 'H2O' "
+                        "for H2/O2).")
+    p.add_argument("--z-st", type=float, default=None,
+                   help="cluster the Z axis around this stoichiometric "
+                        "mixture fraction (Roberts interior stretching). "
+                        "Default: uniform axis (legacy).")
+    p.add_argument("--z-beta", type=float, default=5.0,
+                   help="Z-axis clustering strength (default 5.0)")
     args = p.parse_args()
+
+    # stream/PV overrides (H2/O2 campaign etc.) -- module globals feed
+    # equilibrium_closure() and the Tier-4 lewis block.
+    global X_FUEL_SURROGATE, X_OX, PV_SPECIES
+    if args.x_fuel:
+        X_FUEL_SURROGATE = args.x_fuel
+    if args.x_ox:
+        X_OX = args.x_ox
+    if args.pv_species:
+        PV_SPECIES = tuple(args.pv_species.replace(",", " ").split())
+    if args.x_fuel or args.x_ox or args.pv_species:
+        print(f"[cfg] streams override: fuel=[{X_FUEL_SURROGATE}] "
+              f"ox=[{X_OX}] PV={PV_SPECIES}")
 
     fl_dir = Path(args.flamelet_dir)
     if not fl_dir.is_dir():
@@ -857,17 +1017,27 @@ def main():
     Zq = np.linspace(0.0, 1.0, N_ZQ)
     eq = equilibrium_closure(args.yaml_file, Zq, P_ref, T_fuel, T_ox, species)
 
+    z_cluster = None
+    if args.z_st is not None:
+        z_cluster = (args.z_st, args.z_beta)
     Z_axis, g_axis, C_axis, chi_axis, tables = build_tables(
-        fls, species, n_chi=args.n_chi, eq=eq, chi_mode=args.chi_axis
+        fls, species, n_chi=args.n_chi, eq=eq, chi_mode=args.chi_axis,
+        z_cluster=z_cluster
     )
 
     # Tier-4: optional real-fluid differential-diffusion Lewis-number tables.
     if args.diff_diff_yaml:
         if "T" not in tables:
             raise SystemExit("[lewis] differential diffusion needs the T table")
+        C_norm_onZ = None
+        if args.soret_le and "C_norm_Zq" in eq:
+            C_norm_onZ = np.interp(Z_axis, np.linspace(0.0, 1.0, N_ZQ),
+                                   eq["C_norm_Zq"])
         LeZ, LeC, medZ, medC = compute_lewis_tables(
             tables, species, P_ref, args.diff_diff_yaml,
             transport_model=args.diff_diff_transport,
+            soret=args.soret_le, Z_axis=Z_axis, C_axis=C_axis,
+            C_norm=C_norm_onZ, x_fuel=X_FUEL_SURROGATE, x_ox=X_OX,
         )
         tables["Le_Z"] = LeZ
         tables["Le_C"] = LeC
