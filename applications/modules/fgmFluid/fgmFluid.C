@@ -777,6 +777,18 @@ void Foam::solvers::fgmFluid::updateManifold()
     scalarField* LeZc = fillLeZ ? &LeZField_->primitiveFieldRef() : nullptr;
     scalarField* LeCc = fillLeC ? &LeCField_->primitiveFieldRef() : nullptr;
 
+    // Hoist the flat tables for RG_* and Le out of the per-cell loop. RGtable(k)
+    // is an array access but was called per-cell-per-k; LeTable("Z")/("C") did a
+    // WORD-keyed HashTable lookup PER CELL (word construction + hash) -- lifting
+    // both to raw pointers removes that from the millions-of-cells hot loop.
+    List<const List<scalar>*> RGtbl(RGref.size());
+    forAll(RGtbl, k)
+    {
+        RGtbl[k] = &fgmTable_.RGtable(k);
+    }
+    const List<scalar>* LeZtbl = fillLeZ ? &fgmTable_.LeTable("Z") : nullptr;
+    const List<scalar>* LeCtbl = fillLeC ? &fgmTable_.LeTable("C") : nullptr;
+
     // Tabulated temperature: the FPV/FGM thermochemical state (T and the
     // composition) is a FUNCTION of the manifold coordinates (Z, gZ, c, chi)
     // -- it is LOOKED UP here, not advanced by a transported energy equation.
@@ -857,18 +869,18 @@ void Foam::solvers::fgmFluid::updateManifold()
             forAll(RGref, k)
             {
                 (*RGref[k])[celli] =
-                    fgmTable_.interpolate(fgmTable_.RGtable(k), st);
+                    fgmTable_.interpolate(*RGtbl[k], st);
             }
         }
 
         // Tier-4: per-cell differential-diffusion Lewis numbers.
         if (fillLeZ)
         {
-            (*LeZc)[celli] = fgmTable_.interpolate(fgmTable_.LeTable("Z"), st);
+            (*LeZc)[celli] = fgmTable_.interpolate(*LeZtbl, st);
         }
         if (fillLeC)
         {
-            (*LeCc)[celli] = fgmTable_.interpolate(fgmTable_.LeTable("C"), st);
+            (*LeCc)[celli] = fgmTable_.interpolate(*LeCtbl, st);
         }
     }
 
