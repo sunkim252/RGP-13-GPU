@@ -64,7 +64,7 @@ inline Foam::chungTransport<Thermo>::chungTransport
     Mmd_(Mmd),
     sigmd_(sigmd),
     cacheP_(0), cacheT_(-1), cacheTstar_(0), cacheMur_(0),
-    cacheEta0_(0), cacheY_(0), cacheG1_(0)
+    cacheEta0_(0), cacheY_(0), cacheG1_(0), sumXmd_(0)
 {}
 
 
@@ -91,7 +91,7 @@ inline Foam::chungTransport<Thermo>::chungTransport
     Mmd_(ch.Mmd_),
     sigmd_(ch.sigmd_),
     cacheP_(0), cacheT_(-1), cacheTstar_(0), cacheMur_(0),
-    cacheEta0_(0), cacheY_(0), cacheG1_(0)
+    cacheEta0_(0), cacheY_(0), cacheG1_(0), sumXmd_(0)
 {}
 
 
@@ -178,11 +178,8 @@ inline Foam::scalar Foam::chungTransport<Thermo>::mu
     const scalar T
 ) const
 {
-    scalar sumX  = 0, finalMu = 0;
-    forAll(Xmd_, i)
-    {
-         sumX = sumX + Xmd_[i];
-    }
+    const scalar sumX = sumXmd_;
+    scalar finalMu = 0;
 
     if (sumX <= 1e-16)
     {
@@ -242,11 +239,8 @@ inline Foam::scalar Foam::chungTransport<Thermo>::kappa
     const scalar p, const scalar T
 ) const
 {
-    scalar sumX  = 0, kappa = 0;
-    forAll(Xmd_, i)
-    {
-        sumX = sumX + Xmd_[i];
-    }
+    const scalar sumX = sumXmd_;
+    scalar kappa = 0;
 
     if (sumX <= 0.001)
     {
@@ -561,6 +555,7 @@ inline void Foam::chungTransport<Thermo>::updateTRANS
     kappaiM_   = kappaiM;
     Ymd_       = Ymd;
     Xmd_       = Xmd;
+    sumXmd_ = 0; forAll(Xmd_, _i) { sumXmd_ += Xmd_[_i]; }
     Tcmd_      = Tcmd;
     Pcmd_      = Pcmd;
     Mmd_       = Mmd;
@@ -595,6 +590,7 @@ inline void Foam::chungTransport<Thermo>::updateTRANS_noDiffusion
     kappaiM_   = kappaiM;
     Ymd_       = Ymd;
     Xmd_       = Xmd;
+    sumXmd_ = 0; forAll(Xmd_, _i) { sumXmd_ += Xmd_[_i]; }
     // Tcmd_/Pcmd_/Mmd_/sigmd_ deliberately NOT updated -- only Dimix reads
     // them and the no-diffusion path never calls Dimix. Skips the O(n^2)
     // matrix copies; mu/kappa use only the scalars above + Xmd_.

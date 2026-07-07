@@ -1,0 +1,24 @@
+// Tuned GAMG pressure solver for large 3D FPV meshes (rd0110 2.63M+).
+// Profiling (3D 2.63M): pressure solve = 52% of wall-time (GAMG ~13 iter,
+// 4 solves/step). Drop-in replacement for the p/pFinal blocks in fvSolution.
+// Validate on rd0110: compare p-iteration count and wall/step + mass
+// conservation (continuity error) and flame position vs the baseline.
+p
+{
+    solver           GAMG;
+    smoother         DICGaussSeidel;   // stronger than GaussSeidel for elliptic
+    tolerance        1e-8;
+    relTol           0.01;             // MATCH baseline (pure GAMG speed; loosen separately as Tier 1c accuracy knob)
+    cacheAgglomeration true;           // reuse hierarchy across steps (re-agglomerates only on AMR mesh change)
+    nCellsInCoarsestLevel 200;         // larger -> fewer coarse levels; tune 50-500 for the mesh
+    agglomerator     faceAreaPair;
+    mergeLevels      1;
+    nPreSweeps       0;
+    nPostSweeps      2;
+    nFinestSweeps    2;
+}
+pFinal
+{
+    $p;
+    relTol           0;                // tight only on the final corrector
+}

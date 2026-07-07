@@ -151,6 +151,11 @@ protected:
             mutable scalar cacheY_;
             mutable scalar cacheG1_;
 
+            //- Sum of mole fractions Sum(Xmd_), computed once in updateTRANS
+            //  and reused by mu()/kappa() instead of each re-looping O(nSpecie).
+            //  Bit-identical: same summation, evaluated once per composition.
+            mutable scalar sumXmd_;
+
 
     // Protected Member Functions
 
