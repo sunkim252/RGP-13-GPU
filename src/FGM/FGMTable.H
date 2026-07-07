@@ -97,6 +97,13 @@ class FGMTable
         //  machinery is reused (chi_axis_ then holds the dh axis [J/kg]).
         bool useEnthalpy_;
 
+        //- True if the 4th axis is a steam-dilution axis W = steam mole
+        //  fraction in the oxidiser stream (power-generation H2/O2/H2O line).
+        //  When set, the 4th coordinate passed to interpolate() is a
+        //  transported conserved dilution scalar W (not a defect): the same
+        //  quadrilinear machinery is reused (chi_axis_ then holds the W axis).
+        bool useDilution_;
+
         //- Pure-stream total enthalpies at the flamelet boundary T [J/kg],
         //  used to form the adiabatic reference mixing line h_ad(Z).
         scalar hOx_;
@@ -346,12 +353,18 @@ public:
             { return Le_tables_.found(var); }
 
             //- True if the table carries a chi_st axis (nChi > 1).
-            inline bool hasChi() const { return hasChi_ && !useEnthalpy_; }
+            inline bool hasChi() const
+            { return hasChi_ && !useEnthalpy_ && !useDilution_; }
 
             //- True if the 4th axis is an enthalpy-defect axis (non-adiabatic
             //  FPV). The solver then transports total enthalpy and forms the
             //  defect coordinate; the table interpolation is unchanged.
             inline bool useEnthalpy() const { return useEnthalpy_; }
+
+            //- True if the 4th axis is a steam-dilution axis W. The solver
+            //  then transports a conserved dilution scalar W and passes it
+            //  directly as the 4th coordinate; interpolation is unchanged.
+            inline bool useDilution() const { return useDilution_; }
 
             //- Oxidizer-stream total enthalpy at the flamelet boundary [J/kg].
             inline scalar hOx() const { return hOx_; }

@@ -328,6 +328,35 @@ public:
             const scalarField& chiField
         ) const;
 
+        //- Silent re-arm of the internal-cell coefficient pointers after a mesh
+        //  change (redistribution / refinement). Rebinds refInternalField_ and
+        //  coeffFields_ without the diagnostic reset or Info print.
+        virtual void refreshCoeffFields
+        (
+            const scalarField& refInternal,
+            const List<const scalarField*>& coeffFields
+        ) const;
+
+        //- Silent re-arm of the Opt-1 base-blend stencil field pointers after a
+        //  mesh change. Re-binds fgmTablePtr_/ZfieldPtr_/gZfieldPtr_/CfieldPtr_/
+        //  chiFieldPtr_ only; the mesh-independent node mixtures are NOT rebuilt.
+        virtual void refreshBaseBlendFields
+        (
+            const FGMTable& table,
+            const scalarField& Zfield,
+            const scalarField& gZfield,
+            const scalarField& Cfield,
+            const scalarField& chiField
+        ) const;
+
+        //- Silent re-arm of the Opt-2 patch-face coefficient pointers after a
+        //  mesh change. Rebinds patchRefFields_/patchCoeffFields_ without print.
+        virtual void refreshPatchCoeffFields
+        (
+            const List<const scalarField*>& patchRefs,
+            const List<List<const scalarField*>>& patchCoeffFields
+        ) const;
+
         //- Tier-4: differential-diffusion Lewis numbers from a composition at
         //  (p, T) with the exact live transport (Chung mu/kappa/Cp + Takahashi
         //  Dimix). LeZ = Pr; LeC = nu/D_C (PV-mass-weighted Dimix). Builds the

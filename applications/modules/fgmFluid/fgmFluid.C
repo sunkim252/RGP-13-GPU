@@ -112,6 +112,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     tabRealGasCoeffs_(false),
 
+    armedNCells_(-1),
+
     tabLewis_(false),
 
     thermophysicalTransport
@@ -224,7 +226,30 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
             << " (conserved scalar; T read from 4-D table at dh)" << nl << endl;
     }
 
-    // Multivariate convection over the transported scalars (he, Z, C [, h]).
+    // Steam-diluted FPV: allocate and read the transported dilution scalar W.
+    // Must exist before the first updateManifold() so the 4th coordinate
+    // W = local steam-in-oxidiser fraction is available. chi/enthalpy/3-D
+    // tables skip this and leave WPtr_ null.
+    if (fgmTable_.useDilution())
+    {
+        WPtr_.reset
+        (
+            new volScalarField
+            (
+                IOobject
+                (
+                    "W", runTime.name(), mesh,
+                    IOobject::MUST_READ, IOobject::AUTO_WRITE
+                ),
+                mesh
+            )
+        );
+        Info<< "fgmFluid: STEAM-DILUTED FPV -- transporting dilution scalar W"
+            << " (conserved; 4th manifold axis queried at local W)"
+            << nl << endl;
+    }
+
+    // Multivariate convection over the transported scalars (he, Z, C [, h/W]).
     fields.add(thermo.he());
     fields.add(Z_);
     fields.add(C_);
@@ -234,6 +259,11 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     if (fgmTable_.useEnthalpy())
     {
         fields.add(hPtr_());
+    }
+    // Likewise register the dilution scalar for its shared-scheme convection.
+    if (fgmTable_.useDilution())
+    {
+        fields.add(WPtr_());
     }
 
     // Tier-4: allocate the per-cell differential-diffusion Lewis-number fields
@@ -497,7 +527,98 @@ void Foam::solvers::fgmFluid::setupRealGasCoeffTabulation()
         << nCoeff << " manifold coefficients (RG_*) looked up per cell; "
         << "the O(n^2) calculateRealGas pair sum is skipped on internal cells"
         << nl << endl;
+
+    // Record the cell count the lookup was armed for. updateManifold() re-arms
+    // the cached mixture field pointers whenever mesh.nCells() later differs
+    // from this (a runtime redistribution / AMR refinement reallocates the
+    // fields, invalidating the address-range cell recovery in calcMixture).
+    armedNCells_ = mesh.nCells();
 }
+
+
+void Foam::solvers::fgmFluid::rearmRealGasCoeffTabulation()
+{
+    // Re-arm the tabulated real-gas coefficient lookup after a mesh-cell-count
+    // change (runtime redistribution or AMR refinement). The mixture recovers a
+    // cell/face index from the ADDRESS RANGE of the cached field pointers and
+    // then reads the per-cell coefficients from them; a redistribution
+    // reallocates those fields, so the stale pointers must be refreshed or the
+    // recovery yields a wrong in-range index (out-of-bounds read -> SIGSEGV).
+    // The manifold node mixtures (nodeMixtures_) are mesh-INDEPENDENT and are
+    // deliberately NOT rebuilt here -- only the field pointers are re-bound.
+    if (!tabRealGasCoeffs_)
+    {
+        return;
+    }
+
+    const tabulatedRealGasMixture* hook =
+        dynamic_cast<const tabulatedRealGasMixture*>(&thermo_);
+    if (!hook)
+    {
+        return;
+    }
+
+    const label nCoeff = tabulatedRealGasMixture::nCoeffs_;
+
+    // (a) Ensure the per-cell coefficient fields address the current cell count.
+    //     Registered volScalarFields auto-map on a mesh change, so this is
+    //     defensive and normally a no-op (values are refilled in updateManifold
+    //     immediately after this call).
+    forAll(RGcoeffFields_, k)
+    {
+        if (RGcoeffFields_[k].primitiveField().size() != mesh.nCells())
+        {
+            RGcoeffFields_[k].primitiveFieldRef().setSize(mesh.nCells());
+        }
+    }
+
+    // (b) Re-collect the internal coefficient-field pointers and silently refresh
+    //     the mixture's internal-cell lookup (refInternalField_ + coeffFields_).
+    {
+        List<const scalarField*> ptrs(nCoeff);
+        forAll(RGcoeffFields_, k)
+        {
+            ptrs[k] = &RGcoeffFields_[k].primitiveField();
+        }
+        hook->refreshCoeffFields(Y_[0].primitiveField(), ptrs);
+    }
+
+    // (c) Refresh the Opt-1 base-blend stencil field pointers WITHOUT rebuilding
+    //     the (mesh-independent) node mixtures.
+    hook->refreshBaseBlendFields
+    (
+        fgmTable_,
+        Z_.primitiveField(), gZ_.primitiveField(),
+        C_.primitiveField(), chi_st_.primitiveField()
+    );
+
+    // (d) Refresh the Opt-2 patch-face pointers, mirroring exactly the initial
+    //     arming in setupRealGasCoeffTabulation() (skip Dirichlet-Z inlet patches
+    //     -> those keep live mixing; their prescribed pure-stream Y is off the
+    //     (Z_b,gZ_b,C_b) manifold point).
+    {
+        const volScalarField::Boundary& Y0bf = Y_[0].boundaryField();
+        const volScalarField::Boundary& Zbf = Z_.boundaryField();
+        List<const scalarField*> patchRefs(Y0bf.size());
+        List<List<const scalarField*>> patchCoeffs(Y0bf.size());
+        forAll(Y0bf, p)
+        {
+            if (Zbf[p].fixesValue())
+            {
+                patchRefs[p] = nullptr;
+                continue;
+            }
+            patchRefs[p] = &Y0bf[p];
+            patchCoeffs[p].setSize(nCoeff);
+            forAll(patchCoeffs[p], k)
+            {
+                patchCoeffs[p][k] = &RGcoeffFields_[k].boundaryField()[p];
+            }
+        }
+        hook->refreshPatchCoeffFields(patchRefs, patchCoeffs);
+    }
+}
+
 
 Foam::tmp<Foam::scalarField>
 Foam::solvers::fgmFluid::varianceLengthSqr()
@@ -557,6 +678,18 @@ Foam::solvers::fgmFluid::varianceLengthSqr()
 
 void Foam::solvers::fgmFluid::updateManifold()
 {
+    // Re-arm the Tier-2 tabulated real-gas coefficient lookup if the mesh cell
+    // count changed since it was last armed (runtime redistribution or AMR
+    // refinement reallocated the fields, invalidating the mixture's cached
+    // address-range cell recovery). Must run before any cell mixture is
+    // evaluated below. A no-op guard on a mesh that did not change, so the
+    // default (non-distributor) path stays bit-identical.
+    if (tabRealGasCoeffs_ && armedNCells_ != mesh.nCells())
+    {
+        rearmRealGasCoeffTabulation();
+        armedNCells_ = mesh.nCells();
+    }
+
     // |grad(Z)|^2 for the algebraic variance closure and for the
     // scalar-dissipation rate.
     const tmp<volScalarField> tmagSqrGradZ(magSqr(fvc::grad(Z_)));
@@ -592,10 +725,16 @@ void Foam::solvers::fgmFluid::updateManifold()
     // scalar mixing line). Same quadrilinear lookup as chi; only the 4th
     // coordinate differs.
     const bool useH = fgmTable_.useEnthalpy();
-    const bool use4D = useChi || useH;
+    // Steam-diluted FPV: 4th coordinate = transported dilution scalar W,
+    // passed directly (clamped to the tabulated W range), no defect.
+    const bool useW = fgmTable_.useDilution();
+    const bool use4D = useChi || useH || useW;
     const scalar hOxb   = useH ? fgmTable_.hOx()   : 0;
     const scalar hFuelb = useH ? fgmTable_.hFuel() : 0;
     const scalarField* hcl = useH ? &hPtr_->primitiveField() : nullptr;
+    const scalarField* Wcl = useW ? &WPtr_->primitiveField() : nullptr;
+    const scalar Wlo = useW ? fgmTable_.chiAxis().first() : 0;
+    const scalar Whi = useW ? fgmTable_.chiAxis().last()  : 0;
 
     // Hoist references to the tabulated species fields AND their flat tables
     // (resolving the by-name HashTable lookup once, not once per cell).
@@ -686,6 +825,10 @@ void Foam::solvers::fgmFluid::updateManifold()
             const scalar hAd = (scalar(1) - Zcl)*hOxb + Zcl*hFuelb;
             coord4 = (*hcl)[celli] - hAd;
         }
+        else if (useW)
+        {
+            coord4 = max(Wlo, min(Whi, (*Wcl)[celli]));
+        }
 
         // Shared stencil: ALL tabulated fields (source, T, Y_k, RG_*, Le_*)
         // are interpolated at this one manifold point, so the 4-axis bracket
@@ -758,6 +901,8 @@ void Foam::solvers::fgmFluid::updateManifold()
             const fvPatchScalarField& chip = chibf[patchi];
             const scalarField* hp =
                 useH ? &hPtr_->boundaryField()[patchi] : nullptr;
+            const scalarField* Wp =
+                useW ? &WPtr_->boundaryField()[patchi] : nullptr;
             forAll(Zp, fi)
             {
                 const scalar Zcl = max(min(Zp[fi], scalar(1)), scalar(0));
@@ -768,6 +913,10 @@ void Foam::solvers::fgmFluid::updateManifold()
                 {
                     const scalar hAd = (scalar(1) - Zcl)*hOxb + Zcl*hFuelb;
                     coord4 = (*hp)[fi] - hAd;
+                }
+                else if (useW)
+                {
+                    coord4 = max(Wlo, min(Whi, (*Wp)[fi]));
                 }
                 fgmTable_.interpolateRealGasCoeffs
                 (

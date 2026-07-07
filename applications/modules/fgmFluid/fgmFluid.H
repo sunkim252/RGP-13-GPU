@@ -122,6 +122,17 @@ protected:
         //  forbids a transported energy equation does NOT apply here.
         autoPtr<volScalarField> hPtr_;
 
+        //- Steam-dilution coordinate W [-], transported ONLY for a
+        //  steam-diluted (4-D dilution) table. Conserved scalar (no reaction
+        //  source: injected steam is inert as a stream tracer); the manifold's
+        //  4th axis is queried directly at W = local steam-in-oxidiser
+        //  fraction. Case supplies the field + BCs (steam inlet W=W_ox, O2 and
+        //  fuel inlets W=0). Null for chi/enthalpy/3-D tables.
+        //  v1 model: W is a single conserved mixing scalar; the mass/mole
+        //  basis and the exclusion of combustion-produced H2O are documented
+        //  approximations to be refined with a two-tracer reconstruction.
+        autoPtr<volScalarField> WPtr_;
+
         //- LES mixture-fraction variance coefficient (Cv)
         scalar Cv_;
 
@@ -182,6 +193,16 @@ protected:
         //- Reusable per-cell scratch for the interpolated RG coefficients.
         List<scalar> RGcoeffBuf_;
 
+        //- Mesh cell count for which the tabulated real-gas coefficient lookup
+        //  was last armed. When it changes (a runtime redistribution or an AMR
+        //  refinement move cells between processors / reallocate the coefficient
+        //  and control-variable fields), the cached mixture field pointers --
+        //  used to recover a cell index by address range -- are stale;
+        //  updateManifold() then re-arms them via rearmRealGasCoeffTabulation()
+        //  before any cell mixture is evaluated. -1 until the first successful
+        //  arming (the guard only fires while tabRealGasCoeffs_ is true).
+        label armedNCells_;
+
         //- Tier-4: optional per-cell differential-diffusion Lewis-number fields
         //  for the control variables Z and C, filled from fgmTable_ each
         //  updateManifold. Null unless the table carries the corresponding
@@ -228,6 +249,15 @@ private:
         //  before the first updateManifold()/thermo correct so the fields are
         //  filled before any cell mixture is evaluated through the lookup.
         void setupRealGasCoeffTabulation();
+
+        //- Re-arm the tabulated real-gas coefficient lookup after a mesh-cell-
+        //  count change: refresh the cached mixture field pointers (the internal
+        //  coefficient fields, the Opt-1 base-blend stencil fields and the Opt-2
+        //  patch fields) to the reallocated fields, WITHOUT rebuilding the mesh-
+        //  independent manifold node mixtures. Called from updateManifold() when
+        //  mesh.nCells() differs from armedNCells_ (runtime redistribution or AMR
+        //  refinement). Bit-identical to the freshly armed state.
+        void rearmRealGasCoeffTabulation();
 
         //- Per-cell tabulated Lewis-number field for a control variable, or
         //  nullptr when the table does not tabulate Le for it (constant Le_

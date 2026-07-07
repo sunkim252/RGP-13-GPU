@@ -232,6 +232,46 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         }
     }
 
+    // Steam-dilution scalar W is a CONSERVED mixing scalar (injected steam is
+    // inert as a stream tracer -- combustion-produced H2O is NOT counted in
+    // this v1 model), so it advects/diffuses like Z with no source. It carries
+    // the local steam-in-oxidiser fraction in from the steam inlet; the
+    // manifold's 4th axis is then queried at the local W. Solved only for a
+    // steam-diluted (dilution) table.
+    if (fgmTable_.useDilution())
+    {
+        volScalarField& W = WPtr_();
+        const volScalarField DW("DW", Deff("Z"));   // W diffuses like Z
+        fvScalarMatrix WEqn
+        (
+            fvm::ddt(rho, W)
+          + mvConvection->fvmDiv(phi, W)
+          - fvm::Sp(contErr, W)
+          - fvm::laplacian(DW + Dart, W)
+         ==
+            fvModels().source(rho, W)
+        );
+
+        WEqn.relax();
+        fvConstraints().constrain(WEqn);
+        WEqn.solve("Yi");
+        fvConstraints().constrain(W);
+
+        // Bound W to the tabulated dilution range (outside it the manifold
+        // clamps at the edge slice anyway; keep the transported field in-band).
+        {
+            const List<scalar>& Wax = fgmTable_.chiAxis();
+            const scalar Wmin = min(Wax.first(), Wax.last());
+            const scalar Wmax = max(Wax.first(), Wax.last());
+            scalarField& Wc = W.primitiveFieldRef();
+            forAll(Wc, celli)
+            {
+                Wc[celli] = max(min(Wc[celli], Wmax), Wmin);
+            }
+            W.correctBoundaryConditions();
+        }
+    }
+
 
     // --- No transported energy equation (adiabatic FPV/FGM closure) ---
     // The thermochemical state (T, he, Y) is a tabulated function of the

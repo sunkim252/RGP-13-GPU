@@ -135,6 +135,42 @@ public:
         ) const
         {}
 
+        //- Silent re-arm of the internal-cell coefficient lookup after a mesh-
+        //  cell-count change (AMR refinement / runtime redistribution reallocate
+        //  the fields). Same rebinding as enableCoeffTabulation but WITHOUT the
+        //  diagnostic-count reset or the Info print, so it can run on every mesh
+        //  change without log spam. Default no-op.
+        virtual void refreshCoeffFields
+        (
+            const scalarField& refInternal,
+            const List<const scalarField*>& coeffFields
+        ) const
+        {}
+
+        //- Silent re-arm of the Opt-1 base-blend stencil field pointers after a
+        //  mesh change. Re-binds only the table and the Z/gZ/C/chi manifold-
+        //  coordinate field pointers; the (mesh-independent) pre-blended node
+        //  mixtures are left intact and are NOT rebuilt. Default no-op.
+        virtual void refreshBaseBlendFields
+        (
+            const FGMTable& table,
+            const scalarField& Zfield,
+            const scalarField& gZfield,
+            const scalarField& Cfield,
+            const scalarField& chiField
+        ) const
+        {}
+
+        //- Silent re-arm of the Opt-2 patch-face coefficient pointers after a
+        //  mesh change. Same rebinding as enablePatchCoeffTabulation but without
+        //  the Info print. Default no-op.
+        virtual void refreshPatchCoeffFields
+        (
+            const List<const scalarField*>& patchRefs,
+            const List<List<const scalarField*>>& patchCoeffFields
+        ) const
+        {}
+
         //- Tier-4: evaluate the differential-diffusion Lewis numbers of the
         //  control variables from a mass-fraction composition Y at (p, T),
         //  using the EXACT live mixture transport (Chung/Takahashi) so the

@@ -913,6 +913,69 @@ void Foam::SRKchungTakaMixture<ThermoType>::enableBaseBlendTabulation
 
 
 template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::refreshCoeffFields
+(
+    const scalarField& refInternal,
+    const List<const scalarField*>& coeffFields
+) const
+{
+    if (coeffFields.size() != nCoeffs_)
+    {
+        FatalErrorInFunction
+            << "expected " << label(nCoeffs_) << " coefficient fields, got "
+            << coeffFields.size() << exit(FatalError);
+    }
+    // Silent re-arm on a mesh change: rebind the reference and coefficient field
+    // pointers to the reallocated fields. Unlike enableCoeffTabulation this does
+    // NOT reset coeffDiagCount_ (no repeat [Tier2-DIAG] audit) and prints
+    // nothing, so it can run on every redistribution/refinement step.
+    refInternalField_ = &refInternal;
+    coeffFields_ = coeffFields;
+    useTabulatedCoeffs_ = true;
+}
+
+
+template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::refreshBaseBlendFields
+(
+    const FGMTable& table,
+    const scalarField& Zfield,
+    const scalarField& gZfield,
+    const scalarField& Cfield,
+    const scalarField& chiField
+) const
+{
+    // Silent pointer refresh after a mesh change: the pre-blended manifold node
+    // mixtures (nodeMixtures_) are mesh-independent and are left intact; only the
+    // stencil-locating field pointers are re-bound to the reallocated fields.
+    fgmTablePtr_ = &table;
+    ZfieldPtr_   = &Zfield;
+    gZfieldPtr_  = &gZfield;
+    CfieldPtr_   = &Cfield;
+    chiFieldPtr_ = &chiField;
+}
+
+
+template<class ThermoType>
+void Foam::SRKchungTakaMixture<ThermoType>::refreshPatchCoeffFields
+(
+    const List<const scalarField*>& patchRefs,
+    const List<List<const scalarField*>>& patchCoeffFields
+) const
+{
+    if (patchRefs.size() != patchCoeffFields.size())
+    {
+        FatalErrorInFunction
+            << "patchRefs (" << patchRefs.size() << ") and patchCoeffFields ("
+            << patchCoeffFields.size() << ") size mismatch" << exit(FatalError);
+    }
+    // Silent re-arm on a mesh change (no Info print).
+    patchRefFields_ = patchRefs;
+    patchCoeffFields_ = patchCoeffFields;
+}
+
+
+template<class ThermoType>
 void Foam::SRKchungTakaMixture<ThermoType>::disableCoeffTabulation() const
 {
     useTabulatedCoeffs_ = false;
