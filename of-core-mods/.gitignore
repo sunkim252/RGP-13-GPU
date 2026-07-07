@@ -1,0 +1,7 @@
+linux64*/
+lnInclude/
+*.o
+*.dep
+*.so
+*.bak
+dynamicMeshDict

@@ -1,0 +1,17 @@
+64db671e81d093a1ad95bc028386e9388cd1d961
+Sunchang Kim <cmodelcmodel@protonmail.com>
+Tue Jul 7 22:59:46 2026 +0900
+
+OF-13 core mod: refiner distributes protectedCells_ for multi-level AMR+redistribution
+
+parcom5에서 검증된 실행 버전. hexRef8+distributor multi-level AMR 블로커 해결:
+refiner_fvMeshTopoChanger::distribute()에 map.distributeCellData(protectedCell)
+추가 — protectedCells_(PackedBoolList 세분금지 마스크)가 재분배 시 remap 안 돼
+다음 세분서 corrupt('cell of level 0 uses more than 8 points' hexRef8.C:3537)되던
+문제 수정. libfvMeshTopoChangers를 FOAM_USER_LIBBIN에 빌드해 /opt read-only 오버라이드.
+fgmFluid 재-arming(RGP-13-realFluid 7ab5e3c)+MPI_BUFFER_SIZE 2GB와 함께
+base 2.63M→L3 26.6M runtime AMR+distributor 균형 주행 검증됨.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XaEvDMc9WmHy5M7e6w3yQ1
+
