@@ -51,6 +51,7 @@ Foam::FGMTable::FGMTable
     nChi_(1),
     hasChi_(false),
     useEnthalpy_(false),
+    useDilution_(false),
     hOx_(0),
     hFuel_(0),
     Z_axis_(lookup("Z")),
@@ -106,6 +107,29 @@ Foam::FGMTable::FGMTable
         Info<< "    NON-ADIABATIC FPV: 4th axis = enthalpy defect, nH=" << nChi_
             << "  dh=[" << chi_axis_[0] << "," << chi_axis_[nChi_-1] << "] J/kg"
             << nl << "    hOx=" << hOx_ << " hFuel=" << hFuel_ << " J/kg" << endl;
+    }
+
+    // -------- optional steam-dilution axis (H2/O2/H2O power-generation FPV) --
+    // 4th axis W = steam mole fraction in the oxidiser stream. Reuses the same
+    // chi_axis_/nChi_ 4-D machinery, but the coordinate is a TRANSPORTED
+    // conserved dilution scalar W passed directly (no defect subtraction),
+    // flagged by 'fourthAxis dilution;' with the axis under 'nW'/'W'.
+    if (found("fourthAxis") && word(lookup("fourthAxis")) == "dilution")
+    {
+        nChi_ = readLabel(lookup("nW"));
+        chi_axis_ = List<scalar>(lookup("W"));
+        if (chi_axis_.size() != nChi_)
+        {
+            FatalErrorInFunction
+                << "dilution axis size " << chi_axis_.size()
+                << " != nW = " << nChi_ << exit(FatalError);
+        }
+        hasChi_ = true;          // use the 4-D interpolation path
+        useDilution_ = true;
+        Info<< "    STEAM-DILUTED FPV: 4th axis = oxidiser steam fraction W, "
+            << "nW=" << nChi_
+            << "  W=[" << chi_axis_[0] << "," << chi_axis_[nChi_-1] << "]"
+            << endl;
     }
 
     Info<< "    axes: nZ=" << nZ_
@@ -287,11 +311,26 @@ void Foam::FGMTable::bracket
         return;
     }
 
-    // Linear scan (axes are small). Find j with axis[j] >= v.
+    // Find j with axis[j-1] < v <= axis[j]. The manifold axes are uniform
+    // (Z/gZ/C/dh are linspace), so an initial guess assuming constant
+    // spacing lands on the exact cell (or a neighbour), and the two guarded
+    // walks below run 0-1 times -> O(1). For a non-uniform axis the guess is
+    // just a starting point and the walks recover the correct cell, so this
+    // is a drop-in, bit-identical replacement for the old O(n) linear scan.
+    const scalar span = axis[n - 1] - axis[0];
     label j = 1;
+    if (span > VSMALL)
+    {
+        j = label((v - axis[0])/span*(n - 1)) + 1;
+        j = max(label(1), min(j, n - 1));
+    }
     while (j < n - 1 && axis[j] < v)
     {
         j++;
+    }
+    while (j > 1 && axis[j - 1] >= v)
+    {
+        j--;
     }
 
     i = j - 1;
