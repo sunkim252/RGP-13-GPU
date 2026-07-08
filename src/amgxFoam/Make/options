@@ -1,0 +1,5 @@
+EXE_INC = \
+    -I$(AMGX_DIR)/include
+
+LIB_LIBS = \
+    $(AMGX_DIR)/lib/libamgxsh.so
