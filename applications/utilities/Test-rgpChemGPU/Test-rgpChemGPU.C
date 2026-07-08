@@ -20,6 +20,7 @@ Usage
 #include "scalarMatrices.H"
 #include "ODESystem.H"
 #include "ODESolver.H"
+#include "Rosenbrock34.H"
 #include "dictionary.H"
 
 #include "gpu/rgpChemTypes.H"
@@ -195,19 +196,96 @@ int main(int argc, char *argv[])
         }
     }
 
-    // 공유 rosenbrock34Step의 host 실행: err(h) 스캔 (신선 상태)
+    // 대조: OF Rosenbrock34::solve(고정 dx) vs 공유 스텝 — 같은 신선 상태
     {
-        List<double> yh(n + 1), yo(n + 1), wk((n + 1)*(n + 8));
-        for (int s = 0; s < n; s++) { yh[s] = X[s]*cTot0; }
-        yh[n] = T0;
+        const label neq = n + 1;
+        Rosenbrock34 ros(sys, odeDict);
+
+        scalarField y0f(neq, 0.0);
+        for (int s = 0; s < n; s++) { y0f[s] = X[s]*cTot0; }
+        y0f[n] = T0;
+        scalarField dydx0(neq), yOF(neq);
+        sys.derivatives(0, y0f, 0, dydx0);
+
+        List<double> yMine(neq), wk(neq*(neq + 8)), rows(neq);
+
         for (scalar h = 1e-6; h > 1e-12; h /= 10)
         {
-            const double e = rgpchem::rosenbrock34Step
+            const scalar errOF = ros.solve(0, y0f, 0, dydx0, h, yOF);
+            const double errMine = rgpchem::rosenbrock34Step
             (
-                mech, p0, h, 1e-6, 1e-14, yh.begin(), yo.begin(), wk.begin()
+                mech, p0, h, 1e-6, 1e-14,
+                y0f.begin(), yMine.begin(), wk.begin(), rows.begin()
             );
-            Info<< "host sharedStep h=" << h << " errNorm=" << e
-                << " Tnew=" << yo[n] << endl;
+            scalar dy = 0;
+            for (label i = 0; i < neq; i++)
+            {
+                dy = max(dy, mag(yOF[i] - yMine[i])
+                    /max(mag(yOF[i]), scalar(1e-30)));
+            }
+            label iw = 0;
+            for (label i = 1; i < neq; i++)
+            {
+                if (rows[i] > rows[iw]) { iw = i; }
+            }
+            Info<< "h=" << h << "  errOF=" << errOF
+                << "  errMine=" << errMine
+                << "  maxRelDy(OF vs mine)=" << dy
+                << "  worstRow=" << iw << " (|err|/sc=" << rows[iw]
+                << ")" << endl;
+        }
+
+        // LU 단독 대조: 같은 A=(I/(γh)−J)에 대해 내 LU vs OF LU로 k1 비교
+        {
+            const scalar h = 1e-8, gam = 0.5;
+            scalarField dfdx(neq);
+            scalarSquareMatrix dfdy(neq);
+            sys.jacobian(0, y0f, 0, dfdx, dfdy);
+
+            // OF 경로
+            scalarSquareMatrix A(neq), A0(neq);
+            for (label i = 0; i < neq; i++)
+            {
+                for (label j = 0; j < neq; j++) { A(i, j) = -dfdy(i, j); }
+                A(i, i) += 1.0/(gam*h);
+                for (label j = 0; j < neq; j++) { A0(i, j) = A(i, j); }
+            }
+            labelList pivOF(neq);
+            LUDecompose(A, pivOF);
+            scalarField k1OF(dydx0);
+            LUBacksubstitute(A, pivOF, k1OF);
+
+            // 내 경로 (동일 J 사용)
+            List<double> LU(neq*neq), k1M(neq);
+            List<int> pivM(neq);
+            for (label i = 0; i < neq; i++)
+            {
+                for (label j = 0; j < neq; j++)
+                {
+                    LU[i*neq + j] = -dfdy(i, j);
+                }
+                LU[i*neq + i] += 1.0/(gam*h);
+                k1M[i] = dydx0[i];
+            }
+            rgpchem::luDecomposeHD(LU.begin(), pivM.begin(), neq);
+            rgpchem::luSolveHD(LU.begin(), pivM.begin(), k1M.begin(), neq);
+
+            Info<< "LU k1 대조 (h=1e-8):" << endl;
+            scalar resOF = 0, resM = 0, fmax0 = 0;
+            for (label i = 0; i < neq; i++)
+            {
+                scalar sOF = 0, sM = 0;
+                for (label j = 0; j < neq; j++)
+                {
+                    sOF += A0(i, j)*k1OF[j];
+                    sM += A0(i, j)*k1M[j];
+                }
+                resOF = max(resOF, mag(sOF - dydx0[i]));
+                resM = max(resM, mag(sM - dydx0[i]));
+                fmax0 = max(fmax0, mag(dydx0[i]));
+            }
+            Info<< "  잔차 |A·k1-f|max: OF=" << resOF << "  mine=" << resM
+                << "  (|f|max=" << fmax0 << ")" << endl;
         }
     }
 

@@ -166,56 +166,108 @@ RGP_HD void chemRHS
     dydt[n] = -T*sumH/fmax(sumCcp, 1e-300);
 }
 
-//- 부분피벗 LU (host/device 공유 — 디버그 대조를 위해 단일 소스)
+//- LU 분해 (host/device 공유) — OpenFOAM scalarMatrices::LUDecompose의
+//  1:1 포팅 (NR ludcmp 계열: implicit scaling + Crout). 자작 Doolittle
+//  구현은 잔차 검사에서 오답(|A·x-f| ~ 4e-2)이 확인되어 폐기.
 RGP_HD bool luDecomposeHD(double* Am, int* piv, const int n)
 {
-    for (int k = 0; k < n; k++)
+    double vv[RGP_CHEM_NEQ];
+
+    for (int i = 0; i < n; i++)
     {
-        int ip = k;
-        double amax = fabs(Am[k*n + k]);
-        for (int i = k + 1; i < n; i++)
+        double largest = 0.0;
+        for (int j = 0; j < n; j++)
         {
-            const double v = fabs(Am[i*n + k]);
-            if (v > amax) { amax = v; ip = i; }
+            const double t = fabs(Am[i*n + j]);
+            if (t > largest) { largest = t; }
         }
-        if (amax < 1e-300) { return false; }
-        piv[k] = ip;
-        if (ip != k)
+        if (largest == 0.0) { return false; }
+        vv[i] = 1.0/largest;
+    }
+
+    for (int j = 0; j < n; j++)
+    {
+        for (int i = 0; i < j; i++)
         {
-            for (int j = 0; j < n; j++)
+            double sum = Am[i*n + j];
+            for (int k = 0; k < i; k++)
             {
-                const double t = Am[k*n + j];
-                Am[k*n + j] = Am[ip*n + j];
-                Am[ip*n + j] = t;
+                sum -= Am[i*n + k]*Am[k*n + j];
             }
+            Am[i*n + j] = sum;
         }
-        const double dinv = 1.0/Am[k*n + k];
-        for (int i = k + 1; i < n; i++)
+
+        int iMax = 0;
+        double largest = 0.0;
+        for (int i = j; i < n; i++)
         {
-            const double l = Am[i*n + k]*dinv;
-            Am[i*n + k] = l;
-            for (int j = k + 1; j < n; j++)
+            double sum = Am[i*n + j];
+            for (int k = 0; k < j; k++)
             {
-                Am[i*n + j] -= l*Am[k*n + j];
+                sum -= Am[i*n + k]*Am[k*n + j];
+            }
+            Am[i*n + j] = sum;
+
+            const double t = vv[i]*fabs(sum);
+            if (t >= largest) { largest = t; iMax = i; }
+        }
+
+        piv[j] = iMax;
+        if (j != iMax)
+        {
+            for (int k = 0; k < n; k++)
+            {
+                const double t = Am[j*n + k];
+                Am[j*n + k] = Am[iMax*n + k];
+                Am[iMax*n + k] = t;
+            }
+            vv[iMax] = vv[j];
+        }
+
+        if (Am[j*n + j] == 0.0) { Am[j*n + j] = 1e-15; }
+
+        if (j != n - 1)
+        {
+            const double rDiag = 1.0/Am[j*n + j];
+            for (int i = j + 1; i < n; i++)
+            {
+                Am[i*n + j] *= rDiag;
             }
         }
     }
     return true;
 }
 
+//- OpenFOAM LUBacksubstitute의 1:1 포팅 (NR lubksb)
 RGP_HD void luSolveHD(const double* Am, const int* piv, double* b, const int n)
 {
-    for (int k = 0; k < n; k++)
+    int ii = 0;
+    for (int i = 0; i < n; i++)
     {
-        const int ip = piv[k];
-        if (ip != k) { const double t = b[k]; b[k] = b[ip]; b[ip] = t; }
-        for (int i = k + 1; i < n; i++) { b[i] -= Am[i*n + k]*b[k]; }
+        const int ip = piv[i];
+        double sum = b[ip];
+        b[ip] = b[i];
+        if (ii != 0)
+        {
+            for (int j = ii - 1; j < i; j++)
+            {
+                sum -= Am[i*n + j]*b[j];
+            }
+        }
+        else if (sum != 0.0)
+        {
+            ii = i + 1;
+        }
+        b[i] = sum;
     }
     for (int i = n - 1; i >= 0; i--)
     {
-        double s = b[i];
-        for (int j = i + 1; j < n; j++) { s -= Am[i*n + j]*b[j]; }
-        b[i] = s/Am[i*n + i];
+        double sum = b[i];
+        for (int j = i + 1; j < n; j++)
+        {
+            sum -= Am[i*n + j]*b[j];
+        }
+        b[i] = sum/Am[i*n + i];
     }
 }
 
@@ -232,7 +284,8 @@ RGP_HD double rosenbrock34Step
     const double absTol,
     const double* y0,     // [neq]
     double* y,            // out [neq]
-    double* wk            // 작업공간 [neq*(neq+7)] : J,LU 재사용 겸 k1..k4,dy0,dy
+    double* wk,           // 작업공간 [neq*(neq+7)] : J,LU 재사용 겸 k1..k4,dy0,dy
+    double* errRows = 0   // 진단: 행별 |err|/sc (nullable)
 )
 {
     const double a21 = 2.0, a31 = 48.0/25.0, a32 = 6.0/25.0,
@@ -308,6 +361,7 @@ RGP_HD double rosenbrock34Step
         const double sc =
             absTol + relTol*fmax(fabs(y0[i]), fabs(y[i]));
         const double r = fabs(err)/sc;
+        if (errRows) { errRows[i] = r; }
         if (r > errNorm) { errNorm = r; }
     }
     return errNorm;
