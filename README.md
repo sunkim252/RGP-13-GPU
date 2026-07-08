@@ -11,8 +11,17 @@
 >   스캐폴드 히스토리 보존용 (force-push 전 main).
 > - **컨테이너**: 상위 디렉토리의 `openfoam13-rgp-gpu.def`
 >   (nvidia/cuda:12.4.1 베이스, wmake CUDA 룰 sm_89 포함) —
->   `apptainer build openfoam13-rgp-gpu.sif openfoam13-rgp-gpu.def`,
->   실행 시 `--nv` 필수. thermoGPU 빌드는 컨테이너 안에서 `build/Allwmake`.
+>   `apptainer build openfoam13-rgp-gpu.sif openfoam13-rgp-gpu.def`.
+>   WSL2 GPU 실행: `apptainer exec --nv --bind /usr/lib/wsl <sif>` +
+>   `LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH`.
+>   케이스 실행 시 `--no-home` 권장 (호스트 `$FOAM_USER_LIBBIN`의
+>   이기종 gcc 빌드 lib가 dlopen을 가로채는 것 방지).
+> - **thermoGPU** (`src/thermoGPU/`): SRK+Chung 핫루프 CUDA 커널.
+>   디바이스 계층(`gpu/`)은 Foam-free(플레인 배열 C ABI — OF `Scalar.H`
+>   Bessel 선언과 nvcc 충돌 회피), Foam 브리지는 `rgpGpuBridge.H`.
+>   빌드 `build/Allwmake`, 검증 `Test-rgpThermoGPU <thermoDict>` —
+>   CPU 경로 대비 rho/mu/kappa 최대 상대오차 ~1e-11 (stableRoot 양쪽,
+>   RTX 4060에서 확인).
 
 # RGP-13: Real-Fluid Thermophysics for OpenFOAM-13
 

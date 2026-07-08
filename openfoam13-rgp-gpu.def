@@ -1,0 +1,194 @@
+Bootstrap: docker
+From: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+# ─────────────────────────────────────────────────────────────────────────────
+# openfoam13-rgp-gpu.def — RGP-13-GPU 개발 컨테이너
+#
+# openfoam13-rgp.def(CPU, ubuntu:22.04 베이스)와 구 openfoam13-cuda.def
+# (nvidia/cuda 베이스 + wmake CUDA 룰)를 병합한 이미지.
+#  - 로컬 OpenFOAM-13 트리(AMR core-mod adce153 반영본)를 그대로 복사해 빌드
+#  - RGP-13 real-fluid 플러그인 install.sh 설치 (CPU 이미지와 동일 경로)
+#  - wmake CUDA 룰(sm_89, RTX 4060) 등록 → src/thermoGPU를 build/Allwmake로 빌드
+#  - PETSc + AmgX 선형솔버 오프로드 스택은 옵션 섹션(주석) — 착수 시 활성화
+#
+# 빌드 (RGP-13-GPU 디렉토리에서):
+#   apptainer build openfoam13-rgp-gpu.sif openfoam13-rgp-gpu.def
+# 실행:
+#   apptainer exec --nv openfoam13-rgp-gpu.sif bash
+# ─────────────────────────────────────────────────────────────────────────────
+
+%labels
+    Author sunkim
+    Project RGP-13-GPU
+    Description OpenFOAM-13 + RGP-13 Real Fluid Models + CUDA 12.4 (thermoGPU, AmgX-ready)
+
+%files
+    OpenFOAM-13      /opt/OpenFOAM/OpenFOAM-13
+    ThirdParty-13    /opt/OpenFOAM/ThirdParty-13
+    RGP-13-realFluid /opt/OpenFOAM/RGP-13-realFluid
+
+%environment
+    export FOAM_INST_DIR=/opt/OpenFOAM
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=${CUDA_HOME}/bin:${PATH}
+    export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+    export LIB_RGP13_SRC=/opt/OpenFOAM/RGP-13-realFluid/src
+    . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc || true
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        flex \
+        bison \
+        git \
+        libfl-dev \
+        libopenmpi-dev \
+        openmpi-bin \
+        libscotch-dev \
+        libptscotch-dev \
+        libfftw3-dev \
+        libboost-system-dev \
+        libboost-thread-dev \
+        libreadline-dev \
+        zlib1g-dev \
+        gnuplot \
+        wget \
+        && rm -rf /var/lib/apt/lists/*
+
+    # ─── %post는 /bin/sh(dash)로 실행되므로 bash로 전환 ───
+    /bin/bash << 'EOFBASH'
+    set -e -o pipefail
+
+    export FOAM_INST_DIR=/opt/OpenFOAM
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=$CUDA_HOME/bin:$PATH
+
+    # bashrc 내부의 unalias 등이 비0 종료를 반환해 set -e를 죽이므로 가드
+    set +e
+    . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc
+    set -e
+    [ -n "$WM_PROJECT_DIR" ] || { echo "ERROR: OpenFOAM bashrc sourcing failed"; exit 1; }
+
+    echo "WM_PROJECT_DIR = $WM_PROJECT_DIR"
+    echo "FOAM_LIBBIN    = $FOAM_LIBBIN"
+    nvcc --version | tail -1
+
+    # ─── wmake CUDA 룰 등록 (.cu → nvcc, RTX 4060 = Ada = sm_89) ───
+    RULES_DIR=$WM_PROJECT_DIR/wmake/rules/linux64Gcc
+
+    cat > $RULES_DIR/cuda <<'CUDA_RULES'
+# ── wmake CUDA compilation rules ──
+SUFFIXES += .cu
+
+CUDA_ARCH   = -gencode arch=compute_89,code=sm_89
+NVCC        = nvcc
+NVCC_FLAGS  = -std=c++14 -O3 --use_fast_math \
+              -Xcompiler -fPIC -Xcompiler -Wall \
+              $(CUDA_ARCH) \
+              -DLIB_NAME=$(notdir $(LIB).$(SO)) \
+              -D$(WM_ARCH) -DWM_ARCH_OPTION=$(WM_ARCH_OPTION) \
+              -DWM_$(WM_PRECISION_OPTION) -DWM_LABEL_SIZE=$(WM_LABEL_SIZE)
+
+cutoo       = $(WM_SCHEDULER) $(NVCC) $(NVCC_FLAGS) \
+              $(LIB_HEADER_DIRS) -c $< -o $@
+CUDA_RULES
+
+    grep -q 'rules)/cuda' $RULES_DIR/general 2>/dev/null || \
+        echo 'include $(DEFAULT_RULES)/cuda' >> $RULES_DIR/general
+
+    # ─── ThirdParty 컴파일 (scotch) ───
+    cd $WM_THIRD_PARTY_DIR
+    ./Allwmake -j$(nproc) 2>&1 | tail -5
+
+    # ─── OpenFOAM-13 컴파일 ───
+    cd $WM_PROJECT_DIR
+    ./Allwmake -j$(nproc) 2>&1 | tail -20
+
+    # ─── RGP-13 플러그인 빌드 (표준 Allwmake 경로) ───
+    # install.sh(레거시 트리패치)는 현행 템플릿 소스와 불일치(redefinition) — 사용 금지.
+    # 라이브러리는 사용자 홈이 아닌 이미지 내 플랫폼 libbin에 굽는다.
+    export FOAM_USER_LIBBIN=$FOAM_LIBBIN
+    export FOAM_USER_APPBIN=$FOAM_APPBIN
+    # wmake 병렬화: 인자(-jN)는 'wmake libso' 뒤에 오면 디렉토리로 오인되므로 env로
+    export WM_NCOMPPROCS=$(nproc)
+    # fgmFluid Make/options가 참조하는 realFluid 소스 경로 (사용자 컨벤션)
+    export LIB_RGP13_SRC=/opt/OpenFOAM/RGP-13-realFluid/src
+
+    cd /opt/OpenFOAM/RGP-13-realFluid
+    ./Allwmake 2>&1 | tail -10
+
+    # fgmFluid 솔버 모듈 + 테이블 유틸리티
+    ( cd applications/modules/fgmFluid && wmake libso ) 2>&1 | tail -5
+    ( cd applications/utilities/fgmTabulateRealGasCoeffs && wmake ) 2>&1 | tail -3
+    ( cd applications/utilities/fgmTabulateLewis && wmake ) 2>&1 | tail -3
+
+    # ─── thermoGPU (CUDA 커널 + 검증 유틸) ───
+    # 빌드 머신에 GPU가 없어도 컴파일은 가능 (실행만 --nv 필요)
+    ( cd build && ./Allwmake )
+
+    # 산출물 검증 — 없으면 이미지 빌드 자체를 실패시킨다
+    ls -lh $FOAM_LIBBIN/libRGP13realFluid.so $FOAM_LIBBIN/libfgmFluid.so \
+           $FOAM_LIBBIN/librgpThermoGPU.so \
+           $FOAM_APPBIN/fgmTabulateRealGasCoeffs $FOAM_APPBIN/fgmTabulateLewis \
+           $FOAM_APPBIN/Test-rgpThermoGPU
+
+    # ─── Dynamic compilation 템플릿 업데이트 ───
+    TEMPLATE="$WM_PROJECT_DIR/etc/codeTemplates/dynamicCode/fluidMulticomponentThermo"
+
+    grep -q 'SRKchungTakaMixture' "$TEMPLATE" || \
+        sed -i '/coefficientWilkeMulticomponentMixture/a\    SRKchungTakaMixture' "$TEMPLATE"
+
+    grep -q '    chung$' "$TEMPLATE" || \
+        sed -i '/    Andrade/a\    chung' "$TEMPLATE"
+
+    grep -q '    SRKGas$' "$TEMPLATE" || \
+        sed -i '/    rPolynomial/a\    SRKGas' "$TEMPLATE"
+
+    grep -q '    rfSpecie$' "$TEMPLATE" || \
+        sed -i '/^    specie$/a\    rfSpecie' "$TEMPLATE"
+
+
+    # ─── (옵션) PETSc + AmgX 선형솔버 오프로드 스택 ──────────────────────
+    # 선형솔버 오프로드 착수 시 아래 주석 해제 + petsc4Foam Foundation-13
+    # 포팅 필요. AmgX는 CUDA 12.4 호환 태그 사용.
+    #
+    # cd /opt/OpenFOAM/ThirdParty-13
+    # git clone --depth 1 -b v3.21.4 https://gitlab.com/petsc/petsc.git petsc-3.21.4
+    # cd petsc-3.21.4
+    # ./configure --with-cuda --with-cudac=nvcc --with-precision=double \
+    #     --with-mpi-dir=/usr/lib/x86_64-linux-gnu/openmpi \
+    #     --prefix=/opt/OpenFOAM/ThirdParty-13/platforms/linux64Gcc/petsc-3.21.4
+    # make -j$(nproc) && make install
+    #
+    # cd /opt/OpenFOAM/ThirdParty-13
+    # git clone --recursive --depth 1 -b v2.4.0 https://github.com/NVIDIA/AMGX.git amgx-2.4.0
+    # mkdir -p amgx-2.4.0/build && cd amgx-2.4.0/build
+    # cmake .. -DCUDA_ARCH=89 -DCMAKE_INSTALL_PREFIX=/opt/OpenFOAM/ThirdParty-13/platforms/linux64Gcc/amgx-2.4.0
+    # make -j$(nproc) && make install
+    # ─────────────────────────────────────────────────────────────────────
+
+    echo "=== Build complete ==="
+EOFBASH
+
+%runscript
+    . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc
+    exec "$@"
+
+%test
+    /bin/bash -c "\
+        . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc && \
+        foamRun -help 2>/dev/null | tail -3 && \
+        nvcc --version | tail -1" \
+    && echo "RGP-13-GPU image: OK"
+
+%help
+    OpenFOAM-13 + RGP-13 Real Fluid Models + CUDA 12.4 (GPU 개발 이미지)
+
+    Usage:
+      apptainer build openfoam13-rgp-gpu.sif openfoam13-rgp-gpu.def
+      apptainer exec --nv openfoam13-rgp-gpu.sif bash      # GPU 사용 시 --nv 필수
+      apptainer exec --nv openfoam13-rgp-gpu.sif foamRun
