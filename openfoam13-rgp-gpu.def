@@ -86,7 +86,9 @@ SUFFIXES += .cu
 
 CUDA_ARCH   = -gencode arch=compute_89,code=sm_89
 NVCC        = nvcc
-NVCC_FLAGS  = -std=c++14 -O3 --use_fast_math \
+# -fmad=false: FMA 축약 금지 -- CPU(g++ 비-FMA 코드젠)와의 ULP 정합을 위해.
+# --use_fast_math는 정합 검증(Test-rgpThermoGPU) 신뢰성을 위해 제외.
+NVCC_FLAGS  = -std=c++14 -O3 -fmad=false \
               -Xcompiler -fPIC -Xcompiler -Wall \
               $(CUDA_ARCH) \
               -DLIB_NAME=$(notdir $(LIB).$(SO)) \
