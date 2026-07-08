@@ -118,6 +118,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     gpuThermo_(fgmTable_.lookupOrDefault<Switch>("gpuThermo", false)),
     gpuArmed_(false),
+    thermoTimings_(fgmTable_.lookupOrDefault<Switch>("thermoTimings", false)),
 
     thermophysicalTransport
     (

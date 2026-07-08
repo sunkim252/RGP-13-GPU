@@ -226,6 +226,11 @@ protected:
         //- True once the GPU tables have been uploaded (lazy, first call).
         bool gpuArmed_;
 
+        //- Print the wall time of the per-step thermo property refresh
+        //  (thermo_.correct() or gpuThermoCorrect()). 'thermoTimings on;'
+        //  in fgmProperties; benchmarking aid, default off.
+        Switch thermoTimings_;
+
         //- Reusable host-side gather/scatter buffers for the GPU evaluate
         //  (internal cells + all patch faces, grow-only).
         List<double> gpuP_, gpuT_, gpuY_;

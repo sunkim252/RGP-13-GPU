@@ -31,6 +31,8 @@ License
 #include "fvcGrad.H"
 #include "zeroGradientFvPatchFields.H"
 
+#include <chrono>
+
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
 void Foam::solvers::fgmFluid::thermophysicalPredictor()
@@ -47,7 +49,18 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     );
 
     // --- FGM manifold update: gZ, composition Y_k, PV source (from Z, C) ---
-    updateManifold();
+    {
+        const auto tManifold0 = std::chrono::steady_clock::now();
+        updateManifold();
+        if (thermoTimings_)
+        {
+            Info<< "manifold update (incl. he re-seed) = "
+                << std::chrono::duration<double>
+                   (
+                       std::chrono::steady_clock::now() - tManifold0
+                   ).count() << " s" << endl;
+        }
+    }
     // NOTE: thermo_.normaliseY() REMOVED -- with every specie marked inactive
     // it sets the default specie (N2) = 1 - sum(ACTIVE) = 1 (no active species),
     // spuriously diluting the tabulated composition (which already sums to 1,
@@ -289,13 +302,29 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     // refreshes rho, psi, mu, ... at the new (p, T, Y) for the pressure solve.
     // thermoGPU: the same property refresh, batched on the CUDA device (the
     // he->T inversion is skipped -- T stays the manifold temperature).
-    if (gpuThermo_)
     {
-        gpuThermoCorrect();
-    }
-    else
-    {
-        thermo_.correct();
+        const auto tRefresh0 = std::chrono::steady_clock::now();
+
+        if (gpuThermo_)
+        {
+            gpuThermoCorrect();
+        }
+        else
+        {
+            thermo_.correct();
+        }
+
+        if (thermoTimings_)
+        {
+            const scalar dtRefresh =
+                std::chrono::duration<double>
+                (
+                    std::chrono::steady_clock::now() - tRefresh0
+                ).count();
+            Info<< "thermo refresh ("
+                << (gpuThermo_ ? "GPU" : "CPU") << ") = "
+                << dtRefresh << " s" << endl;
+        }
     }
 }
 
