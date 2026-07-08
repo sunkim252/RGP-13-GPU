@@ -166,6 +166,153 @@ RGP_HD void chemRHS
     dydt[n] = -T*sumH/fmax(sumCcp, 1e-300);
 }
 
+//- 부분피벗 LU (host/device 공유 — 디버그 대조를 위해 단일 소스)
+RGP_HD bool luDecomposeHD(double* Am, int* piv, const int n)
+{
+    for (int k = 0; k < n; k++)
+    {
+        int ip = k;
+        double amax = fabs(Am[k*n + k]);
+        for (int i = k + 1; i < n; i++)
+        {
+            const double v = fabs(Am[i*n + k]);
+            if (v > amax) { amax = v; ip = i; }
+        }
+        if (amax < 1e-300) { return false; }
+        piv[k] = ip;
+        if (ip != k)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                const double t = Am[k*n + j];
+                Am[k*n + j] = Am[ip*n + j];
+                Am[ip*n + j] = t;
+            }
+        }
+        const double dinv = 1.0/Am[k*n + k];
+        for (int i = k + 1; i < n; i++)
+        {
+            const double l = Am[i*n + k]*dinv;
+            Am[i*n + k] = l;
+            for (int j = k + 1; j < n; j++)
+            {
+                Am[i*n + j] -= l*Am[k*n + j];
+            }
+        }
+    }
+    return true;
+}
+
+RGP_HD void luSolveHD(const double* Am, const int* piv, double* b, const int n)
+{
+    for (int k = 0; k < n; k++)
+    {
+        const int ip = piv[k];
+        if (ip != k) { const double t = b[k]; b[k] = b[ip]; b[ip] = t; }
+        for (int i = k + 1; i < n; i++) { b[i] -= Am[i*n + k]*b[k]; }
+    }
+    for (int i = n - 1; i >= 0; i--)
+    {
+        double s = b[i];
+        for (int j = i + 1; j < n; j++) { s -= Am[i*n + j]*b[j]; }
+        b[i] = s/Am[i*n + i];
+    }
+}
+
+
+//- Rosenbrock34 1스텝 (Shampine 계수, OF Rosenbrock34::solve와 동일 산술).
+//  host/device 공유 — GPU 커널과 디버그 대조가 같은 코드를 실행한다.
+//  반환: errNorm (max-norm, OF normaliseError와 동일).
+RGP_HD double rosenbrock34Step
+(
+    const rgpChemMech& m,
+    const double p,
+    const double h,
+    const double relTol,
+    const double absTol,
+    const double* y0,     // [neq]
+    double* y,            // out [neq]
+    double* wk            // 작업공간 [neq*(neq+7)] : J,LU 재사용 겸 k1..k4,dy0,dy
+)
+{
+    const double a21 = 2.0, a31 = 48.0/25.0, a32 = 6.0/25.0,
+        c21 = -8.0, c31 = 372.0/25.0, c32 = 12.0/5.0,
+        c41 = -112.0/125.0, c42 = -54.0/125.0, c43 = -2.0/5.0,
+        b1 = 19.0/9.0, b2 = 1.0/2.0, b3 = 25.0/108.0, b4 = 125.0/108.0,
+        e1 = 34.0/108.0, e2 = 7.0/36.0, e4 = 125.0/108.0,
+        gam = 1.0/2.0;
+
+    const int n = m.nSpecies;
+    const int neq = n + 1;
+
+    double* LU = wk;                    // neq*neq
+    double* k1 = wk + neq*neq;
+    double* k2 = k1 + neq;
+    double* k3 = k2 + neq;
+    double* k4 = k3 + neq;
+    double* dy0 = k4 + neq;
+    double* dy = dy0 + neq;
+    double* ytmp = dy + neq;
+    int piv[RGP_CHEM_NEQ];
+
+    chemRHS(m, p, y0, dy0);
+
+    // FD Jacobian → LU = I/(γh) - J
+    for (int j = 0; j < neq; j++)
+    {
+        for (int i = 0; i < neq; i++) { ytmp[i] = y0[i]; }
+        const double d = fmax(fabs(y0[j])*1e-7, 1e-14);
+        ytmp[j] += d;
+        chemRHS(m, p, ytmp, dy);
+        const double dinv = 1.0/d;
+        for (int i = 0; i < neq; i++)
+        {
+            LU[i*neq + j] = -(dy[i] - dy0[i])*dinv;
+        }
+    }
+    const double diag = 1.0/(gam*h);
+    for (int i = 0; i < neq; i++) { LU[i*neq + i] += diag; }
+
+    if (!luDecomposeHD(LU, piv, neq)) { return 1e300; }
+
+    for (int i = 0; i < neq; i++) { k1[i] = dy0[i]; }
+    luSolveHD(LU, piv, k1, neq);
+
+    for (int i = 0; i < neq; i++) { ytmp[i] = y0[i] + a21*k1[i]; }
+    chemRHS(m, p, ytmp, dy);
+    for (int i = 0; i < neq; i++) { k2[i] = dy[i] + c21*k1[i]/h; }
+    luSolveHD(LU, piv, k2, neq);
+
+    for (int i = 0; i < neq; i++)
+    {
+        ytmp[i] = y0[i] + a31*k1[i] + a32*k2[i];
+    }
+    chemRHS(m, p, ytmp, dy);
+    for (int i = 0; i < neq; i++)
+    {
+        k3[i] = dy[i] + (c31*k1[i] + c32*k2[i])/h;
+    }
+    luSolveHD(LU, piv, k3, neq);
+
+    for (int i = 0; i < neq; i++)
+    {
+        k4[i] = dy[i] + (c41*k1[i] + c42*k2[i] + c43*k3[i])/h;
+    }
+    luSolveHD(LU, piv, k4, neq);
+
+    double errNorm = 0.0;
+    for (int i = 0; i < neq; i++)
+    {
+        y[i] = y0[i] + b1*k1[i] + b2*k2[i] + b3*k3[i] + b4*k4[i];
+        const double err = e1*k1[i] + e2*k2[i] + e4*k4[i];
+        const double sc =
+            absTol + relTol*fmax(fabs(y0[i]), fabs(y[i]));
+        const double r = fabs(err)/sc;
+        if (r > errNorm) { errNorm = r; }
+    }
+    return errNorm;
+}
+
 } // namespace rgpchem
 
 #endif

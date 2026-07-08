@@ -147,127 +147,50 @@ __global__ void chemIntegrateKernel
     const int neq = n + 1;
     const double p = pF[celli];
 
-    double y[NEQ], y0[NEQ], dy0[NEQ], dy[NEQ], err[NEQ];
-    double k1[NEQ], k2[NEQ], k3[NEQ], k4[NEQ];
-    double J[NEQ*NEQ], LU[NEQ*NEQ];
-    int piv[NEQ];
+    double y0[NEQ], y[NEQ];
+    double wk[NEQ*(NEQ + 7)];
 
-    for (int s = 0; s < n; s++) { y[s] = cF[(size_t)celli*n + s]; }
-    y[n] = TF[celli];
+    for (int s = 0; s < n; s++) { y0[s] = cF[(size_t)celli*n + s]; }
+    y0[n] = TF[celli];
 
     double t = 0.0;
-    double h = dtTot;            // 초기 스텝: 전 구간 시도 (거부되면 축소)
+    double h = dtTot;
     long long nSteps = 0;
 
     while (t < dtTot)
     {
         if (h > dtTot - t) { h = dtTot - t; }
 
-        // RHS + FD Jacobian (y0 기준)
-        for (int i = 0; i < neq; i++) { y0[i] = y[i]; }
-        chemRHS(dMech, p, y0, dy0);
-
-        for (int j = 0; j < neq; j++)
-        {
-            const double yj = y0[j];
-            const double d = fmax(fabs(yj)*1e-7, 1e-14);
-            y0[j] = yj + d;
-            chemRHS(dMech, p, y0, dy);
-            y0[j] = yj;
-            const double dinv = 1.0/d;
-            for (int i = 0; i < neq; i++)
-            {
-                J[i*neq + j] = (dy[i] - dy0[i])*dinv;
-            }
-        }
-
-        bool accepted = false;
-        while (!accepted)
-        {
-            // A = I/(γh) - J
-            const double diag = 1.0/(gam*h);
-            for (int i = 0; i < neq*neq; i++) { LU[i] = -J[i]; }
-            for (int i = 0; i < neq; i++) { LU[i*neq + i] += diag; }
-
-            if (!luDecompose(LU, piv, neq))
-            {
-                h *= 0.25;
-                if (h < 1e-25) { stepsF[celli] = -1; return; }
-                continue;
-            }
-
-            // stage 1
-            for (int i = 0; i < neq; i++) { k1[i] = dy0[i]; }
-            luSolve(LU, piv, k1, neq);
-
-            // stage 2
-            for (int i = 0; i < neq; i++) { y[i] = y0[i] + a21*k1[i]; }
-            chemRHS(dMech, p, y, dy);
-            for (int i = 0; i < neq; i++) { k2[i] = dy[i] + c21*k1[i]/h; }
-            luSolve(LU, piv, k2, neq);
-
-            // stage 3
-            for (int i = 0; i < neq; i++)
-            {
-                y[i] = y0[i] + a31*k1[i] + a32*k2[i];
-            }
-            chemRHS(dMech, p, y, dy);
-            for (int i = 0; i < neq; i++)
-            {
-                k3[i] = dy[i] + (c31*k1[i] + c32*k2[i])/h;
-            }
-            luSolve(LU, piv, k3, neq);
-
-            // stage 4 (같은 y에서 평가 — Shampine)
-            for (int i = 0; i < neq; i++)
-            {
-                k4[i] = dy[i] + (c41*k1[i] + c42*k2[i] + c43*k3[i])/h;
-            }
-            luSolve(LU, piv, k4, neq);
-
-            // 해 + 오차
-            double errNorm = 0.0;
-            for (int i = 0; i < neq; i++)
-            {
-                y[i] = y0[i] + b1*k1[i] + b2*k2[i] + b3*k3[i] + b4*k4[i];
-                err[i] = e1*k1[i] + e2*k2[i] + e3v*k3[i] + e4*k4[i];
-                const double sc =
-                    absTol + relTol*fmax(fabs(y0[i]), fabs(y[i]));
-                const double r = err[i]/sc;
-                errNorm += r*r;
-            }
-            errNorm = sqrt(errNorm/neq);
-            nSteps++;
+        const double errNorm =
+            rosenbrock34Step(dMech, p, h, relTol, absTol, y0, y, wk);
+        nSteps++;
 
 #ifdef RGP_CHEM_DEBUG
-            if (celli == 0 && nSteps <= 12)
-            {
-                printf("step %lld t=%.3e h=%.3e err=%.3e T=%.1f k1T=%.3e\n",
-                       nSteps, t, h, errNorm, y[n], k1[n]);
-            }
+        if (celli == 0 && nSteps <= 12)
+        {
+            printf("step %lld t=%.3e h=%.3e err=%.3e T=%.1f\n",
+                   nSteps, t, h, errNorm, y[n]);
+        }
 #endif
 
-            if (errNorm <= 1.0 && y[n] > 0.0 && !isnan(y[n]))
-            {
-                accepted = true;
-                t += h;
-                const double f =
-                    fmin(fmax(0.9*pow(errNorm, -1.0/3.0), 0.2), 5.0);
-                h *= f;
-            }
-            else
-            {
-                const double f = isnan(errNorm) || isnan(y[n])
-                    ? 0.25
-                    : fmin(fmax(0.9*pow(errNorm, -1.0/3.0), 0.1), 0.5);
-                h *= f;
-                if (h < 1e-25) { stepsF[celli] = -1; return; }
-                for (int i = 0; i < neq; i++) { y[i] = y0[i]; }
-            }
-
-            if (nSteps > 2000000) { stepsF[celli] = -2; return; }
+        if (errNorm <= 1.0 && y[n] > 0.0 && !isnan(y[n]))
+        {
+            t += h;
+            for (int i = 0; i < neq; i++) { y0[i] = y[i]; }
+            h *= fmin(fmax(0.9*pow(errNorm, -1.0/3.0), 0.2), 5.0);
         }
+        else
+        {
+            const double f = (isnan(errNorm) || isnan(y[n]))
+                ? 0.25
+                : fmin(fmax(0.9*pow(errNorm, -1.0/3.0), 0.1), 0.5);
+            h *= f;
+            if (h < 1e-25) { stepsF[celli] = -1; return; }
+        }
+
+        if (nSteps > 2000000) { stepsF[celli] = -2; return; }
     }
+    for (int i = 0; i < neq; i++) { y[i] = y0[i]; }
 
     for (int s = 0; s < n; s++)
     {
@@ -275,6 +198,35 @@ __global__ void chemIntegrateKernel
     }
     TF[celli] = y[n];
     stepsF[celli] = nSteps;
+}
+
+//- 디버그: 단일 스레드로 RHS + FD Jacobian만 계산 (host 대조용)
+__global__ void debugJacKernel
+(
+    const double p,
+    const double* __restrict__ yIn,
+    double* __restrict__ dy0,
+    double* __restrict__ J
+)
+{
+    const int n = dMech.nSpecies;
+    const int neq = n + 1;
+    double y0[NEQ], dy[NEQ];
+    for (int i = 0; i < neq; i++) { y0[i] = yIn[i]; }
+    chemRHS(dMech, p, y0, dy0);
+    for (int j = 0; j < neq; j++)
+    {
+        const double yj = y0[j];
+        const double d = fmax(fabs(yj)*1e-7, 1e-14);
+        y0[j] = yj + d;
+        chemRHS(dMech, p, y0, dy);
+        y0[j] = yj;
+        const double dinv = 1.0/d;
+        for (int i = 0; i < neq; i++)
+        {
+            J[i*neq + j] = (dy[i] - dy0[i])*dinv;
+        }
+    }
 }
 
 } // namespace rgpchem
@@ -400,6 +352,32 @@ int rgpChemIntegrate
         stats[1] = mx;
     }
 
+    return 0;
+}
+
+
+int rgpChemDebugJac(double p, const double* y, double* dy0, double* J)
+{
+    rgpChemMech host;
+    cudaMemcpyFromSymbol(&host, dMech, sizeof(int)*2);
+    const int n = host.nSpecies;
+    const int neq = n + 1;
+
+    double *dY, *dDy, *dJ;
+    cudaMalloc(&dY, neq*sizeof(double));
+    cudaMalloc(&dDy, neq*sizeof(double));
+    cudaMalloc(&dJ, neq*neq*sizeof(double));
+    cudaMemcpy(dY, y, neq*sizeof(double), cudaMemcpyHostToDevice);
+
+    rgpchem::debugJacKernel<<<1, 1>>>(p, dY, dDy, dJ);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+
+    cudaMemcpy(dy0, dDy, neq*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(J, dJ, neq*neq*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dY); cudaFree(dDy); cudaFree(dJ);
+
+    if (e != cudaSuccess) return fail(e, "debugJac");
     return 0;
 }
 

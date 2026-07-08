@@ -74,6 +74,16 @@ int  rgpChemIntegrate
 void rgpChemFree(void);
 const char* rgpChemLastError(void);
 
+/*  디버그: 상태 y[n+1]에서 디바이스 쪽 RHS(dy0[n+1])와 FD Jacobian
+    (J[(n+1)^2], 행우선)을 계산해 반환 — host 계산과 대조용.           */
+int  rgpChemDebugJac
+(
+    double p,
+    const double* y,
+    double* dy0,
+    double* J
+);
+
 #ifdef __cplusplus
 }
 #endif

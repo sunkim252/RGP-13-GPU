@@ -38,6 +38,8 @@ class burkeODE : public ODESystem
 
 public:
 
+    mutable label nRHS = 0;
+
     burkeODE(const rgpChemMech& m, const scalar p) : m_(m), p_(p) {}
 
     label nEqns() const { return m_.nSpecies + 1; }
@@ -47,6 +49,7 @@ public:
         const scalar, const scalarField& y, const label, scalarField& dydx
     ) const
     {
+        nRHS++;
         rgpchem::chemRHS(m_, p_, y.begin(), dydx.begin());
     }
 
@@ -127,7 +130,8 @@ int main(int argc, char *argv[])
         (std::chrono::steady_clock::now() - cpu0).count();
     const scalar TfinalCPU = y[n];
     Info<< "CPU(OF Rosenbrock34): tau_ign = " << tauCPU*1e6 << " us, "
-        << "T_final = " << TfinalCPU << " K  (" << cpuSec << " s)" << nl;
+        << "T_final = " << TfinalCPU << " K  (" << cpuSec << " s, "
+        << sys.nRHS << " RHS evals -> ~" << sys.nRHS/16 << " substeps)" << nl;
 
     // ── 2) GPU: 동일 문제 1셀 + 프로파일 대조 ──────────────────────────
     if (rgpChemInit(-1))
@@ -141,24 +145,73 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // 진단: 대표 상태 3개(신선/점화중/평형)의 서브스텝 수
+    // 진단: 동일 상태에서 device J vs host J 대조 (신선/점화중/평형)
     {
         const label ks[3] = {0, label(tauCPU/dtSample), nSnap - 1};
+        const label neq = n + 1;
         for (int d = 0; d < 3; d++)
         {
-            List<double> pd(1, double(p0)), Td(1);
-            List<double> cd(n);
-            for (int s = 0; s < n; s++) { cd[s] = snap[ks[d]][s]; }
-            Td[0] = snap[ks[d]][n];
-            long long st[2] = {0, 0};
-            const int e = rgpChemIntegrate(1, dtSample, 1e-6, 1e-14,
-                                           pd.begin(), Td.begin(),
-                                           cd.begin(), st);
-            Info<< "diag k=" << ks[d] << " T0=" << snap[ks[d]][n]
-                << " -> T=" << Td[0] << " substeps=" << scalar(st[0])
-                << " err=" << e << endl;
+            // host: 동일 FD 공식
+            scalarField yh(snap[ks[d]]);
+            scalarField f0(neq), f1(neq);
+            List<double> Jh(neq*neq), Jd(neq*neq), dy0d(neq);
+            rgpchem::chemRHS(mech, p0, yh.begin(), f0.begin());
+            for (label j = 0; j < neq; j++)
+            {
+                const scalar yj = yh[j];
+                const scalar dd = max(mag(yj)*1e-7, 1e-14);
+                yh[j] = yj + dd;
+                rgpchem::chemRHS(mech, p0, yh.begin(), f1.begin());
+                yh[j] = yj;
+                for (label i = 0; i < neq; i++)
+                {
+                    Jh[i*neq + j] = (f1[i] - f0[i])/dd;
+                }
+            }
+            // device
+            if (rgpChemDebugJac(p0, snap[ks[d]].begin(),
+                                dy0d.begin(), Jd.begin()))
+            {
+                Serr<< "FAIL: " << rgpChemLastError() << endl;
+                return 1;
+            }
+            scalar worstJ = 0, worstF = 0;
+            label wi = -1, wj = -1;
+            for (label i = 0; i < neq; i++)
+            {
+                worstF = max(worstF,
+                    mag(dy0d[i] - f0[i])/max(mag(f0[i]), scalar(1e-30)));
+                for (label j = 0; j < neq; j++)
+                {
+                    const scalar dJ = mag(Jd[i*neq + j] - Jh[i*neq + j])
+                        /max(mag(Jh[i*neq + j]), scalar(1e3));
+                    if (dJ > worstJ) { worstJ = dJ; wi = i; wj = j; }
+                }
+            }
+            Info<< "Jdiag k=" << ks[d] << " T=" << snap[ks[d]][n]
+                << ": max reldiff RHS=" << worstF << " J=" << worstJ
+                << " @(" << wi << "," << wj << ") host="
+                << Jh[wi*neq + wj] << " dev=" << Jd[wi*neq + wj] << endl;
         }
     }
+
+    // 공유 rosenbrock34Step의 host 실행: err(h) 스캔 (신선 상태)
+    {
+        List<double> yh(n + 1), yo(n + 1), wk((n + 1)*(n + 8));
+        for (int s = 0; s < n; s++) { yh[s] = X[s]*cTot0; }
+        yh[n] = T0;
+        for (scalar h = 1e-6; h > 1e-12; h /= 10)
+        {
+            const double e = rgpchem::rosenbrock34Step
+            (
+                mech, p0, h, 1e-6, 1e-14, yh.begin(), yo.begin(), wk.begin()
+            );
+            Info<< "host sharedStep h=" << h << " errNorm=" << e
+                << " Tnew=" << yo[n] << endl;
+        }
+    }
+
+    if (nBatch == 0) { Info<< "(J-diag only)" << nl; return 0; }
 
     // 스텝-일관성 검증: CPU 궤적 스냅샷 nSnap개를 '셀'로 묶어 단일
     // launch — 셀 k는 snap[k]에서 dtSample만큼 적분, snap[k+1]과 대조.
