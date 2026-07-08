@@ -34,6 +34,7 @@ namespace
         double* p = nullptr;
         double* T = nullptr;
         double* c = nullptr;
+        double* dt = nullptr;
         long long* steps = nullptr;
     } gBuf;
 
@@ -42,6 +43,7 @@ namespace
         if (gBuf.p) cudaFree(gBuf.p);
         if (gBuf.T) cudaFree(gBuf.T);
         if (gBuf.c) cudaFree(gBuf.c);
+        if (gBuf.dt) cudaFree(gBuf.dt);
         if (gBuf.steps) cudaFree(gBuf.steps);
         gBuf = Buffers();
     }
@@ -131,7 +133,7 @@ __device__ void luSolve
 __global__ void chemIntegrateKernel
 (
     const int nCells,
-    const double dtTot,
+    const double* __restrict__ dtF,
     const double relTol,
     const double absTol,
     const double* __restrict__ pF,
@@ -153,6 +155,7 @@ __global__ void chemIntegrateKernel
     for (int s = 0; s < n; s++) { y0[s] = cF[(size_t)celli*n + s]; }
     y0[n] = TF[celli];
 
+    const double dtTot = dtF[celli];
     double t = 0.0;
     double h = dtTot;
     long long nSteps = 0;
@@ -262,7 +265,7 @@ int rgpChemUpload(const rgpChemMech* mech)
 int rgpChemIntegrate
 (
     int nCells,
-    double dt,
+    const double* dt,
     double relTol,
     double absTol,
     const double* p,
@@ -290,6 +293,7 @@ int rgpChemIntegrate
             (e = cudaMalloc(&gBuf.T, nCells*sizeof(double))) != cudaSuccess ||
             (e = cudaMalloc(&gBuf.c, (size_t)nCells*n*sizeof(double)))
                 != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.dt, nCells*sizeof(double))) != cudaSuccess ||
             (e = cudaMalloc(&gBuf.steps, nCells*sizeof(long long)))
                 != cudaSuccess)
         {
@@ -307,12 +311,14 @@ int rgpChemIntegrate
         != cudaSuccess) return fail(e, "integrate/H2D T");
     if ((e = cudaMemcpy(gBuf.c, c, bns, cudaMemcpyHostToDevice))
         != cudaSuccess) return fail(e, "integrate/H2D c");
+    if ((e = cudaMemcpy(gBuf.dt, dt, b1s, cudaMemcpyHostToDevice))
+        != cudaSuccess) return fail(e, "integrate/H2D dt");
 
     constexpr int blockSize = 64;
     const int gridSize = (nCells + blockSize - 1)/blockSize;
     rgpchem::chemIntegrateKernel<<<gridSize, blockSize>>>
     (
-        nCells, dt, relTol, absTol, gBuf.p, gBuf.T, gBuf.c, gBuf.steps
+        nCells, gBuf.dt, relTol, absTol, gBuf.p, gBuf.T, gBuf.c, gBuf.steps
     );
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "integrate/launch");

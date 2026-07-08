@@ -302,7 +302,8 @@ int main(int argc, char *argv[])
             for (int s = 0; s < n; s++) { cB[k*n + s] = snap[k][s]; }
             TB[k] = snap[k][n];
         }
-        if (rgpChemIntegrate(nb, dtSample, 1e-6, 1e-14,
+        List<double> dtB(nb, double(dtSample));
+        if (rgpChemIntegrate(nb, dtB.begin(), 1e-6, 1e-14,
                              pB.begin(), TB.begin(), cB.begin(), nullptr))
         {
             Serr<< "FAIL: " << rgpChemLastError() << endl;
@@ -340,12 +341,13 @@ int main(int argc, char *argv[])
             for (int s = 0; s < n; s++) { cB[i*n + s] = X[s]*cT; }
         }
 
+        List<double> dtB(nBatch, 1e-7);
         long long stats[2] = {0, 0};
         // 워밍업(JIT/할당) 후 본측정
-        rgpChemIntegrate(nBatch, 1e-7, 1e-5, 1e-12,
+        rgpChemIntegrate(nBatch, dtB.begin(), 1e-5, 1e-12,
                          pB.begin(), TB.begin(), cB.begin(), stats);
         auto g0 = std::chrono::steady_clock::now();
-        const int err = rgpChemIntegrate(nBatch, 1e-7, 1e-5, 1e-12,
+        const int err = rgpChemIntegrate(nBatch, dtB.begin(), 1e-5, 1e-12,
                                          pB.begin(), TB.begin(),
                                          cB.begin(), stats);
         const double gSec =
@@ -359,6 +361,49 @@ int main(int argc, char *argv[])
         Info<< "  wall = " << gSec << " s -> "
             << scalar(nBatch)/gSec/1e6 << " Mcells/s"
             << "  (substeps: total " << scalar(stats[0])
+            << ", max/cell " << scalar(stats[1]) << ")" << nl;
+    }
+
+    // ── 4) 반응-중 처리율: 궤적 스냅샷(신선→점화→연소)을 순환 복제 ────
+    {
+        Info<< nl << "Reacting-mix throughput: " << nBatch
+            << " cells from trajectory snapshots, dt = 1e-7 s" << nl;
+        List<double> pB(nBatch, double(p0)), TB(nBatch);
+        List<double> cB(nBatch*n, 0.0);
+        for (label i = 0; i < nBatch; i++)
+        {
+            const scalarField& sk = snap[i % nSnap];
+            for (int s = 0; s < n; s++) { cB[i*n + s] = sk[s]; }
+            TB[i] = sk[n];
+        }
+
+        List<double> dtB(nBatch, 1e-7);
+        long long stats[2] = {0, 0};
+        rgpChemIntegrate(nBatch, dtB.begin(), 1e-5, 1e-12,
+                         pB.begin(), TB.begin(), cB.begin(), stats);
+        // (위 호출로 상태가 전진했지만 처리율 측정 목적이라 무방 — 재시드)
+        for (label i = 0; i < nBatch; i++)
+        {
+            const scalarField& sk = snap[i % nSnap];
+            for (int s = 0; s < n; s++) { cB[i*n + s] = sk[s]; }
+            TB[i] = sk[n];
+        }
+        auto g0 = std::chrono::steady_clock::now();
+        const int err = rgpChemIntegrate(nBatch, dtB.begin(), 1e-5, 1e-12,
+                                         pB.begin(), TB.begin(),
+                                         cB.begin(), stats);
+        const double gSec =
+            std::chrono::duration<double>
+            (std::chrono::steady_clock::now() - g0).count();
+        if (err)
+        {
+            Serr<< "FAIL: " << rgpChemLastError() << endl;
+            return 1;
+        }
+        Info<< "  wall = " << gSec << " s -> "
+            << scalar(nBatch)/gSec/1e6 << " Mcells/s"
+            << "  (substeps: total " << scalar(stats[0])
+            << ", mean " << scalar(stats[0])/nBatch
             << ", max/cell " << scalar(stats[1]) << ")" << nl;
     }
 

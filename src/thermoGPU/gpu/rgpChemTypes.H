@@ -62,7 +62,7 @@ int  rgpChemUpload(const rgpChemMech* mech);
 int  rgpChemIntegrate
 (
     int nCells,
-    double dt,
+    const double* dt,   /* [nCells] 셀별 적분 구간 (LTS 지원) */
     double relTol,
     double absTol,
     const double* p,
