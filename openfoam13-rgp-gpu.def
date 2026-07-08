@@ -123,14 +123,17 @@ CUDA_RULES
     cd /opt/OpenFOAM/RGP-13-realFluid
     ./Allwmake 2>&1 | tail -10
 
+    # thermoGPU CUDA 커널 — fgmFluid가 -lrgpThermoGPU를 링크하므로 먼저
+    # (빌드 머신에 GPU가 없어도 컴파일은 가능; 실행만 --nv 필요)
+    ( cd src/thermoGPU && wmake libso ) 2>&1 | tail -2
+
     # fgmFluid 솔버 모듈 + 테이블 유틸리티
     ( cd applications/modules/fgmFluid && wmake libso ) 2>&1 | tail -5
     ( cd applications/utilities/fgmTabulateRealGasCoeffs && wmake ) 2>&1 | tail -3
     ( cd applications/utilities/fgmTabulateLewis && wmake ) 2>&1 | tail -3
 
-    # ─── thermoGPU (CUDA 커널 + 검증 유틸) ───
-    # 빌드 머신에 GPU가 없어도 컴파일은 가능 (실행만 --nv 필요)
-    ( cd build && ./Allwmake )
+    # ─── thermoGPU 검증 유틸 ───
+    ( cd applications/utilities/Test-rgpThermoGPU && wmake ) 2>&1 | tail -3
 
     # 산출물 검증 — 없으면 이미지 빌드 자체를 실패시킨다
     ls -lh $FOAM_LIBBIN/libRGP13realFluid.so $FOAM_LIBBIN/libfgmFluid.so \
