@@ -16,7 +16,9 @@
 
 // * * * * * * * * * * * * * * * 디바이스 상태 * * * * * * * * * * * * * * * //
 
-__constant__ rgpChemMech dMech;
+// 메커니즘은 ~500KB(GRI급)라 __constant__(64KB) 대신 글로벌 메모리 상주.
+static rgpChemMech* dMechPtr = nullptr;   // device
+static int gNSpecies = 0;                 // host 캐시
 
 namespace
 {
@@ -132,6 +134,7 @@ __device__ void luSolve
 //- 셀 하나 적분: [0, dtTot], 적응 Rosenbrock34
 __global__ void chemIntegrateKernel
 (
+    const rgpChemMech* __restrict__ mechP,
     const int nCells,
     const double* __restrict__ dtF,
     const double relTol,
@@ -145,6 +148,7 @@ __global__ void chemIntegrateKernel
     const int celli = blockIdx.x*blockDim.x + threadIdx.x;
     if (celli >= nCells) return;
 
+    const rgpChemMech& dMech = *mechP;
     const int n = dMech.nSpecies;
     const int neq = n + 1;
     const double p = pF[celli];
@@ -206,12 +210,14 @@ __global__ void chemIntegrateKernel
 //- 디버그: 단일 스레드로 RHS + FD Jacobian만 계산 (host 대조용)
 __global__ void debugJacKernel
 (
+    const rgpChemMech* __restrict__ mechP,
     const double p,
     const double* __restrict__ yIn,
     double* __restrict__ dy0,
     double* __restrict__ J
 )
 {
+    const rgpChemMech& dMech = *mechP;
     const int n = dMech.nSpecies;
     const int neq = n + 1;
     double y0[NEQ], dy[NEQ];
@@ -256,8 +262,16 @@ int rgpChemUpload(const rgpChemMech* mech)
         snprintf(gErr, sizeof(gErr), "rgpChemUpload: bad mechanism dims");
         return -1;
     }
-    cudaError_t e = cudaMemcpyToSymbol(dMech, mech, sizeof(rgpChemMech));
-    if (e != cudaSuccess) return fail(e, "rgpChemUpload/memcpyToSymbol");
+    cudaError_t e;
+    if (!dMechPtr)
+    {
+        e = cudaMalloc(&dMechPtr, sizeof(rgpChemMech));
+        if (e != cudaSuccess) return fail(e, "rgpChemUpload/malloc");
+    }
+    e = cudaMemcpy(dMechPtr, mech, sizeof(rgpChemMech),
+                   cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) return fail(e, "rgpChemUpload/memcpy");
+    gNSpecies = mech->nSpecies;
     return 0;
 }
 
@@ -276,11 +290,9 @@ int rgpChemIntegrate
 {
     if (nCells <= 0) return 0;
 
-    rgpChemMech host;
-    cudaError_t e = cudaMemcpyFromSymbol(&host, dMech, sizeof(int)*2);
-    // (nSpecies만 필요 — 구조체 앞머리 2 int)
-    const int n = host.nSpecies;
-    if (n <= 0)
+    cudaError_t e;
+    const int n = gNSpecies;
+    if (n <= 0 || !dMechPtr)
     {
         snprintf(gErr, sizeof(gErr), "rgpChemIntegrate: mech not uploaded");
         return -1;
@@ -318,7 +330,8 @@ int rgpChemIntegrate
     const int gridSize = (nCells + blockSize - 1)/blockSize;
     rgpchem::chemIntegrateKernel<<<gridSize, blockSize>>>
     (
-        nCells, gBuf.dt, relTol, absTol, gBuf.p, gBuf.T, gBuf.c, gBuf.steps
+        dMechPtr, nCells, gBuf.dt, relTol, absTol,
+        gBuf.p, gBuf.T, gBuf.c, gBuf.steps
     );
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "integrate/launch");
@@ -364,9 +377,7 @@ int rgpChemIntegrate
 
 int rgpChemDebugJac(double p, const double* y, double* dy0, double* J)
 {
-    rgpChemMech host;
-    cudaMemcpyFromSymbol(&host, dMech, sizeof(int)*2);
-    const int n = host.nSpecies;
+    const int n = gNSpecies;
     const int neq = n + 1;
 
     double *dY, *dDy, *dJ;
@@ -375,7 +386,7 @@ int rgpChemDebugJac(double p, const double* y, double* dy0, double* J)
     cudaMalloc(&dJ, neq*neq*sizeof(double));
     cudaMemcpy(dY, y, neq*sizeof(double), cudaMemcpyHostToDevice);
 
-    rgpchem::debugJacKernel<<<1, 1>>>(p, dY, dDy, dJ);
+    rgpchem::debugJacKernel<<<1, 1>>>(dMechPtr, p, dY, dDy, dJ);
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) e = cudaDeviceSynchronize();
 
@@ -388,7 +399,12 @@ int rgpChemDebugJac(double p, const double* y, double* dy0, double* J)
 }
 
 
-void rgpChemFree(void) { freeBuffers(); }
+void rgpChemFree(void)
+{
+    freeBuffers();
+    if (dMechPtr) { cudaFree(dMechPtr); dMechPtr = nullptr; }
+    gNSpecies = 0;
+}
 
 const char* rgpChemLastError(void) { return gErr; }
 

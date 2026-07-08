@@ -142,7 +142,7 @@ void Foam::gpuChemistryModel<ThermoType>::armGpu() const
         {
             readArr(d.subDict("kInf"), mech_.A[r], mech_.beta[r], mech_.Ta[r]);
             readArr(d.subDict("k0"), mech_.A0[r], mech_.beta0[r], mech_.Ta0[r]);
-            if (d.found("F"))
+            if (d.found("F") && d.subDict("F").found("alpha"))
             {
                 const dictionary& F = d.subDict("F");
                 mech_.tbType[r] = RGP_TB_TROE;

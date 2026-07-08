@@ -8,8 +8,8 @@
 #ifndef rgpChemTypes_H
 #define rgpChemTypes_H
 
-#define RGP_CHEM_MAX_SPECIES   16
-#define RGP_CHEM_MAX_REACTIONS 32
+#define RGP_CHEM_MAX_SPECIES   40
+#define RGP_CHEM_MAX_REACTIONS 256
 #define RGP_CHEM_NEQ (RGP_CHEM_MAX_SPECIES + 1)   /* c[] + T */
 
 /* 3체/폴오프 유형 */
