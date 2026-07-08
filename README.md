@@ -1,3 +1,19 @@
+# RGP-13-GPU: Real-Fluid Thermophysics for OpenFOAM-13 — GPU fork
+
+> **GPU 개발 포크** — [sunkim252/RGP-13](https://github.com/sunkim252/RGP-13)
+> `main`(497152e, 2026-07-08)에서 분기. 목표: ① 열물리 핫루프
+> (updateTRANS/FGMTable) CUDA 포팅(`src/thermoGPU/`, Phase-1 스캐폴딩 graft됨),
+> ② 선형솔버 AmgX/PETSc 오프로드.
+>
+> - **리모트**: `origin` = RGP-13-GPU(이 저장소) / `upstream` = RGP-13(CPU 본가)
+>   / `local` = 로컬 CPU 트리. CPU 쪽 개선은 `git fetch upstream && git merge upstream/main`.
+> - **브랜치**: `main` = GPU 개발 기본선, `phase1-scaffold-archive` = 2026-04 구
+>   스캐폴드 히스토리 보존용 (force-push 전 main).
+> - **컨테이너**: 상위 디렉토리의 `openfoam13-rgp-gpu.def`
+>   (nvidia/cuda:12.4.1 베이스, wmake CUDA 룰 sm_89 포함) —
+>   `apptainer build openfoam13-rgp-gpu.sif openfoam13-rgp-gpu.def`,
+>   실행 시 `--nv` 필수. thermoGPU 빌드는 컨테이너 안에서 `build/Allwmake`.
+
 # RGP-13: Real-Fluid Thermophysics for OpenFOAM-13
 
 Plug-in real-gas thermophysical-properties library for supercritical
