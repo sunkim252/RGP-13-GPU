@@ -54,7 +54,8 @@ int  rgpGpuDeviceCount(void);               /* 실패 시 0 */
 int  rgpGpuUpload(const rgpGpuTables* tables);
 
 /*  p[nCells], T[nCells], Y[nCells*nSpecies] (셀-우선 AoS: Y[i*n+s])
-    → rho/mu/kappa[nCells]. 내부 디바이스 버퍼는 grow-only 재사용.    */
+    → rho/mu/kappa/Cp/Cv/psi[nCells] — RhoFluidThermo::calculate()가
+    셀마다 채우는 물성 세트 전체. 내부 디바이스 버퍼는 grow-only 재사용. */
 int  rgpGpuEvaluate
 (
     int nCells,
@@ -63,7 +64,10 @@ int  rgpGpuEvaluate
     const double* Y,
     double* rho,
     double* mu,
-    double* kappa
+    double* kappa,
+    double* Cp,
+    double* Cv,
+    double* psi
 );
 
 void rgpGpuFree(void);

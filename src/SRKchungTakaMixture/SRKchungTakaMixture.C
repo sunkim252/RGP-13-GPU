@@ -995,6 +995,71 @@ void Foam::SRKchungTakaMixture<ThermoType>::disableCoeffTabulation() const
 
 
 template<class ThermoType>
+bool Foam::SRKchungTakaMixture<ThermoType>::gpuThermoTables
+(
+    scalarList& W,
+    scalarList& BM,
+    scalarList& CM,
+    scalarList& janafHigh,
+    scalarList& janafLow,
+    List<scalarList>& pair,
+    scalar& TlowJ,
+    scalar& ThighJ,
+    scalar& Tcommon,
+    bool& stableRoot
+) const
+{
+    const label n = numberOfSpecies_;
+
+    W = ListW_;
+    BM = BM_;
+    CM = CM_;
+
+    // janafThermo 계수는 생성 시 질량기준(J/kg/K)으로 변환돼 저장됨.
+    janafHigh.setSize(7*n);
+    janafLow.setSize(7*n);
+    forAll(this->specieThermos(), i)
+    {
+        const auto& hc = this->specieThermos()[i].highCpCoeffs();
+        const auto& lc = this->specieThermos()[i].lowCpCoeffs();
+        for (label c = 0; c < 7; c++)
+        {
+            janafHigh[7*i + c] = hc[c];
+            janafLow[7*i + c] = lc[c];
+        }
+    }
+
+    // 쌍 혼합 행렬 9개, 커널 순서 (row-major [n*n])
+    const List<List<scalar>>* mats[9] =
+    {
+        &COEF1_, &COEF2_, &COEF3_, &SIGMA3M_, &EPSILONKM0_,
+        &OMEGAM0_, &MM0_, &MIUIM0_, &KAPPAIM_
+    };
+    pair.setSize(9);
+    for (label m = 0; m < 9; m++)
+    {
+        pair[m].setSize(n*n);
+        for (label i = 0; i < n; i++)
+        {
+            for (label j = 0; j < n; j++)
+            {
+                pair[m][i*n + j] = (*mats[m])[i][j];
+            }
+        }
+    }
+
+    // OF 관례: 믹스처 janaf 온도범위는 종-0에서 승계
+    TlowJ = this->specieThermos()[0].Tlow();
+    ThighJ = this->specieThermos()[0].Thigh();
+    Tcommon = this->specieThermos()[0].Tcommon();
+
+    stableRoot = ThermoType::stableRoot();
+
+    return true;
+}
+
+
+template<class ThermoType>
 bool Foam::SRKchungTakaMixture<ThermoType>::lewisNumbers
 (
     const List<scalar>& Y,

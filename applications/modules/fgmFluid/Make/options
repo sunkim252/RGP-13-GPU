@@ -1,6 +1,7 @@
 EXE_INC = \
     -I$(LIB_RGP13_SRC)/FGM \
     -I$(LIB_RGP13_SRC)/SRKchungTakaMixture \
+    -I$(LIB_RGP13_SRC)/thermoGPU \
     -I$(FOAM_MODULES)/fluidSolver/lnInclude \
     -I$(FOAM_MODULES)/isothermalFluid/lnInclude \
     -I$(LIB_SRC)/MomentumTransportModels/momentumTransportModels/lnInclude \
@@ -23,6 +24,7 @@ EXE_INC = \
 LIB_LIBS = \
     -L$(FOAM_USER_LIBBIN) \
     -lRGP13realFluid \
+    -lrgpThermoGPU \
     -lfluidSolver \
     -lisothermalFluid \
     -lfluidThermophysicalModels \

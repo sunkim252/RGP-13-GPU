@@ -116,6 +116,9 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     tabLewis_(false),
 
+    gpuThermo_(fgmTable_.lookupOrDefault<Switch>("gpuThermo", false)),
+    gpuArmed_(false),
+
     thermophysicalTransport
     (
         fluidMulticomponentThermophysicalTransportModel::New

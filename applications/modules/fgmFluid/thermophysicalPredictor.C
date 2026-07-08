@@ -287,7 +287,16 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     //
     // thermo.correct() inverts the manifold he straight back to T_table and
     // refreshes rho, psi, mu, ... at the new (p, T, Y) for the pressure solve.
-    thermo_.correct();
+    // thermoGPU: the same property refresh, batched on the CUDA device (the
+    // he->T inversion is skipped -- T stays the manifold temperature).
+    if (gpuThermo_)
+    {
+        gpuThermoCorrect();
+    }
+    else
+    {
+        thermo_.correct();
+    }
 }
 
 

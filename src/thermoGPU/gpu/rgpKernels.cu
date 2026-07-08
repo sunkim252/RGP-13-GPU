@@ -54,6 +54,9 @@ namespace
         double* rho = nullptr;
         double* mu = nullptr;
         double* kappa = nullptr;
+        double* Cp = nullptr;
+        double* Cv = nullptr;
+        double* psi = nullptr;
     };
 
     DeviceTables  gTab;
@@ -83,7 +86,8 @@ namespace
     {
         double** ptrs[] =
         {
-            &gBuf.p, &gBuf.T, &gBuf.Y, &gBuf.rho, &gBuf.mu, &gBuf.kappa
+            &gBuf.p, &gBuf.T, &gBuf.Y, &gBuf.rho, &gBuf.mu, &gBuf.kappa,
+            &gBuf.Cp, &gBuf.Cv, &gBuf.psi
         };
         for (auto pp : ptrs) { if (*pp) { cudaFree(*pp); *pp = nullptr; } }
         gBuf.capCells = 0;
@@ -208,13 +212,16 @@ __device__ double srkRho
 }
 
 
-//- SRK Cp departure [J/(kg K)]: SRKGasI.H Cp(p,T)
-__device__ double srkCpDep
+//- SRK Cp departure + CpMCv [J/(kg K)]: SRKGasI.H Cp(p,T)/CpMCv(p,T)
+//  (동일한 A, B, Z, M, N을 공유하므로 한 번에 계산)
+__device__ void srkCpDepCpMCv
 (
     const double p, const double T,
     const double bM, const double coef1, const double coef2,
     const double coef3, const double Wmix, const double RR,
-    const int stableRoot
+    const int stableRoot,
+    double& cpDep,      // SRKGasI::Cp — EOS departure [J/(kg K)]
+    double& cpMCv       // SRKGasI::CpMCv = R_mass*(M-N)^2/(M^2-A(2Z+B))
 )
 {
     const double sqrtT = sqrt(T);
@@ -232,13 +239,36 @@ __device__ double srkCpDep
     const double M = (Zv*Zv + B*Zv)/(Zv - B);
     const double N = daAlpha*B/(bM*RR);
     const double MmN = M - N;
+    const double denom = M*M - A*(2.0*Zv + B);
 
-    return
+    cpDep =
     (
         (T/bM)*ddaAlpha*log((Zv + B)/Zv)
-      + RR*MmN*MmN/(M*M - A*(2.0*Zv + B))
+      + RR*MmN*MmN/denom
       - RR
     )/Wmix;
+
+    cpMCv = (RR/Wmix)*MmN*MmN/denom;
+}
+
+
+//- SRK psi = (drho/dp)_T [s^2/m^2]: SRKGasI.H psi(p,T) — 전방 FD
+__device__ double srkPsi
+(
+    double p, const double T,
+    const double bM, const double coef1, const double coef2,
+    const double coef3, const double cM,
+    const double Wmix, const double RR, const int stableRoot
+)
+{
+    p = fmax(p, 1e4);                        // EOS 내부 압력 floor
+    const double dp = 1e-3*p;
+    const double rho0 =
+        srkRho(p, T, bM, coef1, coef2, coef3, cM, Wmix, RR, stableRoot);
+    const double rho1 =
+        srkRho(p + dp, T, bM, coef1, coef2, coef3, cM, Wmix, RR, stableRoot);
+    const double dRhodP = (rho1 - rho0)/dp;
+    return fmax(dRhodP, 1e-3*rho0/p);
 }
 
 
@@ -252,7 +282,10 @@ __global__ void rgpEvaluateKernel
     const double* __restrict__ YF,
     double* __restrict__ rhoF,
     double* __restrict__ muF,
-    double* __restrict__ kappaF
+    double* __restrict__ kappaF,
+    double* __restrict__ CpF,
+    double* __restrict__ CvF,
+    double* __restrict__ psiF
 )
 {
     const int celli = blockIdx.x*blockDim.x + threadIdx.x;
@@ -369,10 +402,27 @@ __global__ void rgpEvaluateKernel
     const double p = pF[celli];
     const double T = TF[celli];
 
-    // ── rho (SRK + Peneloux) ──────────────────────────────────────────
+    // ── rho (SRK + Peneloux) / psi (FD) ──────────────────────────────
     const double rho =
         srkRho(p, T, bM, coef1, coef2, coef3, cM, Wmix, RR, kp.stableRoot);
     rhoF[celli] = rho;
+    psiF[celli] =
+        srkPsi(p, T, bM, coef1, coef2, coef3, cM, Wmix, RR, kp.stableRoot);
+
+    // ── Cp / Cv (실제 thermo 체인: JANAF 블렌드 + SRK departure, raw p) ─
+    {
+        const double CpJanafT =
+            ((((aJ[4]*T + aJ[3])*T + aJ[2])*T + aJ[1])*T + aJ[0]);
+        double cpDep, cpMCv;
+        srkCpDepCpMCv
+        (
+            p, T, bM, coef1, coef2, coef3, Wmix, RR, kp.stableRoot,
+            cpDep, cpMCv
+        );
+        const double CpVal = CpJanafT + cpDep;
+        CpF[celli] = CpVal;
+        CvF[celli] = CpVal - cpMCv;          // HtoEthermo.H: Cv = Cp - CpMCv
+    }
 
     // ── Chung calculate(p,T): 공통 중간량 ─────────────────────────────
     const double A_=1.16145, B_=0.14874, C_=0.52487, D_=0.77320, E_=2.16178;
@@ -454,10 +504,13 @@ __global__ void rgpEvaluateKernel
         const double pRef = 100.0;
         const double CpJanaf =
             ((((aJ[4]*T + aJ[3])*T + aJ[2])*T + aJ[1])*T + aJ[0]);
-        const double CpRef =
-            CpJanaf
-          + srkCpDep(pRef, T, bM, coef1, coef2, coef3, Wmix, RR,
-                     kp.stableRoot);
+        double cpDepRef, cpMCvUnused;
+        srkCpDepCpMCv
+        (
+            pRef, T, bM, coef1, coef2, coef3, Wmix, RR, kp.stableRoot,
+            cpDepRef, cpMCvUnused
+        );
+        const double CpRef = CpJanaf + cpDepRef;
 
         const double CvIdeal = CpRef - Rmass;
         const double CvCal = CvIdeal*Wmix*0.2388e-3;   // [cal/mol K]
@@ -570,7 +623,10 @@ int rgpGpuEvaluate
     const double* Y,
     double* rho,
     double* mu,
-    double* kappa
+    double* kappa,
+    double* Cp,
+    double* Cv,
+    double* psi
 )
 {
     if (nCells <= 0) return 0;
@@ -593,7 +649,10 @@ int rgpGpuEvaluate
             (e = cudaMalloc(&gBuf.Y,     bn)) != cudaSuccess ||
             (e = cudaMalloc(&gBuf.rho,   b1)) != cudaSuccess ||
             (e = cudaMalloc(&gBuf.mu,    b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.kappa, b1)) != cudaSuccess)
+            (e = cudaMalloc(&gBuf.kappa, b1)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Cp,    b1)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Cv,    b1)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.psi,   b1)) != cudaSuccess)
         {
             freeBuffers();
             return fail(e, "evaluate/malloc");
@@ -631,7 +690,8 @@ int rgpGpuEvaluate
 
     rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, gBuf.T, gBuf.Y, gBuf.rho, gBuf.mu, gBuf.kappa
+        kp, nCells, gBuf.p, gBuf.T, gBuf.Y,
+        gBuf.rho, gBuf.mu, gBuf.kappa, gBuf.Cp, gBuf.Cv, gBuf.psi
     );
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "evaluate/launch");
@@ -642,6 +702,12 @@ int rgpGpuEvaluate
         != cudaSuccess) return fail(e, "evaluate/D2H mu");
     if ((e = cudaMemcpy(kappa, gBuf.kappa, b1, cudaMemcpyDeviceToHost))
         != cudaSuccess) return fail(e, "evaluate/D2H kappa");
+    if ((e = cudaMemcpy(Cp, gBuf.Cp, b1, cudaMemcpyDeviceToHost))
+        != cudaSuccess) return fail(e, "evaluate/D2H Cp");
+    if ((e = cudaMemcpy(Cv, gBuf.Cv, b1, cudaMemcpyDeviceToHost))
+        != cudaSuccess) return fail(e, "evaluate/D2H Cv");
+    if ((e = cudaMemcpy(psi, gBuf.psi, b1, cudaMemcpyDeviceToHost))
+        != cudaSuccess) return fail(e, "evaluate/D2H psi");
 
     return 0;
 }

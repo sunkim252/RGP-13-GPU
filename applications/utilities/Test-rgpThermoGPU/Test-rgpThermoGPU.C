@@ -60,7 +60,10 @@ void cpuReference
     const scalar T,
     scalar& rho,
     scalar& mu,
-    scalar& kappa
+    scalar& kappa,
+    scalar& Cp,
+    scalar& Cv,
+    scalar& psi
 )
 {
     const label n = Y.size();
@@ -106,6 +109,9 @@ void cpuReference
     rho = t.rho(p, T);
     mu = t.mu(p, T);
     kappa = t.kappa(p, T);
+    Cp = t.Cp(p, T);
+    Cv = t.Cv(p, T);
+    psi = t.psi(p, T);
 }
 
 
@@ -185,6 +191,7 @@ int main(int argc, char *argv[])
     // ── CPU 레퍼런스 + GPU 입력 패킹 ─────────────────────────────────
     scalarList pF(nStates), TF(nStates), YF(nStates*n);
     scalarList rhoCPU(nStates), muCPU(nStates), kappaCPU(nStates);
+    scalarList CpCPU(nStates), CvCPU(nStates), psiCPU(nStates);
 
     label s = 0;
     forAll(comps, c)
@@ -202,7 +209,8 @@ int main(int argc, char *argv[])
                 cpuReference
                 (
                     mix, comps[c], pF[s], TF[s],
-                    rhoCPU[s], muCPU[s], kappaCPU[s]
+                    rhoCPU[s], muCPU[s], kappaCPU[s],
+                    CpCPU[s], CvCPU[s], psiCPU[s]
                 );
                 s++;
             }
@@ -233,10 +241,12 @@ int main(int argc, char *argv[])
     Info<< "GPU tables uploaded (" << n << " species)" << nl;
 
     scalarList rhoGPU(nStates), muGPU(nStates), kappaGPU(nStates);
+    scalarList CpGPU(nStates), CvGPU(nStates), psiGPU(nStates);
     err = rgpGpuEvaluate
     (
         nStates, pF.begin(), TF.begin(), YF.begin(),
-        rhoGPU.begin(), muGPU.begin(), kappaGPU.begin()
+        rhoGPU.begin(), muGPU.begin(), kappaGPU.begin(),
+        CpGPU.begin(), CvGPU.begin(), psiGPU.begin()
     );
     if (err)
     {
@@ -252,16 +262,23 @@ int main(int argc, char *argv[])
     };
 
     scalar maxRho = 0, maxMu = 0, maxKappa = 0;
-    label iRho = -1, iMu = -1, iKappa = -1;
+    scalar maxCp = 0, maxCv = 0, maxPsi = 0;
+    label iRho = -1, iMu = -1, iKappa = -1, iCp = -1, iCv = -1, iPsi = -1;
 
     for (label i = 0; i < nStates; i++)
     {
         const scalar er = relErr(rhoCPU[i], rhoGPU[i]);
         const scalar em = relErr(muCPU[i], muGPU[i]);
         const scalar ek = relErr(kappaCPU[i], kappaGPU[i]);
+        const scalar ecp = relErr(CpCPU[i], CpGPU[i]);
+        const scalar ecv = relErr(CvCPU[i], CvGPU[i]);
+        const scalar eps = relErr(psiCPU[i], psiGPU[i]);
         if (er > maxRho) { maxRho = er; iRho = i; }
         if (em > maxMu) { maxMu = em; iMu = i; }
         if (ek > maxKappa) { maxKappa = ek; iKappa = i; }
+        if (ecp > maxCp) { maxCp = ecp; iCp = i; }
+        if (ecv > maxCv) { maxCv = ecv; iCv = i; }
+        if (eps > maxPsi) { maxPsi = eps; iPsi = i; }
     }
 
     auto report = [&](const char* name, scalar e, label i,
@@ -281,18 +298,27 @@ int main(int argc, char *argv[])
     report("rho  ", maxRho, iRho, rhoCPU, rhoGPU);
     report("mu   ", maxMu, iMu, muCPU, muGPU);
     report("kappa", maxKappa, iKappa, kappaCPU, kappaGPU);
+    report("Cp   ", maxCp, iCp, CpCPU, CpGPU);
+    report("Cv   ", maxCv, iCv, CvCPU, CvGPU);
+    report("psi  ", maxPsi, iPsi, psiCPU, psiGPU);
 
     rgpGpuFree();
 
-    const scalar worst = max(maxRho, max(maxMu, maxKappa));
-    if (worst <= tol)
+    // psi는 전방 FD (rho1-rho0)/dp -- rho의 ULP급 차이가 차분 소거로
+    // ~1e5배 증폭되므로 해석적 5개 물성과 별도 허용오차(1e4*tol)를 쓴다.
+    const scalar psiTol = 1e4*tol;
+    const scalar worst =
+        max(maxRho, max(maxMu, max(maxKappa, max(maxCp, maxCv))));
+    if (worst <= tol && maxPsi <= psiTol)
     {
-        Info<< nl << "PASS (worst " << worst << " <= tol " << tol << ")"
+        Info<< nl << "PASS (analytic worst " << worst << " <= tol " << tol
+            << "; psi " << maxPsi << " <= " << psiTol << " [FD])"
             << nl << endl;
         return 0;
     }
 
-    Info<< nl << "FAIL (worst " << worst << " > tol " << tol << ")"
+    Info<< nl << "FAIL (analytic worst " << worst << " vs tol " << tol
+        << "; psi " << maxPsi << " vs " << psiTol << ")"
         << nl << endl;
     return 1;
 }

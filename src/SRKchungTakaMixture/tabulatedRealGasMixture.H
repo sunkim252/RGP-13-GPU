@@ -41,6 +41,7 @@ Description
 #include "List.H"
 #include "word.H"
 #include "scalarField.H"
+#include "scalarList.H"
 #include "labelList.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -198,6 +199,37 @@ public:
 
         //- Disable the tabulated lookup (revert to live O(n^2) mixing).
         virtual void disableCoeffTabulation() const = 0;
+
+
+    // thermoGPU offload support
+
+        //- Export the species-constant / pair-mixing tables needed by the
+        //  thermoGPU CUDA kernels, as flat arrays (pure Foam data — this
+        //  interface carries NO CUDA dependency; the fgmFluid solver passes
+        //  the arrays to the rgpThermoGPU C ABI). pair holds the 9 [n*n]
+        //  row-major matrices in kernel order:
+        //    COEF1, COEF2, COEF3, SIGMA3M, EPSILONKM0, OMEGAM0, MM0,
+        //    MIUIM0, KAPPAIM.
+        //  janafHigh/janafLow are the mass-basis Cp coefficients [7n];
+        //  the janaf ranges follow the OF mixing convention (species 0).
+        //  Returns false when the backend does not support GPU offload
+        //  (default — e.g. the Ely-Hanley mixture, not yet kernelised).
+        virtual bool gpuThermoTables
+        (
+            scalarList& W,
+            scalarList& BM,
+            scalarList& CM,
+            scalarList& janafHigh,
+            scalarList& janafLow,
+            List<scalarList>& pair,
+            scalar& TlowJ,
+            scalar& ThighJ,
+            scalar& Tcommon,
+            bool& stableRoot
+        ) const
+        {
+            return false;
+        }
 };
 
 

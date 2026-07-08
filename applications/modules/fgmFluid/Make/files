@@ -3,5 +3,6 @@ setRDeltaT.C
 thermophysicalPredictor.C
 momentumPredictor.C
 pressureCorrector.C
+gpuThermoCorrect.C
 
 LIB = $(FOAM_USER_LIBBIN)/libfgmFluid

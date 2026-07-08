@@ -216,6 +216,21 @@ protected:
         //- True when at least one tabulated Lewis-number field is active.
         bool tabLewis_;
 
+        //- thermoGPU: offload the per-cell property refresh (the
+        //  RhoFluidThermo::calculate() loop -- Cp/Cv/psi/rho/mu/kappa at the
+        //  tabulated (p, T, Y)) to the CUDA kernels. Opt-in via
+        //  'gpuThermo on;' in fgmProperties; requires the SRKchungTaka
+        //  (Chung) mixture and a visible CUDA device.
+        Switch gpuThermo_;
+
+        //- True once the GPU tables have been uploaded (lazy, first call).
+        bool gpuArmed_;
+
+        //- Reusable host-side gather/scatter buffers for the GPU evaluate
+        //  (internal cells + all patch faces, grow-only).
+        List<double> gpuP_, gpuT_, gpuY_;
+        List<double> gpuRho_, gpuMu_, gpuKappa_, gpuCp_, gpuCv_, gpuPsi_;
+
         //- Multivariate convection field table (he, Z, C)
         multivariateSurfaceInterpolationScheme<scalar>::fieldTable fields;
 
@@ -263,6 +278,21 @@ private:
         //  nullptr when the table does not tabulate Le for it (constant Le_
         //  fallback). Tier-4 differential-diffusion hook.
         const volScalarField* leField(const word& var) const;
+
+        //- thermoGPU: one-time arming -- export the mixture tables via the
+        //  tabulatedRealGasMixture::gpuThermoTables hook and upload them to
+        //  the CUDA device. FatalError when 'gpuThermo on;' cannot be
+        //  honoured (unsupported mixture / no device), so a requested GPU
+        //  run never silently falls back to the CPU.
+        void armGpuThermo();
+
+        //- thermoGPU: replacement for thermo_.correct() -- batch-evaluate
+        //  Cp/Cv/psi/rho/mu/kappa at the tabulated (p, T, Y) on the GPU for
+        //  the internal cells and all patch faces, and scatter into the
+        //  thermo fields. T is NOT re-inverted from he (it is the manifold
+        //  temperature set in updateManifold; the CPU inversion just returns
+        //  it to Newton tolerance).
+        void gpuThermoCorrect();
 
         //- Effective (dynamic) diffusivity [kg/m/s] for a transported control
         //  variable, using its Lewis number:

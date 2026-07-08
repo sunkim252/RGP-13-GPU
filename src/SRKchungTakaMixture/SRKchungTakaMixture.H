@@ -375,6 +375,23 @@ public:
         //- Disable the tabulated lookup (revert to live mixing).
         virtual void disableCoeffTabulation() const;
 
+        //- thermoGPU: export the species-constant / pair-mixing tables as
+        //  flat arrays for the CUDA kernel upload (tabulatedRealGasMixture
+        //  hook — pure Foam data, no CUDA dependency in this library).
+        virtual bool gpuThermoTables
+        (
+            scalarList& W,
+            scalarList& BM,
+            scalarList& CM,
+            scalarList& janafHigh,
+            scalarList& janafLow,
+            List<scalarList>& pair,
+            scalar& TlowJ,
+            scalar& ThighJ,
+            scalar& Tcommon,
+            bool& stableRoot
+        ) const;
+
 
     // thermoGPU bridge access (raw coefficient tables, read-only)
     // 생성자에서 빌드된 종-상수/쌍-혼합 테이블을 GPU 커널 업로드용으로
