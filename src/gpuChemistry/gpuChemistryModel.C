@@ -10,7 +10,11 @@
 #include "gpu/rgpKernelTypes.H"
 
 #include "gpu/rgpChemRHS.H"
-#include "gpu/rgpH2O2Burke.H"
+#include "OStringStream.H"
+#include "IStringStream.H"
+#include "Tuple2.H"
+#include "thermodynamicConstants.H"
+#include <cstring>
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
@@ -44,35 +48,131 @@ Foam::gpuChemistryModel<ThermoType>::~gpuChemistryModel()
 template<class ThermoType>
 void Foam::gpuChemistryModel<ThermoType>::armGpu() const
 {
-    static const char* mechNames[nSp9] =
-        {"H2", "O2", "H", "O", "OH", "HO2", "H2O2", "H2O", "N2"};
+    // ── 메커니즘 export: base chemistryModel이 파싱한 종/반응을 POD로 ──
+    // 반응 파라미터는 Reaction::write() 라운드트립(dict)에서 추출 —
+    // 타입별 멤버 접근 없이 모든 등록 타입을 일반 처리.
+    memset(&mech_, 0, sizeof(mech_));
 
-    rgpBuildBurke2012(mech_);
-
-    const speciesTable& species = this->thermo().species();
-    if (species.size() != mech_.nSpecies)
+    const PtrList<ThermoType>& sTh = this->specieThermos();
+    const label ns = sTh.size();
+    if (ns > RGP_CHEM_MAX_SPECIES)
     {
         FatalErrorInFunction
-            << "gpu chemistry (Burke 2012 H2/O2) requires exactly "
-            << mech_.nSpecies << " species; case has " << species.size()
-            << exit(FatalError);
+            << "gpu chemistry supports up to " << RGP_CHEM_MAX_SPECIES
+            << " species; case has " << ns << exit(FatalError);
+    }
+    mech_.nSpecies = ns;
+    mech_.RR = constant::thermodynamic::RR;
+    // OF의 Kc 기준압 (etc/controlDict Pstd, 기본 1e5 Pa — CHEMKIN 101325와
+    // 다름). 솔버 경로는 OF와의 정합이 우선이므로 OF 값을 따른다.
+    mech_.pRef = constant::thermodynamic::Pstd;
+
+    forAll(sTh, i)
+    {
+        const scalar W = sTh[i].W();
+        mech_.W[i] = W;
+        mech_.Tcommon[i] = sTh[i].Tcommon();
+        // OF janaf 계수는 질량기준(x R_specific) 저장 — 커널은 무차원
+        // NASA7을 기대하므로 역변환.
+        const scalar Rinv = W/constant::thermodynamic::RR;
+        const auto& hc = sTh[i].highCpCoeffs();
+        const auto& lc = sTh[i].lowCpCoeffs();
+        for (label c = 0; c < 7; c++)
+        {
+            mech_.janafHigh[i][c] = hc[c]*Rinv;
+            mech_.janafLow[i][c] = lc[c]*Rinv;
+        }
     }
 
-    map_.setSize(mech_.nSpecies, -1);
-    for (int m = 0; m < mech_.nSpecies; m++)
+    const PtrList<Reaction<ThermoType>>& rxns = this->reactions();
+    if (rxns.size() > RGP_CHEM_MAX_REACTIONS)
     {
-        forAll(species, i)
+        FatalErrorInFunction
+            << "gpu chemistry supports up to " << RGP_CHEM_MAX_REACTIONS
+            << " reactions; mechanism has " << rxns.size()
+            << exit(FatalError);
+    }
+    mech_.nReactions = rxns.size();
+
+    const speciesTable& species = this->thermo().species();
+
+    forAll(rxns, r)
+    {
+        const Reaction<ThermoType>& rx = rxns[r];
+
+        // 양론 (elementary 가정: exponent == stoichCoeff)
+        forAll(rx.lhs(), k)
         {
-            if (species[i] == word(mechNames[m])) { map_[m] = i; break; }
+            mech_.nuL[r][rx.lhs()[k].index] += rx.lhs()[k].stoichCoeff;
         }
-        if (map_[m] < 0)
+        forAll(rx.rhs(), k)
         {
-            FatalErrorInFunction
-                << "specie " << mechNames[m]
-                << " (Burke 2012 H2/O2) not found in the case species "
-                << species << exit(FatalError);
+            mech_.nuR[r][rx.rhs()[k].index] += rx.rhs()[k].stoichCoeff;
+        }
+
+        const word typ = rx.type();
+        mech_.reversible[r] =
+            typ.find("irreversible") == string::npos ? 1 : 0;
+
+        // dict 라운드트립
+        OStringStream buf;
+        rx.write(buf);
+        IStringStream is(buf.str());
+        dictionary d(is);
+
+        auto readArr = [&](const dictionary& ad, double& A, double& b,
+                           double& Ta)
+        {
+            A = ad.lookup<scalar>("A");
+            b = ad.lookup<scalar>("beta");
+            Ta = ad.lookup<scalar>("Ta");
+        };
+        auto readEff = [&](const dictionary& ed)
+        {
+            for (int s = 0; s < ns; s++) { mech_.eff[r][s] = 1.0; }
+            List<Tuple2<word, scalar>> ce(ed.lookup("coeffs"));
+            forAll(ce, k)
+            {
+                const label si = species[ce[k].first()];
+                mech_.eff[r][si] = ce[k].second();
+            }
+        };
+
+        if (d.found("k0"))                       // 폴오프
+        {
+            readArr(d.subDict("kInf"), mech_.A[r], mech_.beta[r], mech_.Ta[r]);
+            readArr(d.subDict("k0"), mech_.A0[r], mech_.beta0[r], mech_.Ta0[r]);
+            if (d.found("F"))
+            {
+                const dictionary& F = d.subDict("F");
+                mech_.tbType[r] = RGP_TB_TROE;
+                mech_.troe[r][0] = F.lookup<scalar>("alpha");
+                mech_.troe[r][1] = F.lookup<scalar>("Tsss");
+                mech_.troe[r][2] = F.lookup<scalar>("Ts");
+                mech_.troe[r][3] = F.lookupOrDefault<scalar>("Tss", 0);
+            }
+            else
+            {
+                mech_.tbType[r] = RGP_TB_LIND;
+            }
+            readEff(d.subDict("thirdBodyEfficiencies"));
+        }
+        else if (d.found("coeffs"))              // +M 3체
+        {
+            mech_.tbType[r] = RGP_TB_M;
+            readArr(d, mech_.A[r], mech_.beta[r], mech_.Ta[r]);
+            readEff(d);
+        }
+        else                                     // 일반 Arrhenius
+        {
+            mech_.tbType[r] = RGP_TB_NONE;
+            readArr(d, mech_.A[r], mech_.beta[r], mech_.Ta[r]);
         }
     }
+
+    // 항등 매핑 (mech 종 순서 == 케이스 종 순서)
+    map_.setSize(ns);
+    forAll(map_, i) { map_[i] = i; }
 
     const int nDev = max(rgpGpuDeviceCount(), 1);
     if (rgpChemInit(Pstream::parRun() ? (Pstream::myProcNo() % nDev) : -1))
@@ -86,10 +186,10 @@ void Foam::gpuChemistryModel<ThermoType>::armGpu() const
             << "rgpChemUpload: " << rgpChemLastError() << exit(FatalError);
     }
 
-    Info<< "gpuChemistryModel: ARMED — Burke 2012 H2/O2 ("
-        << mech_.nSpecies << " sp / " << mech_.nReactions
-        << " rev. reactions) on the CUDA device; relTol " << relTol_
-        << ", absTol " << absTol_ << nl << endl;
+    Info<< "gpuChemistryModel: ARMED — " << ns << " species / "
+        << mech_.nReactions << " reactions exported from the case "
+        << "mechanism (pRef = " << mech_.pRef << " Pa); relTol "
+        << relTol_ << ", absTol " << absTol_ << nl << endl;
 
     armed_ = true;
 }

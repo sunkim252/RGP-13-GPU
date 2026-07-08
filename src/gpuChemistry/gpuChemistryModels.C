@@ -6,8 +6,17 @@
 
 #include "gpuChemistryModel.H"
 
-#include "forGases.H"
 #include "addToRunTimeSelectionTable.H"
+
+// janaf 기반 기체 thermo만 등록 (armGpu가 janaf 계수 접근자를 요구)
+#include "specie.H"
+#include "perfectGas.H"
+#include "janafThermo.H"
+#include "sensibleEnthalpy.H"
+#include "sensibleInternalEnergy.H"
+#include "thermo.H"
+#include "sutherlandTransport.H"
+#include "constTransport.H"
 
 #define makeGpuChemistryModel(nullArg, ThermoPhysics)                          \
                                                                                \
@@ -33,7 +42,19 @@
 
 namespace Foam
 {
-    forCoeffGases(makeGpuChemistryModel, nullArg);
+    typedef sutherlandTransport<species::thermo
+        <janafThermo<perfectGas<specie>>, sensibleEnthalpy>>
+        gpuGasHsSuth;
+    typedef constTransport<species::thermo
+        <janafThermo<perfectGas<specie>>, sensibleEnthalpy>>
+        gpuGasHsConst;
+    typedef sutherlandTransport<species::thermo
+        <janafThermo<perfectGas<specie>>, sensibleInternalEnergy>>
+        gpuGasEsSuth;
+
+    makeGpuChemistryModel(nullArg, gpuGasHsSuth);
+    makeGpuChemistryModel(nullArg, gpuGasHsConst);
+    makeGpuChemistryModel(nullArg, gpuGasEsSuth);
 }
 
 // ************************************************************************* //
