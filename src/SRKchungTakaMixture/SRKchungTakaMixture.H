@@ -374,6 +374,24 @@ public:
 
         //- Disable the tabulated lookup (revert to live mixing).
         virtual void disableCoeffTabulation() const;
+
+
+    // thermoGPU bridge access (raw coefficient tables, read-only)
+    // 생성자에서 빌드된 종-상수/쌍-혼합 테이블을 GPU 커널 업로드용으로
+    // 노출한다 (rgpGpuBridge.H). k_ij는 COEF1..3에 이미 반영돼 있음.
+
+        const List<scalar>& gpuListW() const { return ListW_; }
+        const List<scalar>& gpuBM() const { return BM_; }
+        const List<scalar>& gpuCM() const { return CM_; }
+        const List<List<scalar>>& gpuCOEF1() const { return COEF1_; }
+        const List<List<scalar>>& gpuCOEF2() const { return COEF2_; }
+        const List<List<scalar>>& gpuCOEF3() const { return COEF3_; }
+        const List<List<scalar>>& gpuSIGMA3M() const { return SIGMA3M_; }
+        const List<List<scalar>>& gpuEPSILONKM0() const { return EPSILONKM0_; }
+        const List<List<scalar>>& gpuOMEGAM0() const { return OMEGAM0_; }
+        const List<List<scalar>>& gpuMM0() const { return MM0_; }
+        const List<List<scalar>>& gpuMIUIM0() const { return MIUIM0_; }
+        const List<List<scalar>>& gpuKAPPAIM() const { return KAPPAIM_; }
 };
 
 

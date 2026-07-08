@@ -1,21 +1,20 @@
 #!/bin/bash
 #------------------------------------------------------------------------------
-# RGP-13 build script
+# RGP-13 thermoGPU build script
+#
+# librgpThermoGPU.so (Foam-free CUDA 커널) + Test-rgpThermoGPU 검증 유틸을
+# 빌드한다. 메인 플러그인(libRGP13realFluid.so)은 상위 ./Allwmake로 먼저
+# 빌드돼 있어야 한다.
 #
 # Usage (inside container):
-#   cd $LIB_RGP13_SRC/../build
-#   ./Allwmake
-#
-# 또는:
-#   apptainer exec --nv openfoam13-cuda.sif bash -c \
-#       "source /opt/OpenFOAM-13/etc/bashrc && cd /home/openfoam/RGP-13/build && ./Allwmake"
+#   source /opt/OpenFOAM/OpenFOAM-13/etc/bashrc
+#   export LIB_RGP13_SRC=<repo>/src        # fgmFluid/유틸 Make 컨벤션
+#   ./build/Allwmake
 #------------------------------------------------------------------------------
 cd "${0%/*}" || exit 1
 
-# Verify environment
 if [ -z "$WM_PROJECT_DIR" ]; then
     echo "Error: OpenFOAM environment not sourced." >&2
-    echo "       Run: source /opt/OpenFOAM-13/etc/bashrc" >&2
     exit 1
 fi
 
@@ -27,18 +26,23 @@ fi
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 
 echo "========================================"
-echo " RGP-13 Build"
-echo "   OpenFOAM : $(foamVersion 2>/dev/null || echo $WM_PROJECT_VERSION)"
+echo " RGP-13 thermoGPU Build"
+echo "   OpenFOAM : ${WM_PROJECT_VERSION}"
 echo "   CUDA     : $(nvcc --version | grep release | awk '{print $6}')"
-echo "   Compiler : $WM_COMPILER"
-echo "   Target   : $FOAM_USER_LIBDIR"
+echo "   Target   : $FOAM_USER_LIBBIN"
 echo "========================================"
 
-# Build thermoGPU library
-cd ../src/thermoGPU && wmake libso 2>&1
+set -e
+
+# CUDA 커널 라이브러리 (Foam-free)
+( cd ../src/thermoGPU && wmake libso )
+
+# CPU 대조 검증 유틸리티
+( cd ../applications/utilities/Test-rgpThermoGPU && wmake )
 
 echo ""
 echo "── Build complete ──"
-ls -lh $FOAM_USER_LIBDIR/librgpThermoGPU.so 2>/dev/null \
-    && echo "OK: librgpThermoGPU.so" \
-    || echo "FAILED: library not found"
+ls -lh "$FOAM_USER_LIBBIN/librgpThermoGPU.so" "$FOAM_USER_APPBIN/Test-rgpThermoGPU"
+echo ""
+echo "Verify (needs GPU; on WSL2 add --nv --bind /usr/lib/wsl):"
+echo "  Test-rgpThermoGPU testCases/counterflow_fgmFluid/constant/thermo.compressibleGas4S"

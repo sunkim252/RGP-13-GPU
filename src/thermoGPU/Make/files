@@ -1,5 +1,3 @@
-gpu/cudaDeviceManager.cu
-gpu/thermoKernels.cu
-rgpRhoThermo.C
+gpu/rgpKernels.cu
 
-LIB = $(FOAM_USER_LIBDIR)/librgpThermoGPU
+LIB = $(FOAM_USER_LIBBIN)/librgpThermoGPU

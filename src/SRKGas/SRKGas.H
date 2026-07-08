@@ -200,6 +200,12 @@ public:
             return "SRKGas<" + word(Specie::typeName_()) + '>';
         }
 
+        //- Cubic root-selection policy (thermoGPU bridge access)
+        static bool stableRoot()
+        {
+            return stableRoot_;
+        }
+
         // Fundamental properties
 
             //- Is the equation of state is incompressible i.e. rho != f(p)

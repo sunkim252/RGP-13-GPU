@@ -1,0 +1,25 @@
+EXE_INC = \
+    -I../../../src/SRKchungTakaMixture \
+    -I../../../src/SRKGas \
+    -I../../../src/chungTransport \
+    -I../../../src/rfSpecie \
+    -I../../../src/FGM \
+    -I../../../src/include \
+    -I../../../src/thermoGPU \
+    -I$(LIB_SRC)/physicalProperties/lnInclude \
+    -I$(LIB_SRC)/thermophysicalModels/basic/lnInclude \
+    -I$(LIB_SRC)/thermophysicalModels/specie/lnInclude \
+    -I$(LIB_SRC)/thermophysicalModels/multicomponentThermo/lnInclude \
+    -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/meshTools/lnInclude
+
+EXE_LIBS = \
+    -L$(FOAM_USER_LIBBIN) \
+    -lRGP13realFluid \
+    -lrgpThermoGPU \
+    -lfluidThermophysicalModels \
+    -lmulticomponentThermophysicalModels \
+    -lspecie \
+    -lfiniteVolume \
+    -lmeshTools \
+    -lOpenFOAM
