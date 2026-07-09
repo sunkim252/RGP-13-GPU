@@ -123,6 +123,9 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
     if (gpuP_.size() < N)
     {
         gpuP_.setSize(N);      gpuT_.setSize(N);      gpuY_.setSize(N*n);
+    }
+    if (gpuRho_.size() < N)   // gpuHeReseed는 입력 버퍼만 사이징한다
+    {
         gpuRho_.setSize(N);    gpuMu_.setSize(N);     gpuKappa_.setSize(N);
         gpuCp_.setSize(N);     gpuCv_.setSize(N);     gpuPsi_.setSize(N);
     }
@@ -231,6 +234,114 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
             kappap[fi] = gpuKappa_[off + fi];
             Cpp[fi]    = gpuCp_[off + fi];
             Cvp[fi]    = gpuCv_[off + fi];
+        }
+        off += np;
+    }
+}
+
+
+void Foam::solvers::fgmFluid::gpuHeReseed()
+{
+    if (!gpuArmed_)
+    {
+        armGpuThermo();
+    }
+
+    const label n = Y_.size();
+    const label nInt = mesh.nCells();
+
+    const volScalarField& pf = thermo_.p();
+    const volScalarField& Tf = thermo_.T();
+
+    // 배치 크기: 내부 셀 + 전체 패치 면 (thermo_.he(p,T) 대입과 동일 범위)
+    label N = nInt;
+    forAll(Tf.boundaryField(), patchi)
+    {
+        N += Tf.boundaryField()[patchi].size();
+    }
+
+    if (gpuP_.size() < N)
+    {
+        gpuP_.setSize(N);  gpuT_.setSize(N);  gpuY_.setSize(N*n);
+    }
+    if (gpuCp_.size() < N)
+    {
+        gpuCp_.setSize(N);   // ha 출력 버퍼로 재사용
+    }
+
+    // ── gather: 내부 셀 ──────────────────────────────────────────────
+    {
+        const scalarField& pc = pf.primitiveField();
+        const scalarField& Tc = Tf.primitiveField();
+        for (label i = 0; i < nInt; i++)
+        {
+            gpuP_[i] = pc[i];
+            gpuT_[i] = Tc[i];
+        }
+        for (label s = 0; s < n; s++)
+        {
+            const scalarField& Ys = Y_[s].primitiveField();
+            for (label i = 0; i < nInt; i++)
+            {
+                gpuY_[i*n + s] = Ys[i];
+            }
+        }
+    }
+
+    // ── gather: 패치 면 ──────────────────────────────────────────────
+    label off = nInt;
+    forAll(Tf.boundaryField(), patchi)
+    {
+        const fvPatchScalarField& pp = pf.boundaryField()[patchi];
+        const fvPatchScalarField& Tp = Tf.boundaryField()[patchi];
+        const label np = Tp.size();
+        for (label fi = 0; fi < np; fi++)
+        {
+            gpuP_[off + fi] = pp[fi];
+            gpuT_[off + fi] = Tp[fi];
+        }
+        for (label s = 0; s < n; s++)
+        {
+            const fvPatchScalarField& Yp = Y_[s].boundaryField()[patchi];
+            for (label fi = 0; fi < np; fi++)
+            {
+                gpuY_[(off + fi)*n + s] = Yp[fi];
+            }
+        }
+        off += np;
+    }
+
+    // ── GPU 일괄 ha 평가 ─────────────────────────────────────────────
+    const int err = rgpGpuEvaluateHa
+    (
+        N,
+        gpuP_.begin(), gpuT_.begin(), gpuY_.begin(), gpuCp_.begin()
+    );
+    if (err)
+    {
+        FatalErrorInFunction
+            << "rgpGpuEvaluateHa (" << N << " states): "
+            << rgpGpuLastError()
+            << exit(FatalError);
+    }
+
+    // ── scatter: he (내부 + 경계, thermo_.he(p,T) 대입과 동일 커버리지) ─
+    volScalarField& he = thermo_.he();
+    {
+        scalarField& hec = he.primitiveFieldRef();
+        for (label i = 0; i < nInt; i++)
+        {
+            hec[i] = gpuCp_[i];
+        }
+    }
+    off = nInt;
+    forAll(he.boundaryField(), patchi)
+    {
+        fvPatchScalarField& hep = he.boundaryFieldRef()[patchi];
+        const label np = hep.size();
+        for (label fi = 0; fi < np; fi++)
+        {
+            hep[fi] = gpuCp_[off + fi];
         }
         off += np;
     }

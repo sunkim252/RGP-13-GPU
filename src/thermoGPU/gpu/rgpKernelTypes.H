@@ -70,6 +70,18 @@ int  rgpGpuEvaluate
     double* psi
 );
 
+/*  ha [J/kg] 일괄 평가: janafThermo::ha(질량 블렌드) + SRK 믹스처
+    departure — updateManifold의 he 재시드 thermo_.he(p,T) 대체.
+    rgpGpuUpload로 올린 동일 테이블 사용.                              */
+int  rgpGpuEvaluateHa
+(
+    int nCells,
+    const double* p,
+    const double* T,
+    const double* Y,
+    double* ha
+);
+
 void rgpGpuFree(void);
 const char* rgpGpuLastError(void);
 

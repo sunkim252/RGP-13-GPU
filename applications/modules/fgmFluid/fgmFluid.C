@@ -30,6 +30,9 @@ License
 #include "addToRunTimeSelectionTable.H"
 #include "tabulatedRealGasMixture.H"
 #include "Switch.H"
+#include "gpu/rgpFgmTypes.H"
+#include <cstring>
+#include <chrono>
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -118,6 +121,9 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     gpuThermo_(fgmTable_.lookupOrDefault<Switch>("gpuThermo", false)),
     gpuArmed_(false),
+    gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
+    gpuManifoldArmed_(false),
+    gpuNFields_(0),
     thermoTimings_(fgmTable_.lookupOrDefault<Switch>("thermoTimings", false)),
 
     thermophysicalTransport
@@ -804,6 +810,122 @@ void Foam::solvers::fgmFluid::updateManifold()
     // (T, Y) permanently consistent.
     scalarField& Tc = thermo_.T().primitiveFieldRef();
 
+    // fgmGPU: 셀 루프 전체(대수 gZ/chi_st 클로저 + 전 필드 16-코너 보간)를
+    // CUDA로 오프로드. 커널(rgpFgmKernels.cu)은 bracket/makeStencil/
+    // interpolate의 부동소수 순서까지 1:1 포트이므로 결과가 비트-동일해야
+    // 한다. 경계면 처리와 he 재시드는 CPU에 남는다(v1).
+    std::chrono::steady_clock::time_point tSec;
+    if (thermoTimings_) { tSec = std::chrono::steady_clock::now(); }
+
+    bool gpuDone = false;
+    if (gpuManifold_)
+    {
+        // 1회 아밍: 축 4개 + [sourcePV, T, Y_k.., RG_.., LeZ?, LeC?] 순서로
+        // 연접한 테이블을 업로드 (테이블은 런 중 불변; 산포 순서와 동일).
+        if (!gpuManifoldArmed_)
+        {
+            DynamicList<const List<scalar>*> tbls;
+            tbls.append(&srcTbl);
+            tbls.append(&Ttbl);
+            forAll(Ytbl, k) { tbls.append(Ytbl[k]); }
+            forAll(RGtbl, k) { tbls.append(RGtbl[k]); }
+            if (fillLeZ) { tbls.append(LeZtbl); }
+            if (fillLeC) { tbls.append(LeCtbl); }
+
+            gpuNFields_ = tbls.size();
+            const label nTot = srcTbl.size();
+            List<double> flat(gpuNFields_*nTot);
+            forAll(tbls, f)
+            {
+                std::memcpy
+                (
+                    flat.begin() + f*nTot,
+                    tbls[f]->begin(),
+                    nTot*sizeof(double)
+                );
+            }
+
+            const int rc = rgpFgmUpload
+            (
+                fgmTable_.nZ(), fgmTable_.nGz(),
+                fgmTable_.nC(), fgmTable_.nChi(),
+                fgmTable_.Zaxis().begin(), fgmTable_.gZaxis().begin(),
+                fgmTable_.Caxis().begin(), fgmTable_.chiAxis().begin(),
+                gpuNFields_, flat.begin()
+            );
+
+            if (rc == 0)
+            {
+                gpuManifoldArmed_ = true;
+                Info<< "fgmFluid: GPU manifold armed -- " << gpuNFields_
+                    << " fields x " << nTot << " table entries" << nl << endl;
+            }
+            else
+            {
+                WarningInFunction
+                    << "GPU manifold table upload failed ("
+                    << rgpFgmLastError() << ") -- falling back to CPU"
+                    << endl;
+                gpuManifold_ = Switch(false);
+            }
+        }
+
+        if (gpuManifoldArmed_)
+        {
+            const label nc = gZc.size();
+            gpuFgmOut_.setSize(gpuNFields_*nc);
+
+            const int mode4 = !use4D ? 0 : (useH ? 2 : (useW ? 3 : 1));
+            const double* hw =
+                useH ? hcl->begin() : (useW ? Wcl->begin() : nullptr);
+
+            const int rc = rgpFgmEvaluate
+            (
+                nc, mode4,
+                Cv_, shape_Zst, chiClampMin_, chiClampMax_,
+                sourcePVscale_, fgmTable_.chi0(), hOxb, hFuelb,
+                Wlo, Whi,
+                Zc.begin(), Cc.begin(), rhoc.begin(),
+                Lsqr.begin(), magSqrGradZ.begin(), DeffZ.begin(),
+                hw,
+                gZc.begin(), chic.begin(), gpuFgmOut_.begin()
+            );
+
+            if (rc != 0)
+            {
+                FatalErrorInFunction
+                    << "rgpFgmEvaluate failed: " << rgpFgmLastError()
+                    << exit(FatalError);
+            }
+
+            // SoA 슬라이스 산포 (필드 순서는 아밍 때의 연접 순서와 동일)
+            const double* out = gpuFgmOut_.begin();
+            const size_t bytes = nc*sizeof(double);
+            label f = 0;
+            std::memcpy(srcc.begin(), out + (f++)*nc, bytes);
+            std::memcpy(Tc.begin(),   out + (f++)*nc, bytes);
+            forAll(Yref, k)
+            {
+                std::memcpy(Yref[k]->begin(), out + (f++)*nc, bytes);
+            }
+            forAll(RGref, k)
+            {
+                std::memcpy(RGref[k]->begin(), out + (f++)*nc, bytes);
+            }
+            if (fillLeZ)
+            {
+                std::memcpy(LeZc->begin(), out + (f++)*nc, bytes);
+            }
+            if (fillLeC)
+            {
+                std::memcpy(LeCc->begin(), out + (f++)*nc, bytes);
+            }
+
+            gpuDone = true;
+        }
+    }
+
+    if (!gpuDone)
     forAll(gZc, celli)
     {
         const scalar Zcl = max(min(Zc[celli], scalar(1)), scalar(0));
@@ -888,6 +1010,15 @@ void Foam::solvers::fgmFluid::updateManifold()
         }
     }
 
+    if (thermoTimings_)
+    {
+        Info<< "manifold interp (" << (gpuDone ? "GPU" : "CPU") << ") = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tSec).count()
+            << " s" << endl;
+        tSec = std::chrono::steady_clock::now();
+    }
+
     gZ_.correctBoundaryConditions();
     chi_st_.correctBoundaryConditions();
     if (fillLeZ) { LeZField_->correctBoundaryConditions(); }
@@ -951,11 +1082,36 @@ void Foam::solvers::fgmFluid::updateManifold()
     // zeroGradient/outflow patches extrapolate the just-set internal field.
     thermo_.T().correctBoundaryConditions();
 
+    if (thermoTimings_)
+    {
+        Info<< "manifold boundary = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tSec).count()
+            << " s" << endl;
+        tSec = std::chrono::steady_clock::now();
+    }
+
     // Re-seed the energy field from (p, T_table) on the manifold composition.
     // he is now a DIAGNOSTIC consistent with the looked-up (T, Y), not a
     // transported variable -- thermo.correct() inverts it straight back to
     // T_table, so the energy state can never drift off the manifold.
-    thermo_.he() = thermo_.he(thermo_.p(), thermo_.T());
+    if (gpuManifold_)
+    {
+        // GPU 배치 ha(p, T_table, Y_table) — CPU he(p,T) 대입의 1:1 대체
+        gpuHeReseed();
+    }
+    else
+    {
+        thermo_.he() = thermo_.he(thermo_.p(), thermo_.T());
+    }
+
+    if (thermoTimings_)
+    {
+        Info<< "manifold he re-seed = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tSec).count()
+            << " s" << endl;
+    }
 }
 
 

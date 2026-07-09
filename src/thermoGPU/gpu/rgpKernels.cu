@@ -272,6 +272,119 @@ __device__ double srkPsi
 }
 
 
+//- 셀 하나의 ha [J/kg]: janafThermo::ha(질량기준 계수 블렌드) +
+//  SRKGas::h(믹스처 departure) — updateManifold의 he 재시드
+//  thermo_.he(p,T)의 1:1 포트. EOS 혼합은 rgpEvaluateKernel과 동일.
+__global__ void rgpHaKernel
+(
+    const KParams  kp,
+    const int      nCells,
+    const double* __restrict__ pF,
+    const double* __restrict__ TF,
+    const double* __restrict__ YF,
+    double* __restrict__ haF
+)
+{
+    const int celli = blockIdx.x*blockDim.x + threadIdx.x;
+    if (celli >= nCells) return;
+
+    const int n = kp.n;
+    const double RR = kp.RR;
+    const double* Yc = YF + (size_t)celli*n;
+
+    double X[RGP_GPU_MAX_SPECIES];
+
+    // ── compositionToX (원시 Y → 몰분율) ──────────────────────────────
+    double sumXb = 0.0;
+    for (int i = 0; i < n; i++) { sumXb += Yc[i]/kp.W[i]; }
+    if (sumXb == 0.0) { sumXb = 1e-30; }
+    for (int i = 0; i < n; i++)
+    {
+        X[i] = (Yc[i]/kp.W[i])/sumXb;
+        if (X[i] <= 0.0) { X[i] = 0.0; }
+    }
+
+    double sumY = 0.0, sumYoW = 0.0;
+    for (int i = 0; i < n; i++)
+    {
+        sumY += Yc[i];
+        sumYoW += Yc[i]/kp.W[i];
+    }
+    const double Wmix = (sumYoW != 0.0) ? sumY/sumYoW : kp.W[0];
+
+    // ── EOS 쌍 혼합 (ha에는 bM, coef1..3만 필요) ──────────────────────
+    double bM = 0, coef1 = 0, coef2 = 0, coef3 = 0;
+    for (int i = 0; i < n; i++)
+    {
+        bM += X[i]*kp.BM[i];
+        const double Xi2 = X[i]*X[i];
+        const int ii = i*n + i;
+        coef1 += Xi2*kp.C1[ii];
+        coef2 += Xi2*kp.C2[ii];
+        coef3 += Xi2*kp.C3[ii];
+    }
+    for (int i = 0; i < n; i++)
+    {
+        for (int j = i + 1; j < n; j++)
+        {
+            const double txx = 2.0*X[i]*X[j];
+            const int ij = i*n + j;
+            coef1 += txx*kp.C1[ij];
+            coef2 += txx*kp.C2[ij];
+            coef3 += txx*kp.C3[ij];
+        }
+    }
+
+    const double p = pF[celli];
+    const double T = TF[celli];
+
+    // ── JANAF 질량기준 계수 블렌드 + janafThermo::ha 적분식 ───────────
+    double aJ[7];
+    {
+        const double* tab = (T < kp.Tcommon) ? kp.jL : kp.jH;
+        const double invSumY = (sumY != 0.0) ? 1.0/sumY : 0.0;
+        for (int c = 0; c < 7; c++)
+        {
+            double acc = 0.0;
+            for (int i = 0; i < n; i++)
+            {
+                acc += Yc[i]*tab[7*i + c];
+            }
+            aJ[c] = acc*invSumY;
+        }
+    }
+
+    const double haJ =
+        ((((aJ[4]/5.0*T + aJ[3]/4.0)*T + aJ[2]/3.0)*T + aJ[1]/2.0)*T
+       + aJ[0])*T
+      + aJ[5];
+
+    // ── SRKGas::h — EOS departure (raw p, CPU와 동일한 B floor/분기) ──
+    double B = bM*p/(RR*T);
+    if (B <= 0.0) { B = 1e-16; }
+    const double Zv = srkZ(p, T, bM, coef1, coef2, coef3, RR, kp.stableRoot);
+
+    double hDep;
+    if (B == -Zv)
+    {
+        hDep = (RR*T*(Zv - 1.0))/Wmix;
+    }
+    else
+    {
+        const double sqrtT = sqrt(T);
+        const double aAlpha = coef1 - coef2*sqrtT + coef3*T;
+        const double daAlpha = -coef2/(2.0*sqrtT) + coef3;
+        hDep =
+        (
+            RR*T*(Zv - 1.0)
+          + (T*daAlpha - aAlpha)/bM*log((Zv + B)/Zv)
+        )/Wmix;
+    }
+
+    haF[celli] = haJ + hDep;
+}
+
+
 //- 셀 하나의 rho/mu/kappa (CPU calcMixture → mu/kappa 경로 1:1)
 __global__ void rgpEvaluateKernel
 (
@@ -708,6 +821,89 @@ int rgpGpuEvaluate
         != cudaSuccess) return fail(e, "evaluate/D2H Cv");
     if ((e = cudaMemcpy(psi, gBuf.psi, b1, cudaMemcpyDeviceToHost))
         != cudaSuccess) return fail(e, "evaluate/D2H psi");
+
+    return 0;
+}
+
+
+int rgpGpuEvaluateHa
+(
+    int nCells,
+    const double* p,
+    const double* T,
+    const double* Y,
+    double* ha
+)
+{
+    if (nCells <= 0) return 0;
+    if (gTab.nSpecies <= 0)
+    {
+        snprintf(gErr, sizeof(gErr), "rgpGpuEvaluateHa: tables not uploaded");
+        return -1;
+    }
+
+    const int n = gTab.nSpecies;
+
+    if (nCells > gBuf.capCells)
+    {
+        freeBuffers();
+        const size_t b1c = (size_t)nCells*sizeof(double);
+        const size_t bnc = (size_t)nCells*n*sizeof(double);
+        cudaError_t e;
+        if ((e = cudaMalloc(&gBuf.p,     b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.T,     b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Y,     bnc)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.rho,   b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.mu,    b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.kappa, b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Cp,    b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Cv,    b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.psi,   b1c)) != cudaSuccess)
+        {
+            freeBuffers();
+            return fail(e, "evaluateHa/malloc");
+        }
+        gBuf.capCells = nCells;
+    }
+
+    const size_t b1 = (size_t)nCells*sizeof(double);
+    const size_t bn = (size_t)nCells*n*sizeof(double);
+
+    cudaError_t e;
+    if ((e = cudaMemcpy(gBuf.p, p, b1, cudaMemcpyHostToDevice))
+        != cudaSuccess) return fail(e, "evaluateHa/H2D p");
+    if ((e = cudaMemcpy(gBuf.T, T, b1, cudaMemcpyHostToDevice))
+        != cudaSuccess) return fail(e, "evaluateHa/H2D T");
+    if ((e = cudaMemcpy(gBuf.Y, Y, bn, cudaMemcpyHostToDevice))
+        != cudaSuccess) return fail(e, "evaluateHa/H2D Y");
+
+    rgp::KParams kp;
+    kp.n = n;
+    kp.stableRoot = gTab.stableRoot;
+    kp.RR = gTab.RR;
+    kp.TlowJ = gTab.TlowJ;
+    kp.ThighJ = gTab.ThighJ;
+    kp.Tcommon = gTab.Tcommon;
+    kp.W = gTab.W;  kp.BM = gTab.BM;  kp.CM = gTab.CM;
+    kp.jH = gTab.janafHigh;  kp.jL = gTab.janafLow;
+    kp.C1 = gTab.COEF1;  kp.C2 = gTab.COEF2;  kp.C3 = gTab.COEF3;
+    kp.S3 = gTab.SIGMA3M;  kp.EK0 = gTab.EPSILONKM0;
+    kp.OM0 = gTab.OMEGAM0;  kp.MM0 = gTab.MM0;
+    kp.MI0 = gTab.MIUIM0;  kp.KA = gTab.KAPPAIM;
+
+    constexpr int blockSize = 128;
+    const int gridSize = (nCells + blockSize - 1)/blockSize;
+
+    // 출력은 Cp 디바이스 버퍼 재사용 (ha 전용 호출이라 충돌 없음)
+    rgp::rgpHaKernel<<<gridSize, blockSize>>>
+    (
+        kp, nCells, gBuf.p, gBuf.T, gBuf.Y, gBuf.Cp
+    );
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return fail(e, "evaluateHa/launch");
+
+    if ((e = cudaMemcpy(ha, gBuf.Cp, b1, cudaMemcpyDeviceToHost))
+        != cudaSuccess) return fail(e, "evaluateHa/D2H ha");
 
     return 0;
 }

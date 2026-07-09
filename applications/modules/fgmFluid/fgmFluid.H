@@ -226,6 +226,15 @@ protected:
         //- True once the GPU tables have been uploaded (lazy, first call).
         bool gpuArmed_;
 
+        //- fgmGPU: updateManifold의 셀 루프(대수 gZ/chi_st + 전 필드
+        //  16-코너 보간)를 CUDA로 오프로드. 'gpuManifold on;' (fgmProperties).
+        Switch gpuManifold_;
+
+        //- 테이블 업로드 완료 플래그 + 보간 출력 호스트 버퍼
+        mutable bool gpuManifoldArmed_;
+        mutable label gpuNFields_;
+        mutable List<double> gpuFgmOut_;
+
         //- Print the wall time of the per-step thermo property refresh
         //  (thermo_.correct() or gpuThermoCorrect()). 'thermoTimings on;'
         //  in fgmProperties; benchmarking aid, default off.
@@ -298,6 +307,13 @@ private:
         //  temperature set in updateManifold; the CPU inversion just returns
         //  it to Newton tolerance).
         void gpuThermoCorrect();
+
+        //- fgmGPU: replacement for the updateManifold he re-seed
+        //  thermo_.he() = thermo_.he(p, T) -- batch-evaluate the absolute
+        //  enthalpy ha(p, T_table, Y_table) on the GPU (janaf blend + SRK
+        //  mixture departure, same tables as armGpuThermo) for internal
+        //  cells and all patch faces. Arms the thermo tables if needed.
+        void gpuHeReseed();
 
         //- Effective (dynamic) diffusivity [kg/m/s] for a transported control
         //  variable, using its Lewis number:
