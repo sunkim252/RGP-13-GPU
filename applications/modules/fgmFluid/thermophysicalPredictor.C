@@ -30,6 +30,8 @@ License
 #include "fvmLaplacian.H"
 #include "fvcGrad.H"
 #include "zeroGradientFvPatchFields.H"
+#include "solutionControl.H"
+#include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
 
@@ -40,16 +42,131 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     std::chrono::steady_clock::time_point tTot;
     if (thermoTimings_) { tTot = std::chrono::steady_clock::now(); }
 
-    tmp<fv::convectionScheme<scalar>> mvConvection
-    (
-        fv::convectionScheme<scalar>::New
-        (
-            mesh,
-            fields,
-            phi,
-            mesh.schemes().div("div(phi,Yi_h)")
-        )
-    );
+    tmp<fv::convectionScheme<scalar>> mvConvection;
+    if (!gpuZC_ || gpuPEqnCheck_)   // check 모드: CPU 대조용으로도 구성
+    {
+        mvConvection =
+            fv::convectionScheme<scalar>::New
+            (
+                mesh,
+                fields,
+                phi,
+                mesh.schemes().div("div(phi,Yi_h)")
+            );
+    }
+    if (gpuZC_)
+    {
+        // ZCGPU: multivariate limitedLinear 가중치를 mvConvection 생성
+        // 시점(= manifold 갱신 전 필드 값)에 GPU에서 준비. limiter =
+        // fields 테이블(he, Z, C[, h, W]) 각 필드 limiter의 min.
+        if (LTS)
+        {
+            FatalErrorInFunction
+                << "gpuZC (v1) does not support LTS"
+                << exit(FatalError);
+        }
+
+        if (!gpuZCArmed_)
+        {
+            armGpuPEqnMesh();
+
+            const label nif = mesh.owner().size();
+            label nbf = 0;
+            forAll(Z_.boundaryField(), patchi)
+            {
+                nbf += Z_.boundaryField()[patchi].size();
+            }
+
+            const surfaceScalarField& wCD = mesh.surfaceInterpolation::weights();
+            const surfaceVectorField& Sff = mesh.Sf();
+            const volVectorField& CC = mesh.C();
+
+            List<double> wl(nif), sf3(3*nif), d3(3*nif);
+            List<double> bsf(3*max(nbf, label(1)), 0.0);
+            forAll(mesh.owner(), f)
+            {
+                wl[f] = wCD.primitiveField()[f];
+                const vector d(CC[mesh.neighbour()[f]] - CC[mesh.owner()[f]]);
+                for (label k = 0; k < 3; k++)
+                {
+                    sf3[k*nif + f] = Sff.primitiveField()[f][k];
+                    d3[k*nif + f] = d[k];
+                }
+            }
+            label off = 0;
+            forAll(Z_.boundaryField(), patchi)
+            {
+                const vectorField& Sfb = Sff.boundaryField()[patchi];
+                forAll(Sfb, fi)
+                {
+                    for (label k = 0; k < 3; k++)
+                    {
+                        bsf[k*nbf + off + fi] = Sfb[fi][k];
+                    }
+                }
+                off += Sfb.size();
+            }
+
+            if (rgpSTEqnMeshUpload(wl.begin(), sf3.begin(), d3.begin(),
+                                   bsf.begin()))
+            {
+                FatalErrorInFunction
+                    << "rgpSTEqnMeshUpload: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+            gpuZCArmed_ = true;
+            Info<< "fgmFluid: GPU Z/C transport armed" << nl << endl;
+        }
+
+        if (rgpSTWeightsBegin(phi.primitiveField().begin()))
+        {
+            FatalErrorInFunction
+                << "rgpSTWeightsBegin: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        label nbfW = 0;
+        forAll(Z_.boundaryField(), patchi)
+        {
+            nbfW += Z_.boundaryField()[patchi].size();
+        }
+        gpuZCBuf_.setSize(3*nbfW);
+
+        auto addWeightField = [&](const volScalarField& f)
+        {
+            double* bPsiA = gpuZCBuf_.begin();
+            label off = 0;
+            forAll(f.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pf = f.boundaryField()[patchi];
+                forAll(pf, fi) { bPsiA[off + fi] = pf[fi]; }
+                off += pf.size();
+            }
+            if (rgpSTWeightsField(f.primitiveField().begin(), bPsiA))
+            {
+                FatalErrorInFunction
+                    << "rgpSTWeightsField(" << f.name() << "): "
+                    << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+        };
+        if (hPtr_.valid() || WPtr_.valid())
+        {
+            FatalErrorInFunction
+                << "gpuZC (v1) does not support transported h/W tables"
+                << exit(FatalError);
+        }
+        addWeightField(thermo.he());
+        addWeightField(Z_);
+        addWeightField(C_);
+
+        if (rgpSTWeightsEnd())
+        {
+            FatalErrorInFunction
+                << "rgpSTWeightsEnd: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+    }
 
     // --- FGM manifold update: gZ, composition Y_k, PV source (from Z, C) ---
     {
@@ -146,6 +263,211 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     // --- Mixture-fraction transport (conserved scalar, no source) ---
     std::chrono::steady_clock::time_point tZC;
     if (thermoTimings_) { tZC = std::chrono::steady_clock::now(); }
+
+    // ZCGPU 공통 솔브: 조립(ddt+div[준비된 가중치]+Sp+laplacian)과
+    // Jacobi-BiCGStab를 디바이스에서. 경계 기여는 fvPatchField API.
+    auto solveScalarGpu = [&]
+    (
+        volScalarField& psiF,
+        const volScalarField& gamma,
+        const volScalarField& sp,
+        const volScalarField* srcPtr
+    )
+    {
+        label nbf = 0;
+        forAll(psiF.boundaryField(), patchi)
+        {
+            nbf += psiF.boundaryField()[patchi].size();
+        }
+        gpuZCBuf_.setSize(3*nbf);
+        double* bDiagA = gpuZCBuf_.begin();
+        double* bSrcA = bDiagA + nbf;
+        double* bPsiA = bSrcA + nbf;
+
+        label off = 0;
+        forAll(psiF.boundaryField(), patchi)
+        {
+            const fvPatchScalarField& pp = psiF.boundaryField()[patchi];
+            const label np = pp.size();
+            if (np == 0) continue;
+
+            const scalarField& phb = phi.boundaryField()[patchi];
+
+            // div: iC = +phi_b*vIC, bC(source) = -phi_b*vBC
+            const scalarField vic
+            (
+                pp.valueInternalCoeffs
+                (
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi]
+                )
+            );
+            const scalarField vbc
+            (
+                pp.valueBoundaryCoeffs
+                (
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi]
+                )
+            );
+
+            // -laplacian: iC = -gammaMagSf*gic, bC = +gammaMagSf*gbc
+            const scalarField gMsf
+            (
+                gamma.boundaryField()[patchi]
+               *mesh.magSf().boundaryField()[patchi]
+            );
+            const scalarField gic(pp.gradientInternalCoeffs());
+            const scalarField gbc(pp.gradientBoundaryCoeffs());
+
+            for (label k = 0; k < np; k++)
+            {
+                bDiagA[off + k] = phb[k]*vic[k] - gMsf[k]*gic[k];
+                bSrcA[off + k] = -phb[k]*vbc[k] + gMsf[k]*gbc[k];
+                bPsiA[off + k] = pp[k];
+            }
+            off += np;
+        }
+
+        const dictionary& sd = mesh.solution().solverDict
+        (
+            word("Yi")
+          + word
+            (
+                (
+                    !mesh.schemes().steady()
+                 && solutionControl::finalIteration(mesh)
+                ) ? "Final" : ""
+            )
+        );
+        const scalar tol = sd.lookup<scalar>("tolerance");
+        const scalar rtol = sd.lookupOrDefault<scalar>("relTol", 0);
+        const label maxIter = sd.lookupOrDefault<label>("maxIter", 1000);
+
+        double res0 = 0, resF = 0;
+        int nIter = 0;
+        const int rc = rgpSTEqnSolve
+        (
+            1.0/runTime.deltaTValue(),
+            srcPtr ? 1 : 0,
+            rho.primitiveField().begin(),
+            rho.oldTime().primitiveField().begin(),
+            psiF.oldTime().primitiveField().begin(),
+            psiF.primitiveField().begin(),
+            phi.primitiveField().begin(),
+            gamma.primitiveField().begin(),
+            sp.primitiveField().begin(),
+            srcPtr ? srcPtr->primitiveField().begin() : nullptr,
+            bPsiA, bDiagA, bSrcA,
+            tol, rtol, maxIter,
+            psiF.primitiveFieldRef().begin(),
+            &res0, &resF, &nIter
+        );
+        if (rc)
+        {
+            FatalErrorInFunction
+                << "rgpSTEqnSolve(" << psiF.name() << "): "
+                << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        Info<< "rgpBiCGStab: Solving for " << psiF.name()
+            << ", Initial residual = " << res0
+            << ", Final residual = " << resF
+            << ", No Iterations " << nIter << endl;
+
+        psiF.correctBoundaryConditions();
+    };
+
+    // ZCGPU 검증: CPU fvMatrix와 계수 대조 (gpuPEqnCheck 재사용)
+    auto checkSTMatrix = [&]
+    (
+        fvScalarMatrix& chk, const volScalarField& psiF,
+        const scalarField& psi0
+    )
+    {
+        const label ncc = mesh.nCells();
+        const label nif = mesh.owner().size();
+        scalarField diagC(chk.diag());
+        scalarField srcC(chk.source());
+        forAll(psiF.boundaryField(), patchi)
+        {
+            const labelUList& fc = mesh.boundary()[patchi].faceCells();
+            const scalarField& iC = chk.internalCoeffs()[patchi];
+            const scalarField& bC = chk.boundaryCoeffs()[patchi];
+            forAll(fc, k)
+            {
+                diagC[fc[k]] += iC[k];
+                srcC[fc[k]] += bC[k];
+            }
+        }
+        List<double> dG(ncc), uG(nif), lG(nif), bG(ncc);
+        rgpSTEqnDump(dG.begin(), uG.begin(), lG.begin(), bG.begin(),
+                     nullptr);
+        scalar dM = 0, uM = 0, lM = 0, bM = 0;
+        forAll(diagC, i)
+        {
+            dM = max(dM, mag(dG[i] - diagC[i])/max(mag(diagC[i]), small));
+            bM = max(bM, mag(bG[i] - srcC[i])/max(mag(srcC[i]), small));
+        }
+        const scalarField& uC = chk.upper();
+        const scalarField& lC = chk.lower();
+        forAll(uC, f)
+        {
+            uM = max(uM, mag(uG[f] - uC[f])/max(mag(uC[f]), small));
+            lM = max(lM, mag(lG[f] - lC[f])/max(mag(lC[f]), small));
+        }
+        Info<< "gpuZCCheck(" << psiF.name() << "): maxRel diag = " << dM
+            << ", upper = " << uM << ", lower = " << lM
+            << ", source = " << bM << endl;
+
+        // CPU 공식 그대로 초기 잔차 재계산 (pre-solve psi0 기준)
+        scalarField Apsi(ncc);
+        scalarField rs(ncc);
+        forAll(Apsi, i) { Apsi[i] = diagC[i]*psi0[i]; rs[i] = diagC[i]; }
+        forAll(mesh.owner(), f)
+        {
+            const label o = mesh.owner()[f], n = mesh.neighbour()[f];
+            Apsi[o] += uC[f]*psi0[n];
+            Apsi[n] += lC[f]*psi0[o];
+            rs[o] += uC[f];
+            rs[n] += lC[f];
+        }
+        const scalar xRef = gAverage(psi0);
+        scalar nF = 0, num = 0;
+        forAll(Apsi, i)
+        {
+            nF += mag(Apsi[i] - rs[i]*xRef) + mag(srcC[i] - rs[i]*xRef);
+            num += mag(srcC[i] - Apsi[i]);
+        }
+        nF += 1e-20;
+        Info<< "gpuZCCheck(" << psiF.name() << "): CPU-formula initRes = "
+            << num/nF << " (normFactor " << nF << ", |rA| " << num << ")"
+            << endl;
+    };
+
+    if (gpuZC_)
+    {
+        const volScalarField DZ("DZ", Deff("Z"));
+        const volScalarField DZeff(DZ + Dart);
+        const scalarField Z0(gpuPEqnCheck_ ? Z_.primitiveField() : scalarField());
+        solveScalarGpu(Z_, DZeff, contErr, nullptr);
+        if (gpuPEqnCheck_)
+        {
+            fvScalarMatrix chk
+            (
+                fvm::ddt(rho, Z_)
+              + mvConvection->fvmDiv(phi, Z_)
+              - fvm::Sp(contErr, Z_)
+              - fvm::laplacian(DZeff, Z_)
+            );
+            checkSTMatrix(chk, Z_, Z0);
+        }
+        fvConstraints().constrain(Z_);
+
+        Z_ = max(min(Z_, scalar(1)), scalar(0));
+    }
+    else
     {
         const volScalarField DZ("DZ", Deff("Z"));
         fvScalarMatrix ZEqn
@@ -167,6 +489,38 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     }
 
     // --- Progress-variable transport (source = rho*omega_C from table) ---
+    if (gpuZC_)
+    {
+        const volScalarField DC("DC", Deff("C"));
+        const volScalarField DCeff(DC + Dart);
+        const scalarField C0(gpuPEqnCheck_ ? C_.primitiveField() : scalarField());
+        solveScalarGpu(C_, DCeff, contErr, &sourcePV_);
+        if (gpuPEqnCheck_)
+        {
+            fvScalarMatrix chk
+            (
+                fvm::ddt(rho, C_)
+              + mvConvection->fvmDiv(phi, C_)
+              - fvm::Sp(contErr, C_)
+              - fvm::laplacian(DCeff, C_)
+             ==
+                sourcePV_
+            );
+            checkSTMatrix(chk, C_, C0);
+        }
+        fvConstraints().constrain(C_);
+
+        if (thermoTimings_)
+        {
+            Info<< "Z+C transport total = "
+                << std::chrono::duration<double>
+                   (std::chrono::steady_clock::now() - tZC).count()
+                << " s" << endl;
+        }
+
+        C_ = max(min(C_, scalar(1)), scalar(0));
+    }
+    else
     {
         const volScalarField DC("DC", Deff("C"));
         fvScalarMatrix CEqn

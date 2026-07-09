@@ -42,6 +42,25 @@ namespace
         double *dVals = nullptr;
     } gM;
 
+    //- 스칼라 수송(Z/C) 확장: limitedLinear div + laplacian + ddt/Sp
+    struct STMesh
+    {
+        double *wLin = nullptr;              // 내부면 linear 가중치
+        double *sf = nullptr, *dvec = nullptr;   // [3*nf] Sf, C_n-C_o
+        double *bSf = nullptr;               // [3*nbf] 경계면 Sf
+    } gSTM;
+
+    struct STBuf
+    {
+        double *rho = nullptr, *rhoOld = nullptr, *psiOld = nullptr,
+               *gamma = nullptr, *sp = nullptr, *src = nullptr;
+        double *phi = nullptr, *wLim = nullptr, *lower = nullptr;
+        double *grad = nullptr;              // [3*nc]
+        double *bPsi = nullptr;
+        double *rA0 = nullptr, *sA = nullptr, *yz = nullptr,
+               *AyA = nullptr, *AzA = nullptr;
+    } gST;
+
     struct PBuf
     {
         // 행렬/벡터 (모두 [nCells] 또는 [nIntFaces])
@@ -73,7 +92,11 @@ namespace
             &gM.gg, &gM.V,
             &gB.diag, &gB.upper, &gB.b, &gB.x, &gB.rA, &gB.pA, &gB.wA,
             &gB.rowSum, &gB.rAUf, &gB.psis, &gB.pOld, &gB.phiInt,
-            &gB.phiB, &gB.bDiag, &gB.bSrc, &gB.flux, &gB.red
+            &gB.phiB, &gB.bDiag, &gB.bSrc, &gB.flux, &gB.red,
+            &gSTM.wLin, &gSTM.sf, &gSTM.dvec, &gSTM.bSf,
+            &gST.rho, &gST.rhoOld, &gST.psiOld, &gST.gamma, &gST.sp,
+            &gST.src, &gST.phi, &gST.wLim, &gST.lower, &gST.grad,
+            &gST.bPsi, &gST.rA0, &gST.sA, &gST.yz, &gST.AyA, &gST.AzA
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gM.nCells = gM.nIntFaces = gM.nBFaces = 0;
@@ -292,6 +315,234 @@ __global__ void faceFlux
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nf) return;
     flux[f] = upper[f]*(x[nei[f]] - x[own[f]]);
+}
+
+// ── 스칼라 수송(Z/C): Gauss linear grad + limitedLinear(k=1) + 조립 ──
+
+//- Gauss linear 셀 그래디언트: g[k*nc+c] = (1/V) Σ ±Sf_k ψ_f
+__global__ void stGradFace
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin, const double* __restrict__ sf,
+    const double* __restrict__ x, double* __restrict__ g
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const double xf = wLin[f]*x[own[f]] + (1.0 - wLin[f])*x[nei[f]];
+    for (int k = 0; k < 3; k++)
+    {
+        const double c = sf[(size_t)k*nf + f]*xf;
+        atomicAdd(&g[(size_t)k*nc + own[f]],  c);
+        atomicAdd(&g[(size_t)k*nc + nei[f]], -c);
+    }
+}
+
+__global__ void stGradBFace
+(
+    const int nbf, const int nc,
+    const int* __restrict__ bfc, const double* __restrict__ bSf,
+    const double* __restrict__ bPsi, double* __restrict__ g
+)
+{
+    const int k2 = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k2 >= nbf) return;
+    for (int k = 0; k < 3; k++)
+    {
+        atomicAdd
+        (
+            &g[(size_t)k*nc + bfc[k2]],
+            bSf[(size_t)k*nbf + k2]*bPsi[k2]
+        );
+    }
+}
+
+__global__ void stGradDivV
+(
+    const int nc, const double* __restrict__ V, double* __restrict__ g
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    for (int k = 0; k < 3; k++) { g[(size_t)k*nc + i] /= V[i]; }
+}
+
+//- limitedLinear(k=1) 면 limiter를 min-누적 (multivariate 규약:
+//  fields 테이블의 각 필드 limiter의 min). OF NVDTVD::r 1:1.
+__global__ void stLimField
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ dvec,
+    const double* __restrict__ phi, const double* __restrict__ x,
+    const double* __restrict__ g, double* __restrict__ lim
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+
+    const int o = own[f], n = nei[f];
+    const double gradf = x[n] - x[o];
+    const int c = (phi[f] > 0.0) ? o : n;
+    const double gradcf =
+        dvec[f]*g[c]
+      + dvec[(size_t)nf + f]*g[(size_t)nc + c]
+      + dvec[(size_t)2*nf + f]*g[(size_t)2*nc + c];
+
+    double r;
+    if (fabs(gradcf) >= 1000.0*fabs(gradf))
+    {
+        const double sg = (gradcf >= 0.0) ? 1.0 : -1.0;
+        const double sf2 = (gradf >= 0.0) ? 1.0 : -1.0;
+        r = 2.0*1000.0*sg*sf2 - 1.0;
+    }
+    else
+    {
+        r = 2.0*(gradcf/gradf) - 1.0;
+    }
+
+    lim[f] = fmin(lim[f], fmax(fmin(2.0*r, 1.0), 0.0));
+}
+
+__global__ void stLimInit(const int nf, double* __restrict__ lim)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    lim[f] = 1.0;
+}
+
+//- w = lim*wLin + (1-lim)*upwind (in-place: lim 버퍼가 w가 됨)
+__global__ void stWeightsEnd
+(
+    const int nf, const double* __restrict__ wLin,
+    const double* __restrict__ phi, double* __restrict__ limW
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const double lim = limW[f];
+    limW[f] = lim*wLin[f] + (1.0 - lim)*((phi[f] >= 0.0) ? 1.0 : 0.0);
+}
+
+//- 셀 항: fvm::ddt(rho,ψ) − fvm::Sp(sp,ψ) (+ src)
+__global__ void stCellAssemble
+(
+    const int n, const double dtInv, const int hasSrc,
+    const double* __restrict__ rho, const double* __restrict__ rhoOld,
+    const double* __restrict__ psiOld, const double* __restrict__ sp,
+    const double* __restrict__ src, const double* __restrict__ V,
+    double* __restrict__ diag, double* __restrict__ b
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    diag[i] = rho[i]*V[i]*dtInv - sp[i]*V[i];
+    b[i] = rhoOld[i]*V[i]*dtInv*psiOld[i] + (hasSrc ? src[i]*V[i] : 0.0);
+}
+
+//- 면 항: fvm::div(phi,ψ)[limited w] − fvm::laplacian(γ,ψ) + negSumDiag
+__global__ void stFaceAssemble
+(
+    const int nf,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ phi, const double* __restrict__ w,
+    const double* __restrict__ wLin, const double* __restrict__ gamma,
+    const double* __restrict__ gg,
+    double* __restrict__ diag, double* __restrict__ upper,
+    double* __restrict__ lower
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const int o = own[f], n = nei[f];
+    const double G = (wLin[f]*gamma[o] + (1.0 - wLin[f])*gamma[n])*gg[f];
+    const double lo = -w[f]*phi[f] - G;
+    const double up = (1.0 - w[f])*phi[f] - G;
+    lower[f] = lo;
+    upper[f] = up;
+    atomicAdd(&diag[o], -lo);
+    atomicAdd(&diag[n], -up);
+}
+
+//- 경계 기여 (phiB 차감 없는 순수 diag/source 산입)
+__global__ void stBFaceAssemble
+(
+    const int nbf, const int* __restrict__ bfc,
+    const double* __restrict__ bDiag, const double* __restrict__ bSrc,
+    double* __restrict__ diag, double* __restrict__ b
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nbf) return;
+    atomicAdd(&diag[bfc[k]], bDiag[k]);
+    atomicAdd(&b[bfc[k]], bSrc[k]);
+}
+
+//- 비대칭 SpMV 면 기여 / rowSum
+__global__ void stFaceSpmv
+(
+    const int nf,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ upper, const double* __restrict__ lower,
+    const double* __restrict__ x, double* __restrict__ y
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    atomicAdd(&y[own[f]], upper[f]*x[nei[f]]);
+    atomicAdd(&y[nei[f]], lower[f]*x[own[f]]);
+}
+
+__global__ void stFaceRowSum
+(
+    const int nf,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ upper, const double* __restrict__ lower,
+    double* __restrict__ rs
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    atomicAdd(&rs[own[f]], upper[f]);
+    atomicAdd(&rs[nei[f]], lower[f]);
+}
+
+//- BiCGStab 벡터 연산들
+__global__ void stPA
+(
+    const int n, const double beta, const double omega,
+    const double* __restrict__ rA, const double* __restrict__ AyA,
+    double* __restrict__ pA
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    pA[i] = rA[i] + beta*(pA[i] - omega*AyA[i]);
+}
+
+__global__ void stAxpy
+(
+    const int n, const double a,
+    const double* __restrict__ x, const double* __restrict__ y,
+    double* __restrict__ out
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = y[i] + a*x[i];
+}
+
+__global__ void stX2
+(
+    const int n, const double alpha, const double omega,
+    const double* __restrict__ yA, const double* __restrict__ zA,
+    double* __restrict__ x
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] += alpha*yA[i] + omega*zA[i];
 }
 
 } // namespace rgppeqn
@@ -783,6 +1034,354 @@ int rgpPEqnFinish(double* pOut, double* fluxInt)
     if ((e = cudaMemcpy(fluxInt, gB.flux, (size_t)nf*sizeof(double),
                         cudaMemcpyDeviceToHost)) != cudaSuccess)
         return pfail(e, "peqn/finish D2H flux");
+    return 0;
+}
+
+
+int rgpSTEqnMeshUpload
+(
+    const double* wLin, const double* Sf, const double* dVec,
+    const double* bSf
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (nc <= 0)
+    {
+        snprintf(gPErr, sizeof(gPErr), "steqn: mesh not uploaded");
+        return -1;
+    }
+
+    cudaError_t e;
+    struct { double** d; const double* s; size_t n; } it[] =
+    {
+        {&gSTM.wLin, wLin, (size_t)nf},
+        {&gSTM.sf, Sf, (size_t)3*nf},
+        {&gSTM.dvec, dVec, (size_t)3*nf},
+        {&gSTM.bSf, bSf, (size_t)3*(nbf > 0 ? nbf : 1)}
+    };
+    for (auto& i : it)
+    {
+        if (!*i.d)
+        {
+            if ((e = cudaMalloc(i.d, i.n*sizeof(double))) != cudaSuccess)
+                return pfail(e, "steqn/mesh malloc");
+        }
+        if (i.s)
+        {
+            if ((e = cudaMemcpy(*i.d, i.s, i.n*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "steqn/mesh H2D");
+        }
+    }
+
+    const size_t bc = (size_t)nc*sizeof(double);
+    const size_t bf = (size_t)nf*sizeof(double);
+    const size_t bb = (size_t)(nbf > 0 ? nbf : 1)*sizeof(double);
+    struct { double** d; size_t bytes; } al[] =
+    {
+        {&gST.rho, bc}, {&gST.rhoOld, bc}, {&gST.psiOld, bc},
+        {&gST.gamma, bc}, {&gST.sp, bc}, {&gST.src, bc},
+        {&gST.phi, bf}, {&gST.wLim, bf}, {&gST.lower, bf},
+        {&gST.grad, 3*bc}, {&gST.bPsi, bb},
+        {&gST.rA0, bc}, {&gST.sA, bc}, {&gST.yz, bc},
+        {&gST.AyA, bc}, {&gST.AzA, bc}
+    };
+    for (auto& a : al)
+    {
+        if (!*a.d)
+        {
+            if ((e = cudaMalloc(a.d, a.bytes)) != cudaSuccess)
+                return pfail(e, "steqn/buf malloc");
+        }
+    }
+    return 0;
+}
+
+
+int rgpSTWeightsBegin(const double* phiInt)
+{
+    const int nf = gM.nIntFaces;
+    if (!gSTM.wLin)
+    {
+        snprintf(gPErr, sizeof(gPErr), "steqn: ST mesh not uploaded");
+        return -1;
+    }
+    cudaError_t e;
+    if ((e = cudaMemcpy(gST.phi, phiInt, (size_t)nf*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "stw/H2D phi");
+    rgppeqn::stLimInit<<<nb(nf), BS>>>(nf, gST.wLim);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "stw/init launch");
+    return 0;
+}
+
+
+int rgpSTWeightsField(const double* psi, const double* bPsi)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    cudaError_t e;
+    if ((e = cudaMemcpy(gB.x, psi, (size_t)nc*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "stw/H2D psi");
+    if (nbf > 0)
+    {
+        if ((e = cudaMemcpy(gST.bPsi, bPsi, (size_t)nbf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "stw/H2D bPsi");
+    }
+
+    if ((e = cudaMemset(gST.grad, 0, (size_t)3*nc*sizeof(double)))
+        != cudaSuccess) return pfail(e, "stw/grad memset");
+    rgppeqn::stGradFace<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf, gB.x, gST.grad);
+    if (nbf > 0)
+    {
+        rgppeqn::stGradBFace<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gSTM.bSf, gST.bPsi, gST.grad);
+    }
+    rgppeqn::stGradDivV<<<nb(nc), BS>>>(nc, gM.V, gST.grad);
+    rgppeqn::stLimField<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.dvec, gST.phi, gB.x, gST.grad,
+         gST.wLim);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "stw/field launch");
+    return 0;
+}
+
+
+int rgpSTWeightsEnd(void)
+{
+    const int nf = gM.nIntFaces;
+    rgppeqn::stWeightsEnd<<<nb(nf), BS>>>(nf, gSTM.wLin, gST.phi,
+                                          gST.wLim);
+    cudaError_t e;
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "stw/end launch");
+    return 0;
+}
+
+
+int rgpSTEqnSolve
+(
+    double dtInv, int hasSrc,
+    const double* rho, const double* rhoOld, const double* psiOld,
+    const double* p0,
+    const double* phiInt, const double* gammaCell, const double* spCell,
+    const double* srcCell, const double* bPsi,
+    const double* bDiag, const double* bSrc,
+    double tol, double relTol, int maxIter,
+    double* psiOut,
+    double* initRes, double* finalRes, int* nIters
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gSTM.wLin)
+    {
+        snprintf(gPErr, sizeof(gPErr), "steqn: ST mesh not uploaded");
+        return -1;
+    }
+
+    cudaError_t e;
+    struct { double* d; const double* s; size_t n; } up[] =
+    {
+        {gST.rho, rho, (size_t)nc}, {gST.rhoOld, rhoOld, (size_t)nc},
+        {gST.psiOld, psiOld, (size_t)nc}, {gB.x, p0, (size_t)nc},
+        {gST.phi, phiInt, (size_t)nf}, {gST.gamma, gammaCell, (size_t)nc},
+        {gST.sp, spCell, (size_t)nc},
+        {gST.src, hasSrc ? srcCell : nullptr, (size_t)nc},
+        {gST.bPsi, bPsi, (size_t)nbf},
+        {gB.bDiag, bDiag, (size_t)nbf}, {gB.bSrc, bSrc, (size_t)nbf}
+    };
+    for (auto& u : up)
+    {
+        if (u.n == 0 || !u.s) continue;
+        if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "steqn/H2D");
+    }
+
+    // (가중치 gST.wLim은 rgpSTWeightsBegin/Field/End가 사전 준비)
+
+    // ── 조립 ─────────────────────────────────────────────────────────
+    rgppeqn::stCellAssemble<<<nb(nc), BS>>>
+        (nc, dtInv, hasSrc, gST.rho, gST.rhoOld, gST.psiOld, gST.sp,
+         gST.src, gM.V, gB.diag, gB.b);
+    rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
+        (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
+         gM.gg, gB.diag, gB.upper, gST.lower);
+    if (nbf > 0)
+    {
+        rgppeqn::stBFaceAssemble<<<nb(nbf), BS>>>
+            (nbf, gM.bfc, gB.bDiag, gB.bSrc, gB.diag, gB.b);
+    }
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "steqn/assemble launch");
+
+    // ── OF normFactor + 초기 잔차 ────────────────────────────────────
+    if ((e = cudaMemcpy(gB.rowSum, gB.diag, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToDevice)) != cudaSuccess)
+        return pfail(e, "steqn/rowSum D2D");
+    rgppeqn::stFaceRowSum<<<nb(nf), BS>>>
+        (nf, gM.own, gM.nei, gB.upper, gST.lower, gB.rowSum);
+
+    rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gB.x, gB.wA);
+    rgppeqn::stFaceSpmv<<<nb(nf), BS>>>
+        (nf, gM.own, gM.nei, gB.upper, gST.lower, gB.x, gB.wA);
+    rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "steqn/init launch");
+
+    int rc;
+    double sumX = 0;
+    if ((rc = reduceHost(nc, 0, gB.x, nullptr, 0, nullptr, sumX))) return rc;
+    const double xRef = sumX/nc;
+    double nf1 = 0, nf2 = 0;
+    if ((rc = reduceHost(nc, 3, gB.wA, nullptr, xRef, gB.rowSum, nf1)))
+        return rc;
+    if ((rc = reduceHost(nc, 3, gB.b, nullptr, xRef, gB.rowSum, nf2)))
+        return rc;
+    const double normFactor = nf1 + nf2 + 1e-20;
+
+    double res = 0;
+    if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res))) return rc;
+    res /= normFactor;
+    *initRes = res;
+
+    auto converged = [&](double r) -> bool
+    {
+        return (r < tol) || (relTol > 0 && r <= relTol*(*initRes));
+    };
+
+    // ── Jacobi-BiCGStab (OF PBiCGStab 구조) ──────────────────────────
+    int iter = 0;
+    if (!converged(res))
+    {
+        // rA0 = rA
+        if ((e = cudaMemcpy(gST.rA0, gB.rA, (size_t)nc*sizeof(double),
+                            cudaMemcpyDeviceToDevice)) != cudaSuccess)
+            return pfail(e, "steqn/rA0");
+
+        double rA0rA = 0, alpha = 0, omega = 0;
+
+        while (iter < maxIter)
+        {
+            const double rA0rAold = rA0rA;
+            if ((rc = reduceHost(nc, 2, gST.rA0, gB.rA, 0, nullptr, rA0rA)))
+                return rc;
+
+            if (iter == 0)
+            {
+                if ((e = cudaMemcpy(gB.pA, gB.rA,
+                                    (size_t)nc*sizeof(double),
+                                    cudaMemcpyDeviceToDevice))
+                    != cudaSuccess) return pfail(e, "steqn/pA0");
+            }
+            else
+            {
+                if (rA0rAold == 0 || omega == 0) break;   // breakdown
+                const double beta = (rA0rA/rA0rAold)*(alpha/omega);
+                rgppeqn::stPA<<<nb(nc), BS>>>
+                    (nc, beta, omega, gB.rA, gST.AyA, gB.pA);
+            }
+
+            // yA = pA/diag; AyA = A yA
+            rgppeqn::precondDir<<<nb(nc), BS>>>
+                (nc, gB.pA, gB.diag, 0.0, gST.yz);
+            rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gST.yz,
+                                              gST.AyA);
+            rgppeqn::stFaceSpmv<<<nb(nf), BS>>>
+                (nf, gM.own, gM.nei, gB.upper, gST.lower, gST.yz,
+                 gST.AyA);
+
+            double rA0AyA = 0;
+            if ((rc = reduceHost(nc, 2, gST.rA0, gST.AyA, 0, nullptr,
+                                 rA0AyA))) return rc;
+            if (rA0AyA == 0) break;
+            alpha = rA0rA/rA0AyA;
+
+            // sA = rA − alpha*AyA
+            rgppeqn::stAxpy<<<nb(nc), BS>>>
+                (nc, -alpha, gST.AyA, gB.rA, gST.sA);
+
+            // 중간 수렴 체크 (OF와 동일한 half-step)
+            double resS = 0;
+            if ((rc = reduceHost(nc, 1, gST.sA, nullptr, 0, nullptr,
+                                 resS))) return rc;
+            resS /= normFactor;
+            if (converged(resS))
+            {
+                // psi += alpha*yA
+                rgppeqn::stX2<<<nb(nc), BS>>>
+                    (nc, alpha, 0.0, gST.yz, gST.yz, gB.x);
+                iter++;
+                res = resS;
+                break;
+            }
+
+            // zA = sA/diag (wA 재사용); AzA = A zA
+            rgppeqn::precondDir<<<nb(nc), BS>>>
+                (nc, gST.sA, gB.diag, 0.0, gB.wA);
+            rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gB.wA,
+                                              gST.AzA);
+            rgppeqn::stFaceSpmv<<<nb(nf), BS>>>
+                (nf, gM.own, gM.nei, gB.upper, gST.lower, gB.wA,
+                 gST.AzA);
+
+            double tS = 0, tT = 0;
+            if ((rc = reduceHost(nc, 2, gST.AzA, gST.sA, 0, nullptr, tS)))
+                return rc;
+            if ((rc = reduceHost(nc, 2, gST.AzA, gST.AzA, 0, nullptr,
+                                 tT))) return rc;
+            if (tT == 0) break;
+            omega = tS/tT;
+
+            // psi += alpha*yA + omega*zA; rA = sA − omega*AzA
+            rgppeqn::stX2<<<nb(nc), BS>>>
+                (nc, alpha, omega, gST.yz, gB.wA, gB.x);
+            rgppeqn::stAxpy<<<nb(nc), BS>>>
+                (nc, -omega, gST.AzA, gST.sA, gB.rA);
+
+            iter++;
+            if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res)))
+                return rc;
+            res /= normFactor;
+            if (converged(res)) break;
+        }
+    }
+
+    *finalRes = res;
+    *nIters = iter;
+
+    if ((e = cudaMemcpy(psiOut, gB.x, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "steqn/D2H psi");
+
+    return 0;
+}
+
+
+int rgpSTEqnDump
+(
+    double* diagOut, double* upperOut, double* lowerOut, double* bOut,
+    double* wOut
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    cudaError_t e;
+    struct { double* h; const double* d; size_t n; } outs[] =
+    {
+        {diagOut, gB.diag, (size_t)nc}, {upperOut, gB.upper, (size_t)nf},
+        {lowerOut, gST.lower, (size_t)nf}, {bOut, gB.b, (size_t)nc},
+        {wOut, gST.wLim, (size_t)nf}
+    };
+    for (auto& o : outs)
+    {
+        if (!o.h) continue;
+        if ((e = cudaMemcpy(o.h, o.d, o.n*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "steqn/dump");
+    }
     return 0;
 }
 

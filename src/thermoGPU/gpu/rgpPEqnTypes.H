@@ -90,6 +90,46 @@ int rgpPEqnResidual(double normFactor, double* res);
 /*  솔브 후처리: faceH 플럭스 + p/flux D2H */
 int rgpPEqnFinish(double* pOut, double* fluxInt);
 
+/*  스칼라 수송(Z/C) GPU: fvm::ddt(rho,ψ) + fvm::div(phi,ψ)[Gauss
+    limitedLinear 1] − fvm::Sp(sp,ψ) − fvm::laplacian(γ,ψ) [+ src]
+    를 디바이스 조립하고 Jacobi-BiCGStab(OF PBiCGStab 구조/잔차 규약)
+    으로 솔브. 경계 기여(bDiag/bSrc = div의 vIC/vBC + −laplacian의
+    gic/gbc 합산)는 호스트가 fvPatchField API로 계산.
+    rgpPEqnMeshUpload 이후 1회 rgpSTEqnMeshUpload(선형가중치, Sf,
+    d = C_n−C_o, 경계 Sf; 모두 SoA [3][n]) 필요.                       */
+int rgpSTEqnMeshUpload
+(
+    const double* wLin, const double* Sf, const double* dVec,
+    const double* bSf
+);
+
+/*  multivariate limitedLinear 가중치: Begin(phi) → Field(각 필드 —
+    fields 테이블의 he, Z, C[, h, W] 순서로 limiter min-누적) → End.
+    mvConvection 생성 시점(manifold 갱신 전) 필드 값으로 호출할 것.     */
+int rgpSTWeightsBegin(const double* phiInt);
+int rgpSTWeightsField(const double* psi, const double* bPsi);
+int rgpSTWeightsEnd(void);
+
+/*  검증용: 마지막 rgpSTEqnSolve의 조립 계수/가중치 D2H (null 허용) */
+int rgpSTEqnDump
+(
+    double* diagOut, double* upperOut, double* lowerOut, double* bOut,
+    double* wOut
+);
+
+int rgpSTEqnSolve
+(
+    double dtInv, int hasSrc,
+    const double* rho, const double* rhoOld, const double* psiOld,
+    const double* p0,
+    const double* phiInt, const double* gammaCell, const double* spCell,
+    const double* srcCell, const double* bPsi,
+    const double* bDiag, const double* bSrc,
+    double tol, double relTol, int maxIter,
+    double* psiOut,
+    double* initRes, double* finalRes, int* nIters
+);
+
 void rgpPEqnFree(void);
 const char* rgpPEqnLastError(void);
 

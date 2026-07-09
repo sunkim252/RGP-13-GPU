@@ -242,6 +242,13 @@ protected:
         //- pEqnGPU CSR nnz (amgx 경로, 아밍 시 설정)
         mutable label gpuPEqnNnz_;
 
+        //- ZCGPU: Z/C 수송 방정식(ddt+multivariate limitedLinear div+Sp+
+        //  laplacian)을 GPU 조립+Jacobi-BiCGStab로. 'gpuZC on;'
+        //  (fgmProperties). gpuPEqn과 동일한 v1 제약(비커플드/Euler/직교).
+        Switch gpuZC_;
+        mutable bool gpuZCArmed_;
+        mutable List<double> gpuZCBuf_;   // 경계 연접 (bDiag,bSrc,bPsi)
+
         //- pEqnGPU 메시 업로드 완료 플래그 + 작업 버퍼
         mutable bool gpuPEqnArmed_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
@@ -335,6 +342,10 @@ private:
         //  mixture departure, same tables as armGpuThermo) for internal
         //  cells and all patch faces. Arms the thermo tables if needed.
         void gpuHeReseed();
+
+        //- pEqnGPU: 정적 메시(owner/neigh/기하계수/V/경계 faceCells)
+        //  업로드 (1회, idempotent). gpuPEqn/gpuZC 양쪽에서 사용.
+        void armGpuPEqnMesh();
 
         //- Effective (dynamic) diffusivity [kg/m/s] for a transported control
         //  variable, using its Lewis number:

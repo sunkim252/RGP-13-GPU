@@ -59,6 +59,77 @@ Description
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
+void Foam::solvers::fgmFluid::armGpuPEqnMesh()
+{
+    if (gpuPEqnArmed_) return;
+
+    const label nc = mesh.nCells();
+    const label nif = mesh.owner().size();
+
+    label nbf = 0;
+    forAll(p_.boundaryField(), patchi)
+    {
+        if (p_.boundaryField()[patchi].coupled())
+        {
+            FatalErrorInFunction
+                << "gpuPEqn/gpuZC (v1) do not support coupled patches"
+                << exit(FatalError);
+        }
+        nbf += p_.boundaryField()[patchi].size();
+    }
+
+    List<int> own(nif), nei(nif);
+    forAll(mesh.owner(), f)
+    {
+        own[f] = mesh.owner()[f];
+        nei[f] = mesh.neighbour()[f];
+    }
+    List<double> gg(nif);
+    const scalarField& magSf = mesh.magSf().primitiveField();
+    const scalarField& dc = mesh.deltaCoeffs().primitiveField();
+    forAll(gg, f) { gg[f] = magSf[f]*dc[f]; }
+
+    List<int> bfc(nbf);
+    label off = 0;
+    forAll(p_.boundaryField(), patchi)
+    {
+        const labelUList& fc = mesh.boundary()[patchi].faceCells();
+        forAll(fc, k) { bfc[off + k] = fc[k]; }
+        off += fc.size();
+    }
+
+    const scalarField Vc(mesh.V());
+    const int rc = rgpPEqnMeshUpload
+    (
+        nc, nif, own.begin(), nei.begin(), gg.begin(),
+        Vc.begin(), nbf, bfc.begin()
+    );
+    if (rc)
+    {
+        FatalErrorInFunction
+            << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
+            << exit(FatalError);
+    }
+    if (gpuPEqnSolver_ == "amgx")
+    {
+        int nnz = 0;
+        if (rgpPEqnCsrPrepare(&nnz))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnCsrPrepare: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+        gpuPEqnNnz_ = nnz;
+    }
+
+    gpuPEqnArmed_ = true;
+    Info<< "fgmFluid: GPU pEqn mesh armed -- " << nc << " cells, "
+        << nif << " internal faces, " << nbf
+        << " boundary faces (pEqn solver: " << gpuPEqnSolver_ << ")"
+        << nl << endl;
+}
+
+
 void Foam::solvers::fgmFluid::correctPressurePEP()
 {
     volScalarField& rho(rho_);
@@ -347,58 +418,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         }
 
         // ── 1회 아밍: 정적 메시 (owner/neigh, magSf*deltaCoeffs, V) ──
-        if (!gpuPEqnArmed_)
-        {
-            List<int> own(nif), nei(nif);
-            forAll(mesh.owner(), f)
-            {
-                own[f] = mesh.owner()[f];
-                nei[f] = mesh.neighbour()[f];
-            }
-            List<double> gg(nif);
-            const scalarField& magSf = mesh.magSf().primitiveField();
-            const scalarField& dc = mesh.deltaCoeffs().primitiveField();
-            forAll(gg, f) { gg[f] = magSf[f]*dc[f]; }
-
-            List<int> bfc(nbf);
-            label off = 0;
-            forAll(p.boundaryField(), patchi)
-            {
-                const labelUList& fc = mesh.boundary()[patchi].faceCells();
-                forAll(fc, k) { bfc[off + k] = fc[k]; }
-                off += fc.size();
-            }
-
-            const scalarField Vc(mesh.V());
-            const int rc = rgpPEqnMeshUpload
-            (
-                nc, nif, own.begin(), nei.begin(), gg.begin(),
-                Vc.begin(), nbf, bfc.begin()
-            );
-            if (rc)
-            {
-                FatalErrorInFunction
-                    << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
-                    << exit(FatalError);
-            }
-            if (gpuPEqnSolver_ == "amgx")
-            {
-                int nnz = 0;
-                if (rgpPEqnCsrPrepare(&nnz))
-                {
-                    FatalErrorInFunction
-                        << "rgpPEqnCsrPrepare: " << rgpPEqnLastError()
-                        << exit(FatalError);
-                }
-                gpuPEqnNnz_ = nnz;
-            }
-
-            gpuPEqnArmed_ = true;
-            Info<< "fgmFluid: GPU pEqn armed -- " << nc << " cells, "
-                << nif << " internal faces, " << nbf
-                << " boundary faces (solver: " << gpuPEqnSolver_ << ")"
-                << nl << endl;
-        }
+        armGpuPEqnMesh();
 
         // ── 경계 기여: pEqn = -laplacian(rAUf, p)의 경계 계수 ─────────
         //    diag += -pGamma*gic, source += +pGamma*gbc (fvm 부호 규약)
