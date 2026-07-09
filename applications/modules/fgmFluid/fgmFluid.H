@@ -226,6 +226,19 @@ protected:
         //- True once the GPU tables have been uploaded (lazy, first call).
         bool gpuArmed_;
 
+        //- pEqnGPU: correctPressurePEP의 압력 방정식을 fvMatrix 우회로
+        //  GPU에서 조립+Jacobi-PCG 솔브+플럭스 추출. 'gpuPEqn on;'
+        //  (fgmProperties). 'Gauss linear orthogonal' laplacian 전용.
+        Switch gpuPEqn_;
+
+        //- pEqnGPU 검증 모드: CPU fvMatrix와 계수/플럭스 대조 출력
+        Switch gpuPEqnCheck_;
+
+        //- pEqnGPU 메시 업로드 완료 플래그 + 작업 버퍼
+        mutable bool gpuPEqnArmed_;
+        mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
+        mutable List<double> gpuPEqnFlux_;  // 내부면 플럭스 out
+
         //- fgmGPU: updateManifold의 셀 루프(대수 gZ/chi_st + 전 필드
         //  16-코너 보간)를 CUDA로 오프로드. 'gpuManifold on;' (fgmProperties).
         Switch gpuManifold_;

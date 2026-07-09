@@ -1,5 +1,6 @@
 gpu/rgpKernels.cu
 gpu/rgpChemKernels.cu
 gpu/rgpFgmKernels.cu
+gpu/rgpPEqnKernels.cu
 
 LIB = $(FOAM_USER_LIBBIN)/librgpThermoGPU

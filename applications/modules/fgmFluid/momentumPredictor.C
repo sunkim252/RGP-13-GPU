@@ -96,31 +96,6 @@ void Foam::solvers::fgmFluid::momentumPredictor()
     (
         pimple.dict().lookupOrDefault<scalar>("LADbulkCoeff", scalar(0))
     );
-    const volScalarField divU(fvc::div(U));
-    volScalarField betaArt
-    (
-        IOobject
-        (
-            "betaArt",
-            mesh.time().name(),
-            mesh,
-            IOobject::NO_READ,
-            IOobject::NO_WRITE
-        ),
-        mesh,
-        dimensionedScalar(dimensionSet(1, -1, -1, 0, 0, 0, 0), 0),
-        zeroGradientFvPatchScalarField::typeName
-    );
-    if (LADbulkCoeff > 0)
-    {
-        const scalarField V23(pow(scalarField(mesh.V()), 2.0/3.0));
-        betaArt.primitiveFieldRef() =
-            LADbulkCoeff*rho.primitiveField()*V23
-           *mag(divU.primitiveField());
-        betaArt.correctBoundaryConditions();
-        Info<< "LAD-bulk: betaArt max = " << gMax(betaArt.primitiveField())
-            << " kg/(m s)" << endl;
-    }
 
     std::chrono::steady_clock::time_point tAsm;
     if (thermoTimings_) { tAsm = std::chrono::steady_clock::now(); }
@@ -130,12 +105,45 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         fvm::ddt(rho, U) + fvm::div(phi, U)
       + MRF.DDt(rho, U)
       + momentumTransport->divDevTau(U)
-      - fvm::laplacian(muArt, U)
-      - fvc::grad(betaArt*divU)
      ==
         fvModels().source(rho, U)
     );
     fvVectorMatrix& UEqn = tUEqn.ref();
+
+    // LAD 항은 계수가 켜졌을 때만 조립: 계수 0이어도 0-계수 laplacian/grad의
+    // LDU 전체 조립이 스텝의 ~0.1-0.2s를 소모한다. 0 기여이므로 생략은
+    // 비트-동일.
+    if (LADUCoeff > 0)
+    {
+        UEqn -= fvm::laplacian(muArt, U);
+    }
+    if (LADbulkCoeff > 0)
+    {
+        const volScalarField divU(fvc::div(U));
+        volScalarField betaArt
+        (
+            IOobject
+            (
+                "betaArt",
+                mesh.time().name(),
+                mesh,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            mesh,
+            dimensionedScalar(dimensionSet(1, -1, -1, 0, 0, 0, 0), 0),
+            zeroGradientFvPatchScalarField::typeName
+        );
+        const scalarField V23(pow(scalarField(mesh.V()), 2.0/3.0));
+        betaArt.primitiveFieldRef() =
+            LADbulkCoeff*rho.primitiveField()*V23
+           *mag(divU.primitiveField());
+        betaArt.correctBoundaryConditions();
+        Info<< "LAD-bulk: betaArt max = " << gMax(betaArt.primitiveField())
+            << " kg/(m s)" << endl;
+
+        UEqn -= fvc::grad(betaArt*divU);
+    }
 
     UEqn.relax();
 

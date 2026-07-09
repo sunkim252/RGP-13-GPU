@@ -51,6 +51,8 @@ Description
 #include "fvcLaplacian.H"
 #include "fvcAverage.H"
 #include "zeroGradientFvPatchFields.H"
+#include "solutionControl.H"
+#include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
 
@@ -316,42 +318,314 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             << " m^2/s" << endl;
     }
 
-    fvScalarMatrix pDDtEqn
-    (
-        psis*fvm::ddt(p)
-      + fvc::div(phiHbyAv)
-      - fvc::laplacian(Dr, rho)/rho
-    );
-
-    while (pimple.correctNonOrthogonal())
+    if (gpuPEqn_)
     {
-        fvScalarMatrix pEqn(pDDtEqn - fvm::laplacian(rAUf, p));
-
-        pEqn.setReference
-        (
-            pressureReference.refCell(),
-            pressureReference.refValue()
-        );
-
-        fvConstraints().constrain(pEqn);
-
+        // --- pEqnGPU: fvMatrix 우회 — 디바이스 조립 + Jacobi-PCG + 플럭스.
+        // 'Gauss linear orthogonal' laplacian + Euler ddt + 비커플드 패치
+        // 전용(v1). 경계 기여만 호스트가 fvPatchField API로 정확 계산.
+        if (LTS || LADrhoCoeff > 0)
         {
-            std::chrono::steady_clock::time_point tS;
-            if (thermoTimings_) { tS = std::chrono::steady_clock::now(); }
-            pEqn.solve();
-            if (thermoTimings_)
+            FatalErrorInFunction
+                << "gpuPEqn (v1) does not support LTS or LADrhoCoeff > 0"
+                << exit(FatalError);
+        }
+
+        const label nc = mesh.nCells();
+        const label nif = mesh.owner().size();
+
+        label nbf = 0;
+        forAll(p.boundaryField(), patchi)
+        {
+            if (p.boundaryField()[patchi].coupled())
             {
-                Info<< "pCorr pEqn.solve = "
-                    << std::chrono::duration<double>
-                       (std::chrono::steady_clock::now() - tS).count()
-                    << " s" << endl;
+                FatalErrorInFunction
+                    << "gpuPEqn (v1) does not support coupled patches"
+                    << exit(FatalError);
+            }
+            nbf += p.boundaryField()[patchi].size();
+        }
+
+        // ── 1회 아밍: 정적 메시 (owner/neigh, magSf*deltaCoeffs, V) ──
+        if (!gpuPEqnArmed_)
+        {
+            List<int> own(nif), nei(nif);
+            forAll(mesh.owner(), f)
+            {
+                own[f] = mesh.owner()[f];
+                nei[f] = mesh.neighbour()[f];
+            }
+            List<double> gg(nif);
+            const scalarField& magSf = mesh.magSf().primitiveField();
+            const scalarField& dc = mesh.deltaCoeffs().primitiveField();
+            forAll(gg, f) { gg[f] = magSf[f]*dc[f]; }
+
+            List<int> bfc(nbf);
+            label off = 0;
+            forAll(p.boundaryField(), patchi)
+            {
+                const labelUList& fc = mesh.boundary()[patchi].faceCells();
+                forAll(fc, k) { bfc[off + k] = fc[k]; }
+                off += fc.size();
+            }
+
+            const scalarField Vc(mesh.V());
+            const int rc = rgpPEqnMeshUpload
+            (
+                nc, nif, own.begin(), nei.begin(), gg.begin(),
+                Vc.begin(), nbf, bfc.begin()
+            );
+            if (rc)
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+            gpuPEqnArmed_ = true;
+            Info<< "fgmFluid: GPU pEqn armed -- " << nc << " cells, "
+                << nif << " internal faces, " << nbf
+                << " boundary faces" << nl << endl;
+        }
+
+        // ── 경계 기여: pEqn = -laplacian(rAUf, p)의 경계 계수 ─────────
+        //    diag += -pGamma*gic, source += +pGamma*gbc (fvm 부호 규약)
+        gpuPEqnBuf_.setSize(3*nbf);
+        double* bDiagA = gpuPEqnBuf_.begin();
+        double* bSrcA  = bDiagA + nbf;
+        double* phiBA  = bSrcA + nbf;
+        {
+            label off = 0;
+            forAll(p.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pp = p.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+
+                const scalarField pGamma
+                (
+                    rAUf.boundaryField()[patchi]
+                   *mesh.magSf().boundaryField()[patchi]
+                );
+                const scalarField gic(pp.gradientInternalCoeffs());
+                const scalarField gbc(pp.gradientBoundaryCoeffs());
+                const scalarField& phb =
+                    phiHbyAv.boundaryField()[patchi];
+
+                for (label k = 0; k < np; k++)
+                {
+                    bDiagA[off + k] = -pGamma[k]*gic[k];
+                    bSrcA[off + k]  =  pGamma[k]*gbc[k];
+                    phiBA[off + k]  =  phb[k];
+                }
+                off += np;
             }
         }
 
-        if (pimple.finalNonOrthogonalIter())
+        const bool needRef = p.needReference();
+        const label refCell = needRef ? pressureReference.refCell() : 0;
+        const scalar refValue = needRef ? pressureReference.refValue() : 0;
+        const scalar dtInv = 1.0/runTime.deltaTValue();
+
+        // ── 검증 모드: CPU fvMatrix 계수와 대조 ──────────────────────
+        if (gpuPEqnCheck_)
         {
-            // Reconstruct the mass flux from the corrected volumetric flux
-            phi = rhof*(phiHbyAv + pEqn.flux());
+            fvScalarMatrix pDDtEqnChk
+            (
+                psis*fvm::ddt(p)
+              + fvc::div(phiHbyAv)
+            );
+            fvScalarMatrix pEqnChk(pDDtEqnChk - fvm::laplacian(rAUf, p));
+            pEqnChk.setReference
+            (
+                pressureReference.refCell(), pressureReference.refValue()
+            );
+
+            scalarField diagC(pEqnChk.diag());
+            scalarField srcC(pEqnChk.source());
+            forAll(p.boundaryField(), patchi)
+            {
+                const labelUList& fc = mesh.boundary()[patchi].faceCells();
+                const scalarField& iC = pEqnChk.internalCoeffs()[patchi];
+                const scalarField& bC = pEqnChk.boundaryCoeffs()[patchi];
+                forAll(fc, k)
+                {
+                    diagC[fc[k]] += iC[k];
+                    srcC[fc[k]] += bC[k];
+                }
+            }
+
+            List<double> dG(nc), uG(nif), bG(nc);
+            const int rc = rgpPEqnAssembleDump
+            (
+                dtInv, rAUf.primitiveField().begin(),
+                psis.primitiveField().begin(),
+                p.oldTime().primitiveField().begin(),
+                phiHbyAv.primitiveField().begin(),
+                phiBA, bDiagA, bSrcA,
+                needRef, refCell, refValue,
+                dG.begin(), uG.begin(), bG.begin()
+            );
+            if (rc)
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnAssembleDump: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+
+            scalar dMax = 0, uMax = 0, bMax = 0;
+            forAll(diagC, i)
+            {
+                dMax = max(dMax, mag(dG[i] - diagC[i])
+                    /max(mag(diagC[i]), small));
+                bMax = max(bMax, mag(bG[i] - srcC[i])
+                    /max(mag(srcC[i]), small));
+            }
+            const scalarField& uC = pEqnChk.upper();
+            forAll(uC, f)
+            {
+                uMax = max(uMax, mag(uG[f] - uC[f])
+                    /max(mag(uC[f]), small));
+            }
+            Info<< "gpuPEqnCheck: maxRel diag = " << dMax
+                << ", upper = " << uMax << ", source = " << bMax << endl;
+        }
+
+        // ── 솔버 컨트롤 (fvSolution p/pFinal 자동 선택) + 솔브 ────────
+        // fvMatrix::solver()와 동일 규약: 최종 보정자에서 "pFinal" 선택
+        const dictionary& sd = mesh.solution().solverDict
+        (
+            p.select
+            (
+                !mesh.schemes().steady()
+             && solutionControl::finalIteration(mesh)
+            )
+        );
+        const scalar tol = sd.lookup<scalar>("tolerance");
+        const scalar rtol = sd.lookupOrDefault<scalar>("relTol", 0);
+        const label maxIter = sd.lookupOrDefault<label>("maxIter", 1000);
+
+        gpuPEqnFlux_.setSize(nif);
+        double res0 = 0, resF = 0;
+        int nIter = 0;
+
+        std::chrono::steady_clock::time_point tS;
+        if (thermoTimings_) { tS = std::chrono::steady_clock::now(); }
+
+        const int rc = rgpPEqnSolve
+        (
+            dtInv,
+            rAUf.primitiveField().begin(),
+            psis.primitiveField().begin(),
+            p.oldTime().primitiveField().begin(),
+            p.primitiveField().begin(),
+            phiHbyAv.primitiveField().begin(),
+            phiBA, bDiagA, bSrcA,
+            needRef, refCell, refValue,
+            tol, rtol, maxIter,
+            p.primitiveFieldRef().begin(), gpuPEqnFlux_.begin(),
+            &res0, &resF, &nIter
+        );
+        if (rc)
+        {
+            FatalErrorInFunction
+                << "rgpPEqnSolve: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        Info<< "rgpPCG:  Solving for p, Initial residual = " << res0
+            << ", Final residual = " << resF
+            << ", No Iterations " << nIter << endl;
+
+        if (thermoTimings_)
+        {
+            Info<< "pCorr pEqn.solve = "
+                << std::chrono::duration<double>
+                   (std::chrono::steady_clock::now() - tS).count()
+                << " s" << endl;
+        }
+
+        p.correctBoundaryConditions();
+
+        // ── 질량 플럭스 재구성: phi = rhof*(phiHbyAv + pEqn.flux()) ──
+        {
+            scalarField& phic = phi.primitiveFieldRef();
+            const scalarField& rf = rhof.primitiveField();
+            const scalarField& ph = phiHbyAv.primitiveField();
+            forAll(phic, f)
+            {
+                phic[f] = rf[f]*(ph[f] + gpuPEqnFlux_[f]);
+            }
+
+            // 경계: fvMatrix::flux() 규약 — iC*p_internal - bC
+            label off = 0;
+            forAll(p.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pp = p.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+
+                const scalarField pi(pp.patchInternalField());
+                const scalarField& rfb = rhof.boundaryField()[patchi];
+                const scalarField& phb =
+                    phiHbyAv.boundaryField()[patchi];
+                scalarField& phibf = phi.boundaryFieldRef()[patchi];
+
+                for (label k = 0; k < np; k++)
+                {
+                    const scalar fluxB =
+                        bDiagA[off + k]*pi[k] - bSrcA[off + k];
+                    phibf[k] = rfb[k]*(phb[k] + fluxB);
+                }
+                off += np;
+            }
+        }
+    }
+    else
+    {
+        fvScalarMatrix pDDtEqn
+        (
+            psis*fvm::ddt(p)
+          + fvc::div(phiHbyAv)
+        );
+        if (LADrhoCoeff > 0)
+        {
+            // AMD 항도 계수가 켜졌을 때만 조립 (0 기여, 생략은 비트-동일)
+            pDDtEqn -= fvc::laplacian(Dr, rho)/rho;
+        }
+
+        while (pimple.correctNonOrthogonal())
+        {
+            fvScalarMatrix pEqn(pDDtEqn - fvm::laplacian(rAUf, p));
+
+            pEqn.setReference
+            (
+                pressureReference.refCell(),
+                pressureReference.refValue()
+            );
+
+            fvConstraints().constrain(pEqn);
+
+            {
+                std::chrono::steady_clock::time_point tS;
+                if (thermoTimings_)
+                {
+                    tS = std::chrono::steady_clock::now();
+                }
+                pEqn.solve();
+                if (thermoTimings_)
+                {
+                    Info<< "pCorr pEqn.solve = "
+                        << std::chrono::duration<double>
+                           (std::chrono::steady_clock::now() - tS).count()
+                        << " s" << endl;
+                }
+            }
+
+            if (pimple.finalNonOrthogonalIter())
+            {
+                // Reconstruct the mass flux from the corrected volumetric
+                // flux
+                phi = rhof*(phiHbyAv + pEqn.flux());
+            }
         }
     }
 
