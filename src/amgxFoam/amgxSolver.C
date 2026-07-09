@@ -55,6 +55,7 @@ namespace
         AMGX_matrix_handle A = nullptr;
         AMGX_vector_handle x = nullptr, b = nullptr;
         Foam::label nCells = -1, nnz = -1;
+        Foam::label solveCount = 0;
         std::vector<int> rowPtr, colInd;
         std::vector<double> vals;
         std::string json;
@@ -105,11 +106,14 @@ Foam::amgxSolver::amgxSolver
                 "{\"config_version\":2,\"solver\":{"
                 "\"solver\":\"PCG\",\"max_iters\":200,"
                 "\"convergence\":\"ABSOLUTE\",\"norm\":\"L2\","
-                "\"monitor_residual\":1,\"store_res_history\":1,"
+                "\"monitor_residual\":1,"
                 "\"preconditioner\":{"
                 "\"solver\":\"AMG\",\"algorithm\":\"CLASSICAL\","
+                "\"interpolator\":\"D2\",\"aggressive_levels\":2,"
                 "\"max_levels\":24,\"cycle\":\"V\","
-                "\"smoother\":{\"solver\":\"JACOBI_L1\"},"
+                "\"matrix_coloring_scheme\":\"MIN_MAX\","
+                "\"smoother\":{\"solver\":\"MULTICOLOR_DILU\","
+                "\"monitor_residual\":0},"
                 "\"presweeps\":1,\"postsweeps\":1,"
                 "\"max_iters\":1"
                 "}}}"
@@ -271,7 +275,21 @@ Foam::solverPerformance Foam::amgxSolver::solve
         AMGX_CHK(AMGX_config_add_parameters(&F.cfg, buf));
     }
 
-    AMGX_CHK(AMGX_solver_setup(F.solver, F.A));
+    // AMG 계층 재사용: 구조 재생성/주기적 리프레시 때만 full setup,
+    // 그 외에는 resetup(기존 계층에 새 계수만 반영) — setup 비용 제거.
+    const label setupInterval =
+        controlDict_.lookupOrDefault<label>("setupInterval", 25);
+    if (rebuild)
+    {
+        AMGX_CHK(AMGX_solver_setup(F.solver, F.A));
+    }
+    else if (setupInterval > 0 && (F.solveCount % setupInterval) == 0)
+    {
+        AMGX_CHK(AMGX_solver_resetup(F.solver, F.A));
+    }
+    // 그 외: AMG 계층 동결 — 전처리기만 미세하게 stale, PCG는 새 계수의
+    // A로 수렴 판정하므로 정확성 무손실 (flexible preconditioning).
+    F.solveCount++;
 
     AMGX_CHK(AMGX_vector_upload(F.x, n, 1, psi.begin()));
     AMGX_CHK(AMGX_vector_upload(F.b, n, 1, const_cast<scalar*>(source.begin())));
