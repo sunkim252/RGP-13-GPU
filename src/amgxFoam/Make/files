@@ -1,3 +1,4 @@
 amgxSolver.C
+rgpPEqnAmgx.C
 
 LIB = $(FOAM_USER_LIBBIN)/libRGP13amgx

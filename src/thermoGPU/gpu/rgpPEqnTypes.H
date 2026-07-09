@@ -63,6 +63,33 @@ int rgpPEqnAssembleDump
     double* diagOut, double* upperOut, double* bOut
 );
 
+/*  AmgX 직결 (③): CSR 구조를 1회 생성하고, 조립 결과를 디바이스 CSR
+    값으로 산포. 솔브는 외부(libRGP13amgx의 rgpPEqnAmgxSolve)가 디바이스
+    포인터로 수행하고, 잔차 확인·플럭스·회수는 여기서.                 */
+int rgpPEqnCsrPrepare(int* nnzOut);
+const int* rgpPEqnCsrRowPtr(void);   /* [nCells+1] 호스트 */
+const int* rgpPEqnCsrColInd(void);   /* [nnz] 호스트 */
+void* rgpPEqnDevValues(void);        /* [nnz] 디바이스 */
+void* rgpPEqnDevB(void);             /* [nCells] 디바이스 */
+void* rgpPEqnDevX(void);             /* [nCells] 디바이스 (x0=p, 솔브 후 p) */
+
+int rgpPEqnAssembleCsr
+(
+    double dtInv,
+    const double* rAUfInt,
+    const double* psis, const double* pOld, const double* p0,
+    const double* phiInt, const double* phiB,
+    const double* bDiag, const double* bSrc,
+    int needRef, int refCell, double refValue,
+    double* normFactor, double* initRes
+);
+
+/*  현재 x의 OF 규약 잔차 Σ|b-Ax|/normFactor */
+int rgpPEqnResidual(double normFactor, double* res);
+
+/*  솔브 후처리: faceH 플럭스 + p/flux D2H */
+int rgpPEqnFinish(double* pOut, double* fluxInt);
+
 void rgpPEqnFree(void);
 const char* rgpPEqnLastError(void);
 

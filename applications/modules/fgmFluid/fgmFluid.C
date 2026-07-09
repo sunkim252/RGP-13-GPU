@@ -123,6 +123,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuArmed_(false),
     gpuPEqn_(fgmTable_.lookupOrDefault<Switch>("gpuPEqn", false)),
     gpuPEqnCheck_(fgmTable_.lookupOrDefault<Switch>("gpuPEqnCheck", false)),
+    gpuPEqnSolver_(fgmTable_.lookupOrDefault<word>("gpuPEqnSolver", "pcg")),
+    gpuPEqnNnz_(0),
     gpuPEqnArmed_(false),
     gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
     gpuManifoldArmed_(false),

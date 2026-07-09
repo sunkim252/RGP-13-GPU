@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <math.h>
+#include <vector>
 
 namespace
 {
@@ -33,6 +34,12 @@ namespace
         int nCells = 0, nIntFaces = 0, nBFaces = 0;
         int    *own = nullptr, *nei = nullptr, *bfc = nullptr;
         double *gg = nullptr, *V = nullptr;
+
+        // CSR (AmgX 직결용): 구조는 호스트 보관, 슬롯맵·값은 디바이스
+        std::vector<int> hOwn, hNei, hRowPtr, hColInd;
+        int nnz = 0;
+        int *dDiagSlot = nullptr, *dUpSlot = nullptr, *dLoSlot = nullptr;
+        double *dVals = nullptr;
     } gM;
 
     struct PBuf
@@ -51,9 +58,15 @@ namespace
 
     void pFreeAll()
     {
-        int* ip[] = {gM.own, gM.nei, gM.bfc};
+        int* ip[] = {gM.own, gM.nei, gM.bfc,
+                     gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot};
         for (auto p : ip) { if (p) cudaFree(p); }
         gM.own = gM.nei = gM.bfc = nullptr;
+        gM.dDiagSlot = gM.dUpSlot = gM.dLoSlot = nullptr;
+        if (gM.dVals) { cudaFree(gM.dVals); gM.dVals = nullptr; }
+        gM.hOwn.clear(); gM.hNei.clear();
+        gM.hRowPtr.clear(); gM.hColInd.clear();
+        gM.nnz = 0;
 
         double** dp[] =
         {
@@ -240,6 +253,32 @@ __global__ void cgUpdate
     r[i] -= alpha*wA[i];
 }
 
+//- LDU → CSR 값 산포 (구조는 정적, 슬롯맵으로 O(1) 기록)
+__global__ void csrScatterDiag
+(
+    const int n, const int* __restrict__ slot,
+    const double* __restrict__ diag, double* __restrict__ vals
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    vals[slot[i]] = diag[i];
+}
+
+__global__ void csrScatterFace
+(
+    const int nf,
+    const int* __restrict__ upSlot, const int* __restrict__ loSlot,
+    const double* __restrict__ upper, double* __restrict__ vals
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    vals[upSlot[f]] = upper[f];   // 대칭: lower == upper
+    vals[loSlot[f]] = upper[f];
+}
+
+
 //- 내부면 플럭스: faceH = upper*x_n - lower*x_o = -upper*(x_o - x_n)...
 //  대칭(lower=upper)이므로 faceH_f = upper_f*(x_n - x_o)
 __global__ void faceFlux
@@ -354,6 +393,8 @@ int rgpPEqnMeshUpload
 {
     pFreeAll();
     gM.nCells = nCells; gM.nIntFaces = nIntFaces; gM.nBFaces = nBFaces;
+    gM.hOwn.assign(owner, owner + nIntFaces);
+    gM.hNei.assign(neigh, neigh + nIntFaces);
 
     cudaError_t e;
     struct { void** d; const void* s; size_t bytes; } it[] =
@@ -553,6 +594,195 @@ int rgpPEqnAssembleDump
     if ((e = cudaMemcpy(bOut, gB.b, (size_t)nc*sizeof(double),
                         cudaMemcpyDeviceToHost)) != cudaSuccess)
         return pfail(e, "peqn/dump b");
+    return 0;
+}
+
+
+int rgpPEqnCsrPrepare(int* nnzOut)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    if (nc <= 0)
+    {
+        snprintf(gPErr, sizeof(gPErr), "peqn/csr: mesh not uploaded");
+        return -1;
+    }
+
+    // 구조: row 당 [lower cols(<row)] [diag] [upper cols(>row)] —
+    // amgxSolver.C와 동일한 삽입 순서 (lduAddr 정렬 승계)
+    const int nnz = nc + 2*nf;
+    gM.hRowPtr.assign(nc + 1, 0);
+    for (int f = 0; f < nf; f++)
+    {
+        gM.hRowPtr[gM.hNei[f] + 1]++;
+        gM.hRowPtr[gM.hOwn[f] + 1]++;
+    }
+    for (int r = 0; r < nc; r++)
+    {
+        gM.hRowPtr[r + 1] += gM.hRowPtr[r] + 1;
+    }
+
+    gM.hColInd.assign(nnz, -1);
+    std::vector<int> diagSlot(nc), upSlot(nf), loSlot(nf), fill(nc, 0);
+
+    for (int f = 0; f < nf; f++)      // lower: row=nei, col=own
+    {
+        const int r = gM.hNei[f];
+        const int k = gM.hRowPtr[r] + fill[r]++;
+        gM.hColInd[k] = gM.hOwn[f];
+        loSlot[f] = k;
+    }
+    for (int r = 0; r < nc; r++)      // diag
+    {
+        const int k = gM.hRowPtr[r] + fill[r]++;
+        gM.hColInd[k] = r;
+        diagSlot[r] = k;
+    }
+    for (int f = 0; f < nf; f++)      // upper: row=own, col=nei
+    {
+        const int r = gM.hOwn[f];
+        const int k = gM.hRowPtr[r] + fill[r]++;
+        gM.hColInd[k] = gM.hNei[f];
+        upSlot[f] = k;
+    }
+
+    cudaError_t e;
+    struct { int** d; const int* s; size_t n; } it[] =
+    {
+        {&gM.dDiagSlot, diagSlot.data(), (size_t)nc},
+        {&gM.dUpSlot, upSlot.data(), (size_t)nf},
+        {&gM.dLoSlot, loSlot.data(), (size_t)nf}
+    };
+    for (auto& i : it)
+    {
+        if (!*i.d)
+        {
+            if ((e = cudaMalloc(i.d, i.n*sizeof(int))) != cudaSuccess)
+                return pfail(e, "peqn/csr malloc");
+        }
+        if ((e = cudaMemcpy(*i.d, i.s, i.n*sizeof(int),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "peqn/csr H2D");
+    }
+    if (!gM.dVals)
+    {
+        if ((e = cudaMalloc(&gM.dVals, (size_t)nnz*sizeof(double)))
+            != cudaSuccess) return pfail(e, "peqn/csr vals malloc");
+    }
+
+    gM.nnz = nnz;
+    *nnzOut = nnz;
+    return 0;
+}
+
+
+const int* rgpPEqnCsrRowPtr(void) { return gM.hRowPtr.data(); }
+const int* rgpPEqnCsrColInd(void) { return gM.hColInd.data(); }
+void* rgpPEqnDevValues(void) { return gM.dVals; }
+void* rgpPEqnDevB(void) { return gB.b; }
+void* rgpPEqnDevX(void) { return gB.x; }
+
+
+int rgpPEqnAssembleCsr
+(
+    double dtInv,
+    const double* rAUfInt,
+    const double* psis, const double* pOld, const double* p0,
+    const double* phiInt, const double* phiB,
+    const double* bDiag, const double* bSrc,
+    int needRef, int refCell, double refValue,
+    double* normFactor, double* initRes
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    if (gM.nnz <= 0)
+    {
+        snprintf(gPErr, sizeof(gPErr), "peqn/csr: not prepared");
+        return -1;
+    }
+
+    int rc = assemble(dtInv, rAUfInt, psis, pOld, phiInt, phiB,
+                      bDiag, bSrc, needRef, refCell, refValue);
+    if (rc) return rc;
+
+    // LDU → CSR 값 산포
+    rgppeqn::csrScatterDiag<<<nb(nc), BS>>>(nc, gM.dDiagSlot, gB.diag,
+                                            gM.dVals);
+    rgppeqn::csrScatterFace<<<nb(nf), BS>>>(nf, gM.dUpSlot, gM.dLoSlot,
+                                            gB.upper, gM.dVals);
+
+    cudaError_t e;
+    if ((e = cudaMemcpy(gB.x, p0, (size_t)nc*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "peqn/csr H2D x0");
+
+    // OF normFactor + 초기 잔차 (rgpPEqnSolve와 동일 규약)
+    if ((e = cudaMemcpy(gB.rowSum, gB.diag, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToDevice)) != cudaSuccess)
+        return pfail(e, "peqn/csr rowSum D2D");
+    rgppeqn::faceRowSum<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
+                                        gB.rowSum);
+
+    rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gB.x, gB.wA);
+    rgppeqn::faceSpmv<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
+                                      gB.x, gB.wA);
+    rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "peqn/csr launch");
+
+    double sumX = 0;
+    if ((rc = reduceHost(nc, 0, gB.x, nullptr, 0, nullptr, sumX))) return rc;
+    const double xRef = sumX/nc;
+    double nf1 = 0, nf2 = 0;
+    if ((rc = reduceHost(nc, 3, gB.wA, nullptr, xRef, gB.rowSum, nf1)))
+        return rc;
+    if ((rc = reduceHost(nc, 3, gB.b, nullptr, xRef, gB.rowSum, nf2)))
+        return rc;
+    *normFactor = nf1 + nf2 + 1e-20;
+
+    double res = 0;
+    if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res))) return rc;
+    *initRes = res/(*normFactor);
+
+    return 0;
+}
+
+
+int rgpPEqnResidual(double normFactor, double* res)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+
+    rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gB.x, gB.wA);
+    rgppeqn::faceSpmv<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
+                                      gB.x, gB.wA);
+    rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
+    cudaError_t e;
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "peqn/res launch");
+
+    double r = 0;
+    int rc;
+    if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, r))) return rc;
+    *res = r/normFactor;
+    return 0;
+}
+
+
+int rgpPEqnFinish(double* pOut, double* fluxInt)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+
+    rgppeqn::faceFlux<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
+                                      gB.x, gB.flux);
+    cudaError_t e;
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "peqn/finish launch");
+
+    if ((e = cudaMemcpy(pOut, gB.x, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "peqn/finish D2H p");
+    if ((e = cudaMemcpy(fluxInt, gB.flux, (size_t)nf*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "peqn/finish D2H flux");
     return 0;
 }
 

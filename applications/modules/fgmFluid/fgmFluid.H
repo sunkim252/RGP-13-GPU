@@ -234,6 +234,14 @@ protected:
         //- pEqnGPU 검증 모드: CPU fvMatrix와 계수/플럭스 대조 출력
         Switch gpuPEqnCheck_;
 
+        //- pEqnGPU 솔버 선택: "pcg"(자체 Jacobi-PCG) | "amgx"(디바이스
+        //  CSR을 libRGP13amgx의 rgpPEqnAmgxSolve로 — dlsym 연결이라
+        //  controlDict libs에 libRGP13amgx.so 필요)
+        word gpuPEqnSolver_;
+
+        //- pEqnGPU CSR nnz (amgx 경로, 아밍 시 설정)
+        mutable label gpuPEqnNnz_;
+
         //- pEqnGPU 메시 업로드 완료 플래그 + 작업 버퍼
         mutable bool gpuPEqnArmed_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)

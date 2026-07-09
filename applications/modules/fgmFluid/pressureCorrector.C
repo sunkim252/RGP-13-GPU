@@ -55,6 +55,7 @@ Description
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
+#include <dlfcn.h>
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
@@ -380,10 +381,23 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
                     << exit(FatalError);
             }
+            if (gpuPEqnSolver_ == "amgx")
+            {
+                int nnz = 0;
+                if (rgpPEqnCsrPrepare(&nnz))
+                {
+                    FatalErrorInFunction
+                        << "rgpPEqnCsrPrepare: " << rgpPEqnLastError()
+                        << exit(FatalError);
+                }
+                gpuPEqnNnz_ = nnz;
+            }
+
             gpuPEqnArmed_ = true;
             Info<< "fgmFluid: GPU pEqn armed -- " << nc << " cells, "
                 << nif << " internal faces, " << nbf
-                << " boundary faces" << nl << endl;
+                << " boundary faces (solver: " << gpuPEqnSolver_ << ")"
+                << nl << endl;
         }
 
         // ── 경계 기여: pEqn = -laplacian(rAUf, p)의 경계 계수 ─────────
@@ -510,30 +524,131 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         std::chrono::steady_clock::time_point tS;
         if (thermoTimings_) { tS = std::chrono::steady_clock::now(); }
 
-        const int rc = rgpPEqnSolve
-        (
-            dtInv,
-            rAUf.primitiveField().begin(),
-            psis.primitiveField().begin(),
-            p.oldTime().primitiveField().begin(),
-            p.primitiveField().begin(),
-            phiHbyAv.primitiveField().begin(),
-            phiBA, bDiagA, bSrcA,
-            needRef, refCell, refValue,
-            tol, rtol, maxIter,
-            p.primitiveFieldRef().begin(), gpuPEqnFlux_.begin(),
-            &res0, &resF, &nIter
-        );
-        if (rc)
+        if (gpuPEqnSolver_ == "amgx")
         {
-            FatalErrorInFunction
-                << "rgpPEqnSolve: " << rgpPEqnLastError()
-                << exit(FatalError);
-        }
+            // ── AmgX 직결: 디바이스 CSR 조립 → AmgX PCG+AMG(계층 동결)
+            //    → OF 규약 잔차로 수렴 확인(미달 시 톨 조여 재솔브) ──
+            typedef int (*AmgxFn)
+            (
+                int, int, const int*, const int*,
+                void*, void*, void*, double, int, int*
+            );
+            typedef const char* (*AmgxErrFn)(void);
+            static AmgxFn amgxFn = nullptr;
+            static AmgxErrFn amgxErrFn = nullptr;
+            if (!amgxFn)
+            {
+                amgxFn = reinterpret_cast<AmgxFn>
+                    (dlsym(RTLD_DEFAULT, "rgpPEqnAmgxSolve"));
+                amgxErrFn = reinterpret_cast<AmgxErrFn>
+                    (dlsym(RTLD_DEFAULT, "rgpPEqnAmgxErr"));
+                if (!amgxFn || !amgxErrFn)
+                {
+                    FatalErrorInFunction
+                        << "gpuPEqnSolver amgx requires libRGP13amgx.so "
+                        << "in the controlDict libs list"
+                        << exit(FatalError);
+                }
+            }
 
-        Info<< "rgpPCG:  Solving for p, Initial residual = " << res0
-            << ", Final residual = " << resF
-            << ", No Iterations " << nIter << endl;
+            double normFactor = 0;
+            int rc = rgpPEqnAssembleCsr
+            (
+                dtInv,
+                rAUf.primitiveField().begin(),
+                psis.primitiveField().begin(),
+                p.oldTime().primitiveField().begin(),
+                p.primitiveField().begin(),
+                phiHbyAv.primitiveField().begin(),
+                phiBA, bDiagA, bSrcA,
+                needRef, refCell, refValue,
+                &normFactor, &res0
+            );
+            if (rc)
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnAssembleCsr: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+
+            const label setupInterval =
+                fgmTable_.lookupOrDefault<label>
+                (
+                    "gpuPEqnSetupInterval", 25
+                );
+
+            const scalar target = max(tol, rtol*res0);
+            resF = res0;
+            // AmgX per-solve 톨 주입은 라이브 솔버에 반영되지 않으므로
+            // (config_add_parameters 잠복 이슈) 고정 4-iter 블록으로
+            // 돌리고 OF 규약 잔차로 외부에서 수렴 판정한다. x는 블록 간
+            // 연속이라 정확히 이어서 수렴한다.
+            for (int round = 0; round < 25 && resF >= target; round++)
+            {
+                int it = 0;
+                rc = amgxFn
+                (
+                    nc, gpuPEqnNnz_,
+                    rgpPEqnCsrRowPtr(), rgpPEqnCsrColInd(),
+                    rgpPEqnDevValues(), rgpPEqnDevB(), rgpPEqnDevX(),
+                    0.0, setupInterval, &it
+                );
+                if (rc)
+                {
+                    FatalErrorInFunction
+                        << "rgpPEqnAmgxSolve: " << amgxErrFn()
+                        << exit(FatalError);
+                }
+                nIter += it;
+                if (rgpPEqnResidual(normFactor, &resF))
+                {
+                    FatalErrorInFunction
+                        << "rgpPEqnResidual: " << rgpPEqnLastError()
+                        << exit(FatalError);
+                }
+            }
+
+            if (rgpPEqnFinish
+                (
+                    p.primitiveFieldRef().begin(), gpuPEqnFlux_.begin()
+                ))
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnFinish: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+
+            Info<< "rgpAmgX: Solving for p, Initial residual = " << res0
+                << ", Final residual = " << resF
+                << ", No Iterations " << nIter << endl;
+        }
+        else
+        {
+            const int rc = rgpPEqnSolve
+            (
+                dtInv,
+                rAUf.primitiveField().begin(),
+                psis.primitiveField().begin(),
+                p.oldTime().primitiveField().begin(),
+                p.primitiveField().begin(),
+                phiHbyAv.primitiveField().begin(),
+                phiBA, bDiagA, bSrcA,
+                needRef, refCell, refValue,
+                tol, rtol, maxIter,
+                p.primitiveFieldRef().begin(), gpuPEqnFlux_.begin(),
+                &res0, &resF, &nIter
+            );
+            if (rc)
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnSolve: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+
+            Info<< "rgpPCG:  Solving for p, Initial residual = " << res0
+                << ", Final residual = " << resF
+                << ", No Iterations " << nIter << endl;
+        }
 
         if (thermoTimings_)
         {
