@@ -19,6 +19,8 @@
 #include "rhoThermo.H"
 
 #include "gpu/rgpKernelTypes.H"
+#include "gpu/rgpFgmTypes.H"
+#include <cstring>
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
@@ -120,6 +122,8 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         N += Tf.boundaryField()[patchi].size();
     }
 
+    const label nB = N - nInt;
+
     if (gpuP_.size() < N)
     {
         gpuP_.setSize(N);      gpuT_.setSize(N);      gpuY_.setSize(N*n);
@@ -130,7 +134,56 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         gpuCp_.setSize(N);     gpuCv_.setSize(N);     gpuPsi_.setSize(N);
     }
 
-    // ── gather: 내부 셀 ──────────────────────────────────────────────
+    // ── fgm 디바이스 체인: 직전 updateManifold의 (T, Y_tab) SoA가 아직
+    // 디바이스에 있으므로 내부 셀의 T/Y gather + H2D 재업로드를 제거하고
+    // p만 올린다. 비테이블 종(보통 0-1개)만 호스트 SoA로 보충.
+    bool chained = false;
+    if (gpuManifoldArmed_ && rgpFgmDevLastN() == nInt)
+    {
+        List<int> yMap(n, -1);
+        forAll(tabSpecieIDs_, k) { yMap[tabSpecieIDs_[k]] = 2 + k; }
+        label nH = 0;
+        forAll(yMap, s) { if (yMap[s] < 0) { yMap[s] = -1 - nH; nH++; } }
+
+        label h = 0;
+        forAll(yMap, s)
+        {
+            if (yMap[s] < 0)
+            {
+                std::memcpy
+                (
+                    &gpuY_[h*nInt],
+                    Y_[s].primitiveField().begin(),
+                    nInt*sizeof(double)
+                );
+                h++;
+            }
+        }
+
+        std::memcpy
+        (
+            gpuP_.begin(), pf.primitiveField().begin(), nInt*sizeof(double)
+        );
+
+        chained =
+            rgpGpuEvaluateFromFgm
+            (
+                nInt,
+                gpuP_.begin(), yMap.begin(), nH, gpuY_.begin(),
+                gpuRho_.begin(), gpuMu_.begin(), gpuKappa_.begin(),
+                gpuCp_.begin(), gpuCv_.begin(), gpuPsi_.begin()
+            ) == 0;
+
+        if (!chained)
+        {
+            WarningInFunction
+                << "fgm device chain failed (" << rgpGpuLastError()
+                << ") -- falling back to the full-batch path" << endl;
+        }
+    }
+
+    // ── gather: 내부 셀 (비체인 폴백만) ──────────────────────────────
+    if (!chained)
     {
         const scalarField& pc = pf.primitiveField();
         const scalarField& Tc = Tf.primitiveField();
@@ -149,7 +202,7 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         }
     }
 
-    // ── gather: 패치 면 ──────────────────────────────────────────────
+    // ── gather: 패치 면 (양 경로 공통 — 경계는 항상 호스트에서) ──────
     label off = nInt;
     forAll(Tf.boundaryField(), patchi)
     {
@@ -172,19 +225,42 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         off += np;
     }
 
-    // ── GPU 일괄 평가 ────────────────────────────────────────────────
-    const int err = rgpGpuEvaluate
-    (
-        N,
-        gpuP_.begin(), gpuT_.begin(), gpuY_.begin(),
-        gpuRho_.begin(), gpuMu_.begin(), gpuKappa_.begin(),
-        gpuCp_.begin(), gpuCv_.begin(), gpuPsi_.begin()
-    );
-    if (err)
+    // ── GPU 일괄 평가: 비체인=전체 배치 / 체인=경계면 소배치 ─────────
+    if (!chained)
     {
-        FatalErrorInFunction
-            << "rgpGpuEvaluate (" << N << " states): " << rgpGpuLastError()
-            << exit(FatalError);
+        const int err = rgpGpuEvaluate
+        (
+            N,
+            gpuP_.begin(), gpuT_.begin(), gpuY_.begin(),
+            gpuRho_.begin(), gpuMu_.begin(), gpuKappa_.begin(),
+            gpuCp_.begin(), gpuCv_.begin(), gpuPsi_.begin()
+        );
+        if (err)
+        {
+            FatalErrorInFunction
+                << "rgpGpuEvaluate (" << N << " states): "
+                << rgpGpuLastError()
+                << exit(FatalError);
+        }
+    }
+    else if (nB > 0)
+    {
+        const int err = rgpGpuEvaluate
+        (
+            nB,
+            gpuP_.begin() + nInt, gpuT_.begin() + nInt,
+            gpuY_.begin() + nInt*n,
+            gpuRho_.begin() + nInt, gpuMu_.begin() + nInt,
+            gpuKappa_.begin() + nInt, gpuCp_.begin() + nInt,
+            gpuCv_.begin() + nInt, gpuPsi_.begin() + nInt
+        );
+        if (err)
+        {
+            FatalErrorInFunction
+                << "rgpGpuEvaluate (boundary, " << nB << " states): "
+                << rgpGpuLastError()
+                << exit(FatalError);
+        }
     }
 
     // ── scatter: thermo 필드 (RhoFluidThermo::calculate()가 채우는 세트).
@@ -260,6 +336,8 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
         N += Tf.boundaryField()[patchi].size();
     }
 
+    const label nB = N - nInt;
+
     if (gpuP_.size() < N)
     {
         gpuP_.setSize(N);  gpuT_.setSize(N);  gpuY_.setSize(N*n);
@@ -269,7 +347,54 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
         gpuCp_.setSize(N);   // ha 출력 버퍼로 재사용
     }
 
-    // ── gather: 내부 셀 ──────────────────────────────────────────────
+    // ── fgm 디바이스 체인: (T, Y_tab)는 직전 fgm evaluate의 디바이스
+    // SoA에서 직접 — 내부 셀은 p 업로드만으로 ha 평가.
+    bool chained = false;
+    if (gpuManifoldArmed_ && rgpFgmDevLastN() == nInt)
+    {
+        List<int> yMap(n, -1);
+        forAll(tabSpecieIDs_, k) { yMap[tabSpecieIDs_[k]] = 2 + k; }
+        label nH = 0;
+        forAll(yMap, s) { if (yMap[s] < 0) { yMap[s] = -1 - nH; nH++; } }
+
+        label h = 0;
+        forAll(yMap, s)
+        {
+            if (yMap[s] < 0)
+            {
+                std::memcpy
+                (
+                    &gpuY_[h*nInt],
+                    Y_[s].primitiveField().begin(),
+                    nInt*sizeof(double)
+                );
+                h++;
+            }
+        }
+
+        std::memcpy
+        (
+            gpuP_.begin(), pf.primitiveField().begin(), nInt*sizeof(double)
+        );
+
+        chained =
+            rgpGpuEvaluateHaFromFgm
+            (
+                nInt,
+                gpuP_.begin(), yMap.begin(), nH, gpuY_.begin(),
+                gpuCp_.begin()
+            ) == 0;
+
+        if (!chained)
+        {
+            WarningInFunction
+                << "fgm device chain failed (" << rgpGpuLastError()
+                << ") -- falling back to the full-batch path" << endl;
+        }
+    }
+
+    // ── gather: 내부 셀 (비체인 폴백만) ──────────────────────────────
+    if (!chained)
     {
         const scalarField& pc = pf.primitiveField();
         const scalarField& Tc = Tf.primitiveField();
@@ -288,7 +413,7 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
         }
     }
 
-    // ── gather: 패치 면 ──────────────────────────────────────────────
+    // ── gather: 패치 면 (양 경로 공통) ───────────────────────────────
     label off = nInt;
     forAll(Tf.boundaryField(), patchi)
     {
@@ -311,18 +436,37 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
         off += np;
     }
 
-    // ── GPU 일괄 ha 평가 ─────────────────────────────────────────────
-    const int err = rgpGpuEvaluateHa
-    (
-        N,
-        gpuP_.begin(), gpuT_.begin(), gpuY_.begin(), gpuCp_.begin()
-    );
-    if (err)
+    // ── GPU 일괄 ha 평가: 비체인=전체 / 체인=경계면 소배치 ───────────
+    if (!chained)
     {
-        FatalErrorInFunction
-            << "rgpGpuEvaluateHa (" << N << " states): "
-            << rgpGpuLastError()
-            << exit(FatalError);
+        const int err = rgpGpuEvaluateHa
+        (
+            N,
+            gpuP_.begin(), gpuT_.begin(), gpuY_.begin(), gpuCp_.begin()
+        );
+        if (err)
+        {
+            FatalErrorInFunction
+                << "rgpGpuEvaluateHa (" << N << " states): "
+                << rgpGpuLastError()
+                << exit(FatalError);
+        }
+    }
+    else if (nB > 0)
+    {
+        const int err = rgpGpuEvaluateHa
+        (
+            nB,
+            gpuP_.begin() + nInt, gpuT_.begin() + nInt,
+            gpuY_.begin() + nInt*n, gpuCp_.begin() + nInt
+        );
+        if (err)
+        {
+            FatalErrorInFunction
+                << "rgpGpuEvaluateHa (boundary, " << nB << " states): "
+                << rgpGpuLastError()
+                << exit(FatalError);
+        }
     }
 
     // ── scatter: he (내부 + 경계, thermo_.he(p,T) 대입과 동일 커버리지) ─

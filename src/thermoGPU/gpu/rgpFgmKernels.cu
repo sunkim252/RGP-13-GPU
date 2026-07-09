@@ -37,6 +37,7 @@ namespace
                *msg = nullptr, *Deff = nullptr, *hw = nullptr,
                *gZ = nullptr, *chi = nullptr, *out = nullptr;
         int outCap = 0;
+        int lastN = 0;   // 마지막 evaluate의 nCells (디바이스 체인 검증용)
     } gB;
 
     void fgmFreeAll()
@@ -314,9 +315,17 @@ int rgpFgmEvaluate
                          cudaMemcpyDeviceToHost)) != cudaSuccess)
         return ffail(rc, "fgm/D2H out");
 
+    gB.lastN = nCells;
     return 0;
 }
 
+
+/*  디바이스 체인용 접근자: 마지막 rgpFgmEvaluate의 SoA 출력(디바이스
+    포인터)과 그 레이아웃. rgpGpuEvaluate*FromFgm(rgpKernels.cu)이 같은
+    .so 안에서 호출해 (T, Y_k)를 호스트 왕복 없이 재사용한다.          */
+const double* rgpFgmDevOutPtr(void) { return gB.out; }
+int rgpFgmDevNFields(void) { return gT.nFields; }
+int rgpFgmDevLastN(void) { return gB.lastN; }
 
 void rgpFgmFree(void) { fgmFreeAll(); }
 

@@ -13,6 +13,7 @@
 \*---------------------------------------------------------------------------*/
 
 #include "rgpKernelTypes.H"
+#include "rgpFgmTypes.H"
 
 #include <cuda_runtime.h>
 #include <math.h>
@@ -57,6 +58,11 @@ namespace
         double* Cp = nullptr;
         double* Cv = nullptr;
         double* psi = nullptr;
+
+        // fgm 디바이스 체인용: 종→fgm 필드 맵 + 비테이블 종 호스트 Y
+        int*    yMap = nullptr;   // [RGP_GPU_MAX_SPECIES]
+        double* yH = nullptr;     // [yHCap]
+        int     yHCap = 0;
     };
 
     DeviceTables  gTab;
@@ -87,10 +93,12 @@ namespace
         double** ptrs[] =
         {
             &gBuf.p, &gBuf.T, &gBuf.Y, &gBuf.rho, &gBuf.mu, &gBuf.kappa,
-            &gBuf.Cp, &gBuf.Cv, &gBuf.psi
+            &gBuf.Cp, &gBuf.Cv, &gBuf.psi, &gBuf.yH
         };
         for (auto pp : ptrs) { if (*pp) { cudaFree(*pp); *pp = nullptr; } }
+        if (gBuf.yMap) { cudaFree(gBuf.yMap); gBuf.yMap = nullptr; }
         gBuf.capCells = 0;
+        gBuf.yHCap = 0;
     }
 }
 
@@ -269,6 +277,34 @@ __device__ double srkPsi
         srkRho(p + dp, T, bM, coef1, coef2, coef3, cM, Wmix, RR, stableRoot);
     const double dRhodP = (rho1 - rho0)/dp;
     return fmax(dRhodP, 1e-3*rho0/p);
+}
+
+
+//- fgm 디바이스 SoA 출력(field 1 = T, field 2+k = 테이블 종 Y_k)을
+//  (T, 셀-우선 AoS Y)로 변환 — he 재시드/물성 refresh 체인의 입력 준비.
+//  yMap[s] >= 0: fgm 필드 인덱스, < 0: 호스트 업로드 SoA의 (-1-yMap[s])행
+__global__ void fgmToPTY
+(
+    const int nCells, const int n,
+    const double* __restrict__ fgmOut,
+    const int* __restrict__ yMap,
+    const double* __restrict__ yHost,
+    double* __restrict__ T,
+    double* __restrict__ Y
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nCells) return;
+
+    T[i] = fgmOut[(size_t)nCells + i];
+    for (int s = 0; s < n; s++)
+    {
+        const int m = yMap[s];
+        Y[(size_t)i*n + s] =
+            (m >= 0)
+          ? fgmOut[(size_t)m*nCells + i]
+          : yHost[(size_t)(-1 - m)*nCells + i];
+    }
 }
 
 
@@ -821,6 +857,209 @@ int rgpGpuEvaluate
         != cudaSuccess) return fail(e, "evaluate/D2H Cv");
     if ((e = cudaMemcpy(psi, gBuf.psi, b1, cudaMemcpyDeviceToHost))
         != cudaSuccess) return fail(e, "evaluate/D2H psi");
+
+    return 0;
+}
+
+
+//- fgm 디바이스 체인 공통부: 용량 확보 + p/yMap/yHost 업로드 +
+//  fgm SoA 출력 → (gBuf.T, gBuf.Y AoS) 변환. 0=성공.
+static int chainPrepare
+(
+    int nCells, const double* p,
+    const int* yMap, int nYHost, const double* yHost
+)
+{
+    const int n = gTab.nSpecies;
+
+    const double* fgmOut = rgpFgmDevOutPtr();
+    if (!fgmOut || rgpFgmDevLastN() != nCells || rgpFgmDevNFields() < 2)
+    {
+        snprintf(gErr, sizeof(gErr),
+                 "chain: fgm device output unavailable or size mismatch "
+                 "(lastN %d, want %d)", rgpFgmDevLastN(), nCells);
+        return -1;
+    }
+
+    if (nCells > gBuf.capCells)
+    {
+        freeBuffers();
+        const size_t b1c = (size_t)nCells*sizeof(double);
+        const size_t bnc = (size_t)nCells*n*sizeof(double);
+        cudaError_t e;
+        if ((e = cudaMalloc(&gBuf.p,     b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.T,     b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Y,     bnc)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.rho,   b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.mu,    b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.kappa, b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Cp,    b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Cv,    b1c)) != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.psi,   b1c)) != cudaSuccess)
+        {
+            freeBuffers();
+            return fail(e, "chain/malloc");
+        }
+        gBuf.capCells = nCells;
+    }
+
+    cudaError_t e;
+    if (!gBuf.yMap)
+    {
+        if ((e = cudaMalloc(&gBuf.yMap, RGP_GPU_MAX_SPECIES*sizeof(int)))
+            != cudaSuccess) return fail(e, "chain/malloc yMap");
+    }
+
+    const size_t b1 = (size_t)nCells*sizeof(double);
+    if ((e = cudaMemcpy(gBuf.p, p, b1, cudaMemcpyHostToDevice))
+        != cudaSuccess) return fail(e, "chain/H2D p");
+    if ((e = cudaMemcpy(gBuf.yMap, yMap, n*sizeof(int),
+                        cudaMemcpyHostToDevice))
+        != cudaSuccess) return fail(e, "chain/H2D yMap");
+
+    if (nYHost > 0)
+    {
+        const size_t need = (size_t)nYHost*nCells;
+        if ((size_t)gBuf.yHCap < need)
+        {
+            if (gBuf.yH) { cudaFree(gBuf.yH); gBuf.yH = nullptr; }
+            gBuf.yHCap = 0;
+            if ((e = cudaMalloc(&gBuf.yH, need*sizeof(double)))
+                != cudaSuccess) return fail(e, "chain/malloc yH");
+            gBuf.yHCap = (int)need;
+        }
+        if ((e = cudaMemcpy(gBuf.yH, yHost, need*sizeof(double),
+                            cudaMemcpyHostToDevice))
+            != cudaSuccess) return fail(e, "chain/H2D yH");
+    }
+
+    constexpr int bs = 128;
+    rgp::fgmToPTY<<<(nCells + bs - 1)/bs, bs>>>
+    (
+        nCells, n, fgmOut, gBuf.yMap, gBuf.yH, gBuf.T, gBuf.Y
+    );
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return fail(e, "chain/launch cvt");
+
+    return 0;
+}
+
+
+static void fillKParams(rgp::KParams& kp)
+{
+    kp.n = gTab.nSpecies;
+    kp.stableRoot = gTab.stableRoot;
+    kp.RR = gTab.RR;
+    kp.TlowJ = gTab.TlowJ;
+    kp.ThighJ = gTab.ThighJ;
+    kp.Tcommon = gTab.Tcommon;
+    kp.W = gTab.W;  kp.BM = gTab.BM;  kp.CM = gTab.CM;
+    kp.jH = gTab.janafHigh;  kp.jL = gTab.janafLow;
+    kp.C1 = gTab.COEF1;  kp.C2 = gTab.COEF2;  kp.C3 = gTab.COEF3;
+    kp.S3 = gTab.SIGMA3M;  kp.EK0 = gTab.EPSILONKM0;
+    kp.OM0 = gTab.OMEGAM0;  kp.MM0 = gTab.MM0;
+    kp.MI0 = gTab.MIUIM0;  kp.KA = gTab.KAPPAIM;
+}
+
+
+int rgpGpuEvaluateFromFgm
+(
+    int nCells,
+    const double* p,
+    const int* yMap,
+    int nYHost,
+    const double* yHost,
+    double* rho,
+    double* mu,
+    double* kappa,
+    double* Cp,
+    double* Cv,
+    double* psi
+)
+{
+    if (nCells <= 0) return 0;
+    if (gTab.nSpecies <= 0)
+    {
+        snprintf(gErr, sizeof(gErr),
+                 "rgpGpuEvaluateFromFgm: tables not uploaded");
+        return -1;
+    }
+
+    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost);
+    if (rc) return rc;
+
+    rgp::KParams kp;
+    fillKParams(kp);
+
+    constexpr int blockSize = 128;
+    const int gridSize = (nCells + blockSize - 1)/blockSize;
+
+    rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
+    (
+        kp, nCells, gBuf.p, gBuf.T, gBuf.Y,
+        gBuf.rho, gBuf.mu, gBuf.kappa, gBuf.Cp, gBuf.Cv, gBuf.psi
+    );
+    cudaError_t e;
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return fail(e, "evaluateFromFgm/launch");
+
+    const size_t b1 = (size_t)nCells*sizeof(double);
+    struct { double* h; double* d; const char* w; } outs[] =
+    {
+        {rho, gBuf.rho, "rho"}, {mu, gBuf.mu, "mu"},
+        {kappa, gBuf.kappa, "kappa"}, {Cp, gBuf.Cp, "Cp"},
+        {Cv, gBuf.Cv, "Cv"}, {psi, gBuf.psi, "psi"}
+    };
+    for (auto& o : outs)
+    {
+        if ((e = cudaMemcpy(o.h, o.d, b1, cudaMemcpyDeviceToHost))
+            != cudaSuccess) return fail(e, "evaluateFromFgm/D2H");
+    }
+
+    return 0;
+}
+
+
+int rgpGpuEvaluateHaFromFgm
+(
+    int nCells,
+    const double* p,
+    const int* yMap,
+    int nYHost,
+    const double* yHost,
+    double* ha
+)
+{
+    if (nCells <= 0) return 0;
+    if (gTab.nSpecies <= 0)
+    {
+        snprintf(gErr, sizeof(gErr),
+                 "rgpGpuEvaluateHaFromFgm: tables not uploaded");
+        return -1;
+    }
+
+    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost);
+    if (rc) return rc;
+
+    rgp::KParams kp;
+    fillKParams(kp);
+
+    constexpr int blockSize = 128;
+    const int gridSize = (nCells + blockSize - 1)/blockSize;
+
+    // 출력은 rho 디바이스 버퍼 재사용 (Cp는 직후 refresh 체인이 쓸 수
+    // 있으므로 피한다 — ha 전용 호출 뒤 항상 D2H로 회수됨)
+    rgp::rgpHaKernel<<<gridSize, blockSize>>>
+    (
+        kp, nCells, gBuf.p, gBuf.T, gBuf.Y, gBuf.rho
+    );
+    cudaError_t e;
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return fail(e, "evaluateHaFromFgm/launch");
+
+    if ((e = cudaMemcpy(ha, gBuf.rho, (size_t)nCells*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return fail(e, "evaluateHaFromFgm/D2H");
 
     return 0;
 }

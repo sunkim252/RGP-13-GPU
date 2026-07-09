@@ -144,6 +144,8 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     );
 
     // --- Mixture-fraction transport (conserved scalar, no source) ---
+    std::chrono::steady_clock::time_point tZC;
+    if (thermoTimings_) { tZC = std::chrono::steady_clock::now(); }
     {
         const volScalarField DZ("DZ", Deff("Z"));
         fvScalarMatrix ZEqn
@@ -180,8 +182,27 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
 
         CEqn.relax();
         fvConstraints().constrain(CEqn);
-        CEqn.solve("Yi");
+        {
+            std::chrono::steady_clock::time_point tS;
+            if (thermoTimings_) { tS = std::chrono::steady_clock::now(); }
+            CEqn.solve("Yi");
+            if (thermoTimings_)
+            {
+                Info<< "CEqn solve-only = "
+                    << std::chrono::duration<double>
+                       (std::chrono::steady_clock::now() - tS).count()
+                    << " s" << endl;
+            }
+        }
         fvConstraints().constrain(C_);
+
+        if (thermoTimings_)
+        {
+            Info<< "Z+C transport total = "
+                << std::chrono::duration<double>
+                   (std::chrono::steady_clock::now() - tZC).count()
+                << " s" << endl;
+        }
 
         // The transported progress variable is the NORMALIZED c in [0, 1]
         // (table closure: omega = 0 at c = 1, the equilibrium/envelope

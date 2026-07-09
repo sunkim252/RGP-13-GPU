@@ -82,6 +82,35 @@ int  rgpGpuEvaluateHa
     double* ha
 );
 
+/*  fgm 디바이스 체인 변형: (T, 테이블 종 Y)를 마지막 rgpFgmEvaluate의
+    디바이스 SoA 출력에서 직접 취해 호스트 왕복을 제거한다. p만 업로드.
+    yMap[s] >= 0: fgm 필드 인덱스(2+k), < 0: yHost SoA의 (-1-yMap[s])행
+    (비테이블 종). 셀 수는 마지막 fgm evaluate와 같아야 한다.          */
+int  rgpGpuEvaluateFromFgm
+(
+    int nCells,
+    const double* p,
+    const int* yMap,
+    int nYHost,
+    const double* yHost,
+    double* rho,
+    double* mu,
+    double* kappa,
+    double* Cp,
+    double* Cv,
+    double* psi
+);
+
+int  rgpGpuEvaluateHaFromFgm
+(
+    int nCells,
+    const double* p,
+    const int* yMap,
+    int nYHost,
+    const double* yHost,
+    double* ha
+);
+
 void rgpGpuFree(void);
 const char* rgpGpuLastError(void);
 

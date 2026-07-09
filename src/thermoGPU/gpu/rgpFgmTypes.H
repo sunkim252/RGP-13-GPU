@@ -42,6 +42,12 @@ int rgpFgmEvaluate
     double* fieldsOut
 );
 
+/*  디바이스 체인용: 마지막 rgpFgmEvaluate의 SoA 출력(디바이스 포인터)
+    과 레이아웃. field 1 = T, field 2+k = k번째 테이블 종 Y.           */
+const double* rgpFgmDevOutPtr(void);
+int rgpFgmDevNFields(void);
+int rgpFgmDevLastN(void);
+
 void rgpFgmFree(void);
 const char* rgpFgmLastError(void);
 

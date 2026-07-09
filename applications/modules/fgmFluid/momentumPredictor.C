@@ -122,6 +122,9 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             << " kg/(m s)" << endl;
     }
 
+    std::chrono::steady_clock::time_point tAsm;
+    if (thermoTimings_) { tAsm = std::chrono::steady_clock::now(); }
+
     tUEqn =
     (
         fvm::ddt(rho, U) + fvm::div(phi, U)
@@ -137,6 +140,15 @@ void Foam::solvers::fgmFluid::momentumPredictor()
     UEqn.relax();
 
     fvConstraints().constrain(UEqn);
+
+    if (thermoTimings_)
+    {
+        Info<< "UEqn assembly = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tAsm).count()
+            << " s" << endl;
+        tAsm = std::chrono::steady_clock::now();
+    }
 
     if (pimple.momentumPredictor())
     {
@@ -156,6 +168,14 @@ void Foam::solvers::fgmFluid::momentumPredictor()
 
         fvConstraints().constrain(U);
         K = 0.5*magSqr(U);
+
+        if (thermoTimings_)
+        {
+            Info<< "UEqn solve = "
+                << std::chrono::duration<double>
+                   (std::chrono::steady_clock::now() - tAsm).count()
+                << " s" << endl;
+        }
     }
 
     if (thermoTimings_)
