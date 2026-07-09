@@ -37,6 +37,9 @@ License
 
 void Foam::solvers::fgmFluid::thermophysicalPredictor()
 {
+    std::chrono::steady_clock::time_point tTot;
+    if (thermoTimings_) { tTot = std::chrono::steady_clock::now(); }
+
     tmp<fv::convectionScheme<scalar>> mvConvection
     (
         fv::convectionScheme<scalar>::New
@@ -325,6 +328,14 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                 << (gpuThermo_ ? "GPU" : "CPU") << ") = "
                 << dtRefresh << " s" << endl;
         }
+    }
+
+    if (thermoTimings_)
+    {
+        Info<< "thermophysical predictor total = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tTot).count()
+            << " s" << endl;
     }
 }
 

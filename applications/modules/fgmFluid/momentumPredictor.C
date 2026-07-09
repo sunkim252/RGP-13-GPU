@@ -30,10 +30,15 @@ License
 #include "fvcDiv.H"
 #include "zeroGradientFvPatchFields.H"
 
+#include <chrono>
+
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
 void Foam::solvers::fgmFluid::momentumPredictor()
 {
+    std::chrono::steady_clock::time_point tTot;
+    if (thermoTimings_) { tTot = std::chrono::steady_clock::now(); }
+
     volVectorField& U(U_);
 
     // --- Localized Artificial (shear) Viscosity on the momentum -------------
@@ -151,6 +156,14 @@ void Foam::solvers::fgmFluid::momentumPredictor()
 
         fvConstraints().constrain(U);
         K = 0.5*magSqr(U);
+    }
+
+    if (thermoTimings_)
+    {
+        Info<< "momentum predictor total = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tTot).count()
+            << " s" << endl;
     }
 }
 

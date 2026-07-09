@@ -52,6 +52,8 @@ Description
 #include "fvcAverage.H"
 #include "zeroGradientFvPatchFields.H"
 
+#include <chrono>
+
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
 void Foam::solvers::fgmFluid::correctPressurePEP()
@@ -75,8 +77,42 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // T_table exactly (no drift) while rho/psi still refresh at the new p. This
     // fixes the RANK-1 side effect where bare thermo_.correct() inverted a stale
     // he against the new p and drifted T, moving the spike into the chamber.
+    std::chrono::steady_clock::time_point tPh, tTot;
+    if (thermoTimings_) { tPh = tTot = std::chrono::steady_clock::now(); }
+
     updateManifold();
-    thermo_.correct();
+
+    if (thermoTimings_)
+    {
+        Info<< "pCorr manifold = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tPh).count()
+            << " s" << endl;
+        tPh = std::chrono::steady_clock::now();
+    }
+
+    // 예측자(thermophysicalPredictor)와 동일한 GPU 물성 refresh 대체.
+    // updateManifold가 직전에 he를 T_table로 재시드하므로 CPU 경로의
+    // he->T 역산은 T_table을 되돌려줄 뿐 — GPU 경로(역산 생략, (p,T,Y)
+    // 일괄 물성)와 의미가 같다. 보정자당 1회 x nCorr회 호출되는 CPU
+    // calculate() 루프가 제거된다.
+    if (gpuThermo_)
+    {
+        gpuThermoCorrect();
+    }
+    else
+    {
+        thermo_.correct();
+    }
+
+    if (thermoTimings_)
+    {
+        Info<< "pCorr thermo correct = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tPh).count()
+            << " s" << endl;
+        tPh = std::chrono::steady_clock::now();
+    }
 
     // Per-corrector transported-density re-sync (modified-PIMPLE, cf.
     // realFluidFoam/Jarczyk-Pfitzner). The transported rho_ is otherwise
@@ -299,7 +335,18 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
         fvConstraints().constrain(pEqn);
 
-        pEqn.solve();
+        {
+            std::chrono::steady_clock::time_point tS;
+            if (thermoTimings_) { tS = std::chrono::steady_clock::now(); }
+            pEqn.solve();
+            if (thermoTimings_)
+            {
+                Info<< "pCorr pEqn.solve = "
+                    << std::chrono::duration<double>
+                       (std::chrono::steady_clock::now() - tS).count()
+                    << " s" << endl;
+            }
+        }
 
         if (pimple.finalNonOrthogonalIter())
         {
@@ -383,6 +430,14 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     if (thermo.dpdt())
     {
         dpdt = fvc::ddt(p);
+    }
+
+    if (thermoTimings_)
+    {
+        Info<< "pCorr total = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tTot).count()
+            << " s" << endl;
     }
 }
 
