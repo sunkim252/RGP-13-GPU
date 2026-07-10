@@ -64,10 +64,20 @@ Description
 
 void Foam::solvers::fgmFluid::armGpuPEqnMesh()
 {
-    if (gpuPEqnArmed_) return;
-
     const label nc = mesh.nCells();
     const label nif = mesh.owner().size();
+
+    // AMR/재분배로 토폴로지가 바뀌면 stale owner/neigh/V/가중치로
+    // 조용히 틀린 행렬을 조립하게 된다 — 상태 불일치 시 전체 재아밍
+    // (rgpPEqnMeshUpload가 디바이스 버퍼 전체 해제 후 재할당)
+    if (gpuPEqnArmed_)
+    {
+        if (nc == gpuMeshCells_ && nif == gpuMeshFaces_) return;
+        Info<< "fgmFluid: mesh topology changed ("
+            << gpuMeshCells_ << " -> " << nc
+            << " cells) -- re-arming GPU mesh structures" << nl << endl;
+        gpuZCArmed_ = false;   // ST 메시(가중치/Sf/d)도 재업로드 필요
+    }
 
     label nbf = 0;
     forAll(p_.boundaryField(), patchi)
@@ -126,6 +136,8 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
     }
 
     gpuPEqnArmed_ = true;
+    gpuMeshCells_ = nc;
+    gpuMeshFaces_ = nif;
     Info<< "fgmFluid: GPU pEqn mesh armed -- " << nc << " cells, "
         << nif << " internal faces, " << nbf
         << " boundary faces (pEqn solver: " << gpuPEqnSolver_ << ")"
@@ -897,7 +909,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 phiBA, bDiagA, bSrcA,
                 needRef, refCell, refValue,
                 tol, rtol, maxIter,
-                p.primitiveFieldRef().begin(), gpuPEqnFlux_.begin(),
+                devChain ? nullptr : p.primitiveFieldRef().begin(),
+                devChain ? nullptr : gpuPEqnFlux_.begin(),
                 &res0, &resF, &nIter
             );
             if (rc)

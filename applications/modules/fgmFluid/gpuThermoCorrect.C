@@ -501,6 +501,17 @@ void Foam::solvers::fgmFluid::pinGpuHostBuffers()
 {
     if (gpuPinned_) return;
 
+    // 동적 메시(AMR/이동): 필드/버퍼 재할당 시 page-lock 등록이 해제
+    // 없이 무효화(dangling registration)될 수 있어 pinning을 끈다 —
+    // 전송은 pageable로 동작(정합 무관, 성능 ~2%)
+    if (mesh.dynamic())
+    {
+        Info<< "fgmFluid: dynamic mesh -- host buffer pinning disabled"
+            << nl << endl;
+        gpuPinned_ = true;   // 재시도 방지
+        return;
+    }
+
     // grow-only 스테이징 버퍼 (첫 스텝 후 최종 크기)
     auto pinList = [&](List<double>& l)
     {

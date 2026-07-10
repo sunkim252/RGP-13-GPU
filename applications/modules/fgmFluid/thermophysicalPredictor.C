@@ -40,9 +40,10 @@ License
 
 void Foam::solvers::fgmFluid::armGpuSTMesh()
 {
-    if (gpuZCArmed_) return;
-
+    // pEqn 메시 아밍이 토폴로지 변경을 감지하면 gpuZCArmed_를 리셋함
     armGpuPEqnMesh();
+
+    if (gpuZCArmed_) return;
 
     const label nif = mesh.owner().size();
     label nbf = 0;

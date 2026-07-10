@@ -1461,18 +1461,23 @@ int rgpPEqnSolve
     *finalRes = res;
     *nIters = iter;
 
-    // 플럭스 + 결과 회수
-    rgppeqn::faceFlux<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
-                                      gB.x, gB.flux);
-    if ((e = cudaGetLastError()) != cudaSuccess)
-        return pfail(e, "peqn/flux launch");
-
-    if ((e = cudaMemcpy(pOut, gB.x, (size_t)nc*sizeof(double),
-                        cudaMemcpyDeviceToHost)) != cudaSuccess)
-        return pfail(e, "peqn/D2H p");
-    if ((e = cudaMemcpy(fluxInt, gB.flux, (size_t)nf*sizeof(double),
-                        cudaMemcpyDeviceToHost)) != cudaSuccess)
-        return pfail(e, "peqn/D2H flux");
+    // 플럭스 + 결과 회수 (null이면 스킵 — devChain은 Finish2가 회수)
+    if (fluxInt)
+    {
+        rgppeqn::faceFlux<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
+                                          gB.x, gB.flux);
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return pfail(e, "peqn/flux launch");
+        if ((e = cudaMemcpy(fluxInt, gB.flux, (size_t)nf*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "peqn/D2H flux");
+    }
+    if (pOut)
+    {
+        if ((e = cudaMemcpy(pOut, gB.x, (size_t)nc*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "peqn/D2H p");
+    }
 
     return 0;
 }

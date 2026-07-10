@@ -259,6 +259,10 @@ protected:
         //  1회 — 모든 grow-only 버퍼가 최종 크기에 도달한 뒤)
         mutable bool gpuPinned_;
 
+        //- GPU 메시 구조의 아밍 시점 상태 (AMR/재분배 감지 → 재아밍)
+        mutable label gpuMeshCells_;
+        mutable label gpuMeshFaces_;
+
         //- pEqnGPU 메시 업로드 완료 플래그 + 작업 버퍼
         mutable bool gpuPEqnArmed_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
