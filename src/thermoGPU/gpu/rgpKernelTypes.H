@@ -113,10 +113,15 @@ int  rgpGpuEvaluateHaFromFgm
     double* ha
 );
 
-/*  호스트 버퍼 page-lock 등록/해제 (pageable 전송 병목 완화).
-    등록된 범위가 살아있는 동안만 유효 — 재할당 전 반드시 해제.     */
+/*  호스트 버퍼 page-lock 등록/해제 (pageable 전송 병목 완화 +
+    unified mapped 모드의 디바이스 별칭).                              */
 int rgpPinHost(void* p, size_t bytes);
 int rgpUnpinHost(void* p);
+
+/*  unified 메모리 모드: 0=copy(디스크리트 기본), 1=mapped(등록 버퍼
+    zero-copy — 검증용), 2=native(GH200류 일관 메모리, 자동 감지).
+    env RGP_GPU_UNIFIED=0/1/2 로 override.                             */
+int rgpGpuUnifiedMode(void);
 
 void rgpGpuFree(void);
 const char* rgpGpuLastError(void);

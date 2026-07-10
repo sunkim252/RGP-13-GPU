@@ -8,6 +8,7 @@
 \*---------------------------------------------------------------------------*/
 
 #include "rgpFgmTypes.H"
+#include "rgpStage.H"
 
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -38,6 +39,7 @@ namespace
                *gZ = nullptr, *chi = nullptr, *out = nullptr;
         int outCap = 0;
         int lastN = 0;   // 마지막 evaluate의 nCells (디바이스 체인 검증용)
+        double *outActive = nullptr;   // 체인이 읽을 실제 출력 포인터
     } gB;
 
     void fgmFreeAll()
@@ -277,22 +279,29 @@ int rgpFgmEvaluate
         gB.outCap = (int)need;
     }
 
-    const size_t b1 = nCells*sizeof(double);
-    struct { double* d; const double* s; } up[] =
-    {
-        {gB.Z, Z}, {gB.C, C}, {gB.rho, rho}, {gB.Lsqr, Lsqr},
-        {gB.msg, magSqrGradZ}, {gB.Deff, DeffZ}
-    };
-    for (auto& e : up)
-    {
-        if ((rc = cudaMemcpy(e.d, e.s, b1, cudaMemcpyHostToDevice))
-            != cudaSuccess) return ffail(rc, "fgm/H2D");
-    }
+    const size_t n1 = (size_t)nCells;
+    const double* dZ = rgpInPtr(Z, gB.Z, n1, &rc);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/in Z");
+    const double* dC = rgpInPtr(C, gB.C, n1, &rc);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/in C");
+    const double* dRho = rgpInPtr(rho, gB.rho, n1, &rc);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/in rho");
+    const double* dLsqr = rgpInPtr(Lsqr, gB.Lsqr, n1, &rc);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/in Lsqr");
+    const double* dMsg = rgpInPtr(magSqrGradZ, gB.msg, n1, &rc);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/in msg");
+    const double* dDeff = rgpInPtr(DeffZ, gB.Deff, n1, &rc);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/in Deff");
+    const double* dHw = gB.hw;
     if (hOrW)
     {
-        if ((rc = cudaMemcpy(gB.hw, hOrW, b1, cudaMemcpyHostToDevice))
-            != cudaSuccess) return ffail(rc, "fgm/H2D hw");
+        dHw = rgpInPtr(hOrW, gB.hw, n1, &rc);
+        if (rc != cudaSuccess) return ffail(rc, "fgm/in hw");
     }
+
+    double* oGZ = rgpOutPtr(gZ, gB.gZ);
+    double* oChi = rgpOutPtr(chiSt, gB.chi);
+    double* oOut = rgpOutPtr(fieldsOut, gB.out);
 
     constexpr int bs = 128;
     rgpfgm::fgmKernel<<<(nCells + bs - 1)/bs, bs>>>
@@ -301,21 +310,21 @@ int rgpFgmEvaluate
         hOx, hFuel, Wlo, Whi,
         gT.nZ, gT.nG, gT.nC, gT.nK, gT.Zax, gT.Gax, gT.Cax, gT.Kax,
         gT.nFields, gT.tables,
-        gB.Z, gB.C, gB.rho, gB.Lsqr, gB.msg, gB.Deff, gB.hw,
-        gB.gZ, gB.chi, gB.out
+        dZ, dC, dRho, dLsqr, dMsg, dDeff, dHw,
+        oGZ, oChi, oOut
     );
     if ((rc = cudaGetLastError()) != cudaSuccess)
         return ffail(rc, "fgm/launch");
 
-    if ((rc = cudaMemcpy(gZ, gB.gZ, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return ffail(rc, "fgm/D2H gZ");
-    if ((rc = cudaMemcpy(chiSt, gB.chi, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return ffail(rc, "fgm/D2H chi");
-    if ((rc = cudaMemcpy(fieldsOut, gB.out, need*sizeof(double),
-                         cudaMemcpyDeviceToHost)) != cudaSuccess)
-        return ffail(rc, "fgm/D2H out");
+    if ((rc = rgpOutFinish(gZ, oGZ, gB.gZ, n1)) != cudaSuccess)
+        return ffail(rc, "fgm/out gZ");
+    if ((rc = rgpOutFinish(chiSt, oChi, gB.chi, n1)) != cudaSuccess)
+        return ffail(rc, "fgm/out chi");
+    if ((rc = rgpOutFinish(fieldsOut, oOut, gB.out, need)) != cudaSuccess)
+        return ffail(rc, "fgm/out fields");
 
     gB.lastN = nCells;
+    gB.outActive = oOut;   // 체인(he 재시드/refresh)이 읽을 위치
     return 0;
 }
 
@@ -323,7 +332,10 @@ int rgpFgmEvaluate
 /*  디바이스 체인용 접근자: 마지막 rgpFgmEvaluate의 SoA 출력(디바이스
     포인터)과 그 레이아웃. rgpGpuEvaluate*FromFgm(rgpKernels.cu)이 같은
     .so 안에서 호출해 (T, Y_k)를 호스트 왕복 없이 재사용한다.          */
-const double* rgpFgmDevOutPtr(void) { return gB.out; }
+const double* rgpFgmDevOutPtr(void)
+{
+    return gB.outActive ? gB.outActive : gB.out;
+}
 int rgpFgmDevNFields(void) { return gT.nFields; }
 int rgpFgmDevLastN(void) { return gB.lastN; }
 

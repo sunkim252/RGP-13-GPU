@@ -77,14 +77,15 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
     echo "FOAM_LIBBIN    = $FOAM_LIBBIN"
     nvcc --version | tail -1
 
-    # ─── wmake CUDA 룰 등록 (.cu → nvcc, RTX 4060 = Ada = sm_89) ───
+    # ─── wmake CUDA 룰 등록 (.cu → nvcc; Ada sm_89 + Hopper sm_90
+    #     — GH200/H100 대비 fat binary + PTX 전방호환) ───
     RULES_DIR=$WM_PROJECT_DIR/wmake/rules/linux64Gcc
 
     cat > $RULES_DIR/cuda <<'CUDA_RULES'
 # ── wmake CUDA compilation rules ──
 SUFFIXES += .cu
 
-CUDA_ARCH   = -gencode arch=compute_89,code=sm_89
+CUDA_ARCH   = -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90
 NVCC        = nvcc
 # -fmad=false: FMA 축약 금지 -- CPU(g++ 비-FMA 코드젠)와의 ULP 정합을 위해.
 # --use_fast_math는 정합 검증(Test-rgpThermoGPU) 신뢰성을 위해 제외.

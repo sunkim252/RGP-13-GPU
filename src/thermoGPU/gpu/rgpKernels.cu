@@ -14,11 +14,16 @@
 
 #include "rgpKernelTypes.H"
 #include "rgpFgmTypes.H"
+#include "rgpStage.H"
 
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+
+//- unified 모드 (rgpStage.H 참조; 모든 nvcc TU가 공유)
+int gRgpUnified = 0;
 
 // * * * * * * * * * * * * * * 디바이스 테이블 상태 * * * * * * * * * * * * * //
 
@@ -700,9 +705,27 @@ extern "C"
 
 int rgpGpuInit(int deviceId)
 {
-    cudaError_t e = cudaSetDevice(deviceId < 0 ? 0 : deviceId);
+    const int dev = deviceId < 0 ? 0 : deviceId;
+    cudaError_t e = cudaSetDevice(dev);
     if (e != cudaSuccess) return fail(e, "rgpGpuInit/cudaSetDevice");
+
+    // 기기 인식: GH200류 일관 메모리(HMM/ATS)면 native zero-copy.
+    // env RGP_GPU_UNIFIED = 0(강제 copy) / 1(mapped 검증) / 2(강제 native)
+    int pma = 0;
+    cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess, dev);
+    const char* env = getenv("RGP_GPU_UNIFIED");
+    if (env && env[0] == '0')      { gRgpUnified = 0; }
+    else if (env && env[0] == '2') { gRgpUnified = 2; }
+    else if (env && env[0] == '1') { gRgpUnified = 1; }
+    else                           { gRgpUnified = pma ? 2 : 0; }
+
     return 0;
+}
+
+
+int rgpGpuUnifiedMode(void)
+{
+    return gRgpUnified;
 }
 
 
@@ -809,16 +832,20 @@ int rgpGpuEvaluate
         gBuf.capCells = nCells;
     }
 
-    const size_t b1 = (size_t)nCells*sizeof(double);
-    const size_t bn = (size_t)nCells*n*sizeof(double);
-
     cudaError_t e;
-    if ((e = cudaMemcpy(gBuf.p, p, b1, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "evaluate/H2D p");
-    if ((e = cudaMemcpy(gBuf.T, T, b1, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "evaluate/H2D T");
-    if ((e = cudaMemcpy(gBuf.Y, Y, bn, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "evaluate/H2D Y");
+    const double* dP = rgpInPtr(p, gBuf.p, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "evaluate/in p");
+    const double* dT = rgpInPtr(T, gBuf.T, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "evaluate/in T");
+    const double* dY = rgpInPtr(Y, gBuf.Y, (size_t)nCells*n, &e);
+    if (e != cudaSuccess) return fail(e, "evaluate/in Y");
+
+    double* oRho = rgpOutPtr(rho, gBuf.rho);
+    double* oMu = rgpOutPtr(mu, gBuf.mu);
+    double* oKappa = rgpOutPtr(kappa, gBuf.kappa);
+    double* oCp = rgpOutPtr(Cp, gBuf.Cp);
+    double* oCv = rgpOutPtr(Cv, gBuf.Cv);
+    double* oPsi = rgpOutPtr(psi, gBuf.psi);
 
     rgp::KParams kp;
     kp.n = n;
@@ -839,24 +866,23 @@ int rgpGpuEvaluate
 
     rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, gBuf.T, gBuf.Y,
-        gBuf.rho, gBuf.mu, gBuf.kappa, gBuf.Cp, gBuf.Cv, gBuf.psi
+        kp, nCells, dP, dT, dY,
+        oRho, oMu, oKappa, oCp, oCv, oPsi
     );
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "evaluate/launch");
 
-    if ((e = cudaMemcpy(rho, gBuf.rho, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return fail(e, "evaluate/D2H rho");
-    if ((e = cudaMemcpy(mu, gBuf.mu, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return fail(e, "evaluate/D2H mu");
-    if ((e = cudaMemcpy(kappa, gBuf.kappa, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return fail(e, "evaluate/D2H kappa");
-    if ((e = cudaMemcpy(Cp, gBuf.Cp, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return fail(e, "evaluate/D2H Cp");
-    if ((e = cudaMemcpy(Cv, gBuf.Cv, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return fail(e, "evaluate/D2H Cv");
-    if ((e = cudaMemcpy(psi, gBuf.psi, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return fail(e, "evaluate/D2H psi");
+    struct { double* h; double* o; double* d; } outs[] =
+    {
+        {rho, oRho, gBuf.rho}, {mu, oMu, gBuf.mu},
+        {kappa, oKappa, gBuf.kappa}, {Cp, oCp, gBuf.Cp},
+        {Cv, oCv, gBuf.Cv}, {psi, oPsi, gBuf.psi}
+    };
+    for (auto& o : outs)
+    {
+        if ((e = rgpOutFinish(o.h, o.o, o.d, (size_t)nCells))
+            != cudaSuccess) return fail(e, "evaluate/out");
+    }
 
     return 0;
 }
@@ -1105,16 +1131,14 @@ int rgpGpuEvaluateHa
         gBuf.capCells = nCells;
     }
 
-    const size_t b1 = (size_t)nCells*sizeof(double);
-    const size_t bn = (size_t)nCells*n*sizeof(double);
-
     cudaError_t e;
-    if ((e = cudaMemcpy(gBuf.p, p, b1, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "evaluateHa/H2D p");
-    if ((e = cudaMemcpy(gBuf.T, T, b1, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "evaluateHa/H2D T");
-    if ((e = cudaMemcpy(gBuf.Y, Y, bn, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "evaluateHa/H2D Y");
+    const double* dP = rgpInPtr(p, gBuf.p, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "evaluateHa/in p");
+    const double* dT = rgpInPtr(T, gBuf.T, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "evaluateHa/in T");
+    const double* dY = rgpInPtr(Y, gBuf.Y, (size_t)nCells*n, &e);
+    if (e != cudaSuccess) return fail(e, "evaluateHa/in Y");
+    double* oHa = rgpOutPtr(ha, gBuf.Cp);
 
     rgp::KParams kp;
     kp.n = n;
@@ -1136,13 +1160,13 @@ int rgpGpuEvaluateHa
     // 출력은 Cp 디바이스 버퍼 재사용 (ha 전용 호출이라 충돌 없음)
     rgp::rgpHaKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, gBuf.T, gBuf.Y, gBuf.Cp
+        kp, nCells, dP, dT, dY, oHa
     );
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "evaluateHa/launch");
 
-    if ((e = cudaMemcpy(ha, gBuf.Cp, b1, cudaMemcpyDeviceToHost))
-        != cudaSuccess) return fail(e, "evaluateHa/D2H ha");
+    if ((e = rgpOutFinish(ha, oHa, gBuf.Cp, (size_t)nCells))
+        != cudaSuccess) return fail(e, "evaluateHa/out");
 
     return 0;
 }
@@ -1150,7 +1174,10 @@ int rgpGpuEvaluateHa
 
 int rgpPinHost(void* p, size_t bytes)
 {
-    cudaError_t e = cudaHostRegister(p, bytes, cudaHostRegisterPortable);
+    cudaError_t e = cudaHostRegister
+    (
+        p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped
+    );
     if (e != cudaSuccess)
     {
         snprintf(gErr, sizeof(gErr), "pinHost: %s", cudaGetErrorString(e));

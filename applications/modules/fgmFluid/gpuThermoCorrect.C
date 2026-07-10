@@ -93,10 +93,15 @@ void Foam::solvers::fgmFluid::armGpuThermo()
             << exit(FatalError);
     }
 
+    const int um = rgpGpuUnifiedMode();
     Info<< "fgmFluid: thermoGPU ARMED -- " << W.size()
         << "-species SRK+Chung tables on CUDA device " << dev
         << " (of " << nDev << "); thermo_.correct() replaced by the "
-        << "batched GPU property refresh" << nl << endl;
+        << "batched GPU property refresh" << nl
+        << "    memory mode: "
+        << (um == 2 ? "unified-native (coherent, zero-copy)"
+          : um == 1 ? "unified-mapped (pinned zero-copy, validation)"
+          : "explicit-copy (discrete GPU)") << nl << endl;
 
     gpuArmed_ = true;
 }
