@@ -610,25 +610,16 @@ void Foam::solvers::fgmFluid::pinGpuHostBuffers()
         return;
     }
 
-    // AmgX: 자체 pinned 풀과의 공존 시 누적 등록량이 한계(WSL2
-    // paravirt pinned 상한)를 넘으면 이후의 일반 H2D 복사가 invalid
-    // argument로 깨진다 — devChain(+gpuUBuf_ ~240MB)과 겹칠 때 실측
-    // (2026-07-11, Portable-only 등록으로도 재현). pin 이득은 ~2%라
-    // amgx 경로에서는 끈다.
-    if (gpuPEqn_ && gpuPEqnSolver_ == "amgx")
-    {
-        Info<< "fgmFluid: amgx pressure solver -- host buffer pinning "
-            << "disabled (pinned-pool interaction)" << nl << endl;
-        gpuPinned_ = true;
-        return;
-    }
-
     // grow-only 스테이징 버퍼 (첫 스텝 후 최종 크기)
+    size_t pinnedBytes = 0;
     auto pinList = [&](List<double>& l)
     {
         if (l.size() > 0)
         {
-            rgpPinHost(l.begin(), l.size()*sizeof(double));
+            if (rgpPinHost(l.begin(), l.size()*sizeof(double)) == 0)
+            {
+                pinnedBytes += l.size()*sizeof(double);
+            }
         }
     };
     pinList(gpuFgmOut_);
@@ -639,38 +630,18 @@ void Foam::solvers::fgmFluid::pinGpuHostBuffers()
     pinList(gpuPEqnFlux_);
     pinList(gpuZCBuf_);
 
-    // 직접 포인터로 전송되는 상주 필드 (주소는 필드 수명 동안 고정)
-    auto pinField = [&](const scalarField& f)
-    {
-        if (f.size() > 0)
-        {
-            rgpPinHost
-            (
-                const_cast<scalar*>(f.begin()), f.size()*sizeof(double)
-            );
-        }
-    };
-    pinField(Z_.primitiveField());
-    pinField(C_.primitiveField());
-    pinField(gZ_.primitiveField());
-    pinField(chi_st_.primitiveField());
-    pinField(sourcePV_.primitiveField());
-    pinField(thermo_.T().primitiveField());
-    pinField(thermo_.p().primitiveField());
-    pinField(thermo_.he().primitiveField());
-    pinField(thermo_.psi().primitiveField());
-    pinField(rho_.primitiveField());
-    pinField(rho_.oldTime().primitiveField());
-    pinField(p_.oldTime().primitiveField());
-    pinField(phi_.primitiveField());
-    pinField(phi_.oldTime().primitiveField());
-    forAll(tabSpecieIDs_, k)
-    {
-        pinField(Y_[tabSpecieIDs_[k]].primitiveField());
-    }
+    // ⚠️ OF 필드(primitiveField)는 등록하지 않는다: rho_=thermo.rho(),
+    // Z_=max(min(Z_,1),0) 류의 tmp-대입이 스토리지를 transfer(교체)해
+    // 등록이 즉시 dangling이 되고, 이후 glibc가 stale 등록 범위 안쪽을
+    // 재활용해 새 할당을 내주는 순간 그 포인터의 H2D가 invalid
+    // argument로 깨진다 — AmgX 병용 시 결정적으로 재현됐던 크래시의
+    // 근본 원인(2026-07-11 규명; AmgX는 자체 호스트 할당으로 malloc
+    // 재활용 배치를 바꿔 충돌을 표면화했을 뿐, pcg에서도 잠복했다).
+    // 위의 List<double> 스테이징 버퍼들은 transfer 대상이 아니라 안전.
 
     gpuPinned_ = true;
-    Info<< "fgmFluid: GPU host buffers page-locked (pinned)" << nl << endl;
+    Info<< "fgmFluid: GPU host buffers page-locked (pinned) -- "
+        << label(pinnedBytes/(1024*1024)) << " MiB total" << nl << endl;
 }
 
 
