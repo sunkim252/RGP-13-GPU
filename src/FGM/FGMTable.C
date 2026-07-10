@@ -355,9 +355,14 @@ void Foam::FGMTable::makeStencil
     bracket(C_axis_,   C,   iC, st.wC);
     bracket(chi_axis_, chi, iK, st.wK);
 
-    // If chi axis has length 1 the bracket above sets iK=0, wK=0, and we
-    // need the iK+1 neighbour to fold to the same slice rather than walk
-    // past the end of the array.
+    // Degenerate-axis folding: for any axis of length 1 the bracket above
+    // returns i=0, w=0; the +1 corner must fold onto the same slice or the
+    // stencil walks into the neighbouring slice / past the allocation.
+    // (Previously only the chi axis was folded — latent OOB for tables
+    // collapsed in Z/gZ/C.)
+    const label iZp = (Z_axis_.size()   >= 2) ? (iZ + 1) : iZ;
+    const label iGp = (gZ_axis_.size()  >= 2) ? (iG + 1) : iG;
+    const label iCp = (C_axis_.size()   >= 2) ? (iC + 1) : iC;
     const label iKp = (chi_axis_.size() >= 2) ? (iK + 1) : iK;
 
     // Corner order = interpolateTable's c0000..c1111 (Z fastest, then gZ,
@@ -368,11 +373,14 @@ void Foam::FGMTable::makeStencil
         const label k = dK ? iKp : iK;
         for (label dC = 0; dC < 2; dC++)
         {
+            const label c = dC ? iCp : iC;
             for (label dG = 0; dG < 2; dG++)
             {
+                const label g = dG ? iGp : iG;
                 for (label dZ = 0; dZ < 2; dZ++)
                 {
-                    st.idx[n++] = flatIndex(iZ + dZ, iG + dG, iC + dC, k);
+                    const label z = dZ ? iZp : iZ;
+                    st.idx[n++] = flatIndex(z, g, c, k);
                 }
             }
         }

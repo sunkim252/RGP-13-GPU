@@ -156,6 +156,22 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                 << "gpuZC (v1) does not support transported h/W tables"
                 << exit(FatalError);
         }
+        if
+        (
+            mesh.solution().relaxEquation(Z_.name())
+         || mesh.solution().relaxEquation(C_.name())
+        )
+        {
+            FatalErrorInFunction
+                << "gpuZC (v1) does not support equation relaxation "
+                << "on Z/C" << exit(FatalError);
+        }
+        if (fvModels().size() > 0)
+        {
+            FatalErrorInFunction
+                << "gpuZC (v1) does not support fvModels sources"
+                << exit(FatalError);
+        }
         addWeightField(thermo.he());
         addWeightField(Z_);
         addWeightField(C_);
@@ -329,17 +345,8 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             off += np;
         }
 
-        const dictionary& sd = mesh.solution().solverDict
-        (
-            word("Yi")
-          + word
-            (
-                (
-                    !mesh.schemes().steady()
-                 && solutionControl::finalIteration(mesh)
-                ) ? "Final" : ""
-            )
-        );
+        // CPU 경로의 ZEqn.solve("Yi")는 Final 선택을 하지 않음 — 동일 규약
+        const dictionary& sd = mesh.solution().solverDict(word("Yi"));
         const scalar tol = sd.lookup<scalar>("tolerance");
         const scalar rtol = sd.lookupOrDefault<scalar>("relTol", 0);
         const label maxIter = sd.lookupOrDefault<label>("maxIter", 1000);

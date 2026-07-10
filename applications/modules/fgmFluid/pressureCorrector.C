@@ -454,7 +454,9 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
         // Update the pressure BCs for flux consistency (3D:
         // waveTransmissive outlet, fixedFluxPressure walls).
-        constrainPressure(p, rho, U, tphiHbyAv(), trAUf(), MRF);
+        // 체적 플럭스(phiHbyAv[m3/s])에는 rho 인자 없는 오버로드가 정합
+        // (rho 버전은 질량 플럭스용 — fixedFluxPressure에서 rho_b배 오차)
+        constrainPressure(p, U, tphiHbyAv(), trAUf(), MRF);
     }
     else
     {
@@ -550,7 +552,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     trAUfB.ref().boundaryFieldRef()[patchi] ==
                         rAU.boundaryField()[patchi];
                 }
-                constrainPressure(p, rho, U, tphiB(), trAUfB(), MRF);
+                constrainPressure(p, U, tphiB(), trAUfB(), MRF);
             }
         }
     }
@@ -717,6 +719,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 tpsis()*fvm::ddt(p)
               + fvc::div(tphiHbyAv())
             );
+            if (LADrhoCoeff > 0)
+            {
+                pDDtEqnChk -= fvc::laplacian(Dr, rho)/rho;
+            }
             fvScalarMatrix pEqnChk
             (
                 pDDtEqnChk - fvm::laplacian(trAUf(), p)
@@ -933,23 +939,29 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 << " s" << endl;
         }
 
+        // devChain: 솔브된 p를 먼저 회수해야 correctBoundaryConditions가
+        // 새 내부장 기준으로 경계를 갱신한다 (pOut=null 계약 — 리뷰 F1:
+        // cBC가 솔브-전 p로 돌면 경계 p가 한 솔브 지연되어 ∇p 오염)
+        if (devChain)
+        {
+            if (rgpPEqnFinish2
+                (
+                    p.primitiveFieldRef().begin(),
+                    gpuPEqnFlux_.begin()
+                ))
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnFinish2: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+        }
+
         p.correctBoundaryConditions();
 
         // ── 질량 플럭스 재구성: phi = rhof*(phiHbyAv + pEqn.flux()) ──
         {
             if (devChain)
             {
-                // 내부 전체(rhof*(phiHbyAv+flux))를 디바이스에서
-                if (rgpPEqnFinish2
-                    (
-                        p.primitiveFieldRef().begin(),
-                        gpuPEqnFlux_.begin()
-                    ))
-                {
-                    FatalErrorInFunction
-                        << "rgpPEqnFinish2: " << rgpPEqnLastError()
-                        << exit(FatalError);
-                }
                 scalarField& phic = phi.primitiveFieldRef();
                 forAll(phic, f) { phic[f] = gpuPEqnFlux_[f]; }
             }

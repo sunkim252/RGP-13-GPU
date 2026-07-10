@@ -37,7 +37,7 @@ namespace
         double *Z = nullptr, *C = nullptr, *rho = nullptr, *Lsqr = nullptr,
                *msg = nullptr, *Deff = nullptr, *hw = nullptr,
                *gZ = nullptr, *chi = nullptr, *out = nullptr;
-        int outCap = 0;
+        size_t outCap = 0;
         int lastN = 0;   // 마지막 evaluate의 nCells (디바이스 체인 검증용)
         double *outActive = nullptr;   // 체인이 읽을 실제 출력 포인터
     } gB;
@@ -56,6 +56,11 @@ namespace rgpfgm
 {
 
 constexpr double SMALL = 1e-15, VSMALL = 1e-300;
+
+//- Foam::max/min 의미론 (NaN 전파 — fmax/fmin은 NaN을 버려 상류
+//  필드 오염을 가려버림; 비-NaN 값에서는 결과 동일)
+__device__ inline double fMax(double a, double b) { return (a > b) ? a : b; }
+__device__ inline double fMin(double a, double b) { return (a < b) ? a : b; }
 
 //- FGMTable::bracket 1:1
 __device__ void bracket
@@ -106,19 +111,19 @@ __global__ void fgmKernel
     const int celli = blockIdx.x*blockDim.x + threadIdx.x;
     if (celli >= nCells) return;
 
-    const double Zcl = fmax(fmin(Zf[celli], 1.0), 0.0);
-    const double Ccl = fmax(Cf[celli], 0.0);
-    const double rho_l = fmax(rhof[celli], SMALL);
+    const double Zcl = fMax(fMin(Zf[celli], 1.0), 0.0);
+    const double Ccl = fMax(Cf[celli], 0.0);
+    const double rho_l = fMax(rhof[celli], SMALL);
 
     const double Zvar = Cv*Lsqrf[celli]*msgf[celli];
     const double gz =
-        fmin(fmax(Zvar/fmax(Zcl*(1.0 - Zcl), SMALL), 0.0), 1.0);
+        fMin(fMax(Zvar/fMax(Zcl*(1.0 - Zcl), SMALL), 0.0), 1.0);
 
     const double D = Defff[celli]/rho_l;
     const double chiTilde = 2.0*D*msgf[celli];
-    const double shapeCell = fmax(Zcl*(1.0 - Zcl), SMALL);
+    const double shapeCell = fMax(Zcl*(1.0 - Zcl), SMALL);
     const double chi_st =
-        fmax(chiMin, fmin(chiMax, chiTilde*shapeZst/shapeCell));
+        fMax(chiMin, fMin(chiMax, chiTilde*shapeZst/shapeCell));
 
     double coord4 = chi0;
     if (mode4 == 1) { coord4 = chi_st; }
@@ -128,7 +133,7 @@ __global__ void fgmKernel
     }
     else if (mode4 == 3)
     {
-        coord4 = fmax(Wlo, fmin(Whi, hwf[celli]));
+        coord4 = fMax(Wlo, fMin(Whi, hwf[celli]));
     }
 
     gZf[celli] = gz;
@@ -141,21 +146,29 @@ __global__ void fgmKernel
     bracket(Gax, nG, gz, iG, wG);
     bracket(Cax, nC, Ccl, iC, wC);
     bracket(Kax, nK, coord4, iK, wK);
+    // 퇴화 축(n==1) 폴딩: 상단 코너를 자기 자신으로 접어 OOB 차단
+    // (w=0이라 값 기여는 없지만, 미폴딩 시 이웃 슬라이스/할당 밖을 읽음)
+    const int iZp = (nZ >= 2) ? (iZ + 1) : iZ;
+    const int iGp = (nG >= 2) ? (iG + 1) : iG;
+    const int iCp = (nC >= 2) ? (iC + 1) : iC;
     const int iKp = (nK >= 2) ? (iK + 1) : iK;
 
-    int idx[16];
+    size_t idx[16];
     int m = 0;
     for (int dK = 0; dK < 2; dK++)
     {
         const int k = dK ? iKp : iK;
         for (int dC = 0; dC < 2; dC++)
         {
+            const int c = dC ? iCp : iC;
             for (int dG = 0; dG < 2; dG++)
             {
+                const int g = dG ? iGp : iG;
                 for (int dZ = 0; dZ < 2; dZ++)
                 {
+                    const int z = dZ ? iZp : iZ;
                     idx[m++] =
-                        (((iZ + dZ)*nG + (iG + dG))*nC + (iC + dC))*nK + k;
+                        (((size_t)z*nG + g)*nC + c)*nK + k;
                 }
             }
         }
@@ -257,6 +270,10 @@ int rgpFgmEvaluate
         return -1;
     }
 
+    // 부분 실패 시 이전 스텝의 SoA를 체인이 소비하지 않도록 선-무효화
+    gB.lastN = 0;
+    gB.outActive = nullptr;
+
     cudaError_t rc;
     if (nCells > gB.cap)
     {
@@ -271,12 +288,12 @@ int rgpFgmEvaluate
         gB.cap = nCells;
     }
     const size_t need = (size_t)gT.nFields*nCells;
-    if ((size_t)gB.outCap < need)
+    if (gB.outCap < need)
     {
         if (gB.out) cudaFree(gB.out);
         if ((rc = cudaMalloc(&gB.out, need*sizeof(double))) != cudaSuccess)
             return ffail(rc, "fgm/out");
-        gB.outCap = (int)need;
+        gB.outCap = need;
     }
 
     const size_t n1 = (size_t)nCells;

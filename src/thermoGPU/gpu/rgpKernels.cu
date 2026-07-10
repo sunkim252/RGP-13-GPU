@@ -67,7 +67,7 @@ namespace
         // fgm 디바이스 체인용: 종→fgm 필드 맵 + 비테이블 종 호스트 Y
         int*    yMap = nullptr;   // [RGP_GPU_MAX_SPECIES]
         double* yH = nullptr;     // [yHCap]
-        int     yHCap = 0;
+        size_t  yHCap = 0;
     };
 
     DeviceTables  gTab;
@@ -715,7 +715,19 @@ int rgpGpuInit(int deviceId)
     cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess, dev);
     const char* env = getenv("RGP_GPU_UNIFIED");
     if (env && env[0] == '0')      { gRgpUnified = 0; }
-    else if (env && env[0] == '2') { gRgpUnified = 2; }
+    else if (env && env[0] == '2')
+    {
+        // 강제 native: 일관 메모리 미지원 기기에서는 첫 커널이
+        // pageable 포인터 역참조로 즉사 — mapped 검증 모드로 강등
+        if (!pma)
+        {
+            fprintf(stderr, "rgpGpuInit: RGP_GPU_UNIFIED=2 requested "
+                    "but device lacks pageable-memory access -- "
+                    "downgrading to mapped mode (1)\n");
+            gRgpUnified = 1;
+        }
+        else { gRgpUnified = 2; }
+    }
     else if (env && env[0] == '1') { gRgpUnified = 1; }
     else                           { gRgpUnified = pma ? 2 : 0; }
 
@@ -946,13 +958,13 @@ static int chainPrepare
     if (nYHost > 0)
     {
         const size_t need = (size_t)nYHost*nCells;
-        if ((size_t)gBuf.yHCap < need)
+        if (gBuf.yHCap < need)
         {
             if (gBuf.yH) { cudaFree(gBuf.yH); gBuf.yH = nullptr; }
             gBuf.yHCap = 0;
             if ((e = cudaMalloc(&gBuf.yH, need*sizeof(double)))
                 != cudaSuccess) return fail(e, "chain/malloc yH");
-            gBuf.yHCap = (int)need;
+            gBuf.yHCap = need;
         }
         if ((e = cudaMemcpy(gBuf.yH, yHost, need*sizeof(double),
                             cudaMemcpyHostToDevice))

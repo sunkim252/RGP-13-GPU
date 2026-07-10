@@ -115,6 +115,21 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                 << "gpuUEqn (v1) does not support MRF"
                 << exit(FatalError);
         }
+        // 침묵 오차 방지: CPU 경로의 relax/fvModels/fvConstraints(행렬)
+        // 는 GPU 조립에 미반영 — 활성 상태면 다른 방정식을 풀게 되므로
+        // 명시적으로 차단
+        if (mesh.solution().relaxEquation(U.name()))
+        {
+            FatalErrorInFunction
+                << "gpuUEqn (v1) does not support equation relaxation "
+                << "on U" << exit(FatalError);
+        }
+        if (fvModels().size() > 0 || fvConstraints().size() > 0)
+        {
+            FatalErrorInFunction
+                << "gpuUEqn (v1) does not support fvModels/fvConstraints"
+                << exit(FatalError);
+        }
 
         armGpuSTMesh();
 

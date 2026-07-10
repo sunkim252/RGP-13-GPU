@@ -77,6 +77,7 @@ namespace
         double *UB3 = nullptr, *bfx3 = nullptr;       // [3*nbf]
         double *bg9 = nullptr;                        // [9*nbf]
         double *rAU = nullptr, *HbyA3 = nullptr;      // [nc], [3*nc]
+        bool assembled = false;   // rgpUEqnSolve 조립 완료 여부 (AH 가드)
     } gU;
 
     //- pCorr 준비체인 디바이스 버퍼 (rAUf/phiHbyAv/psis/rhof 상주)
@@ -134,6 +135,7 @@ namespace
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
+        gU.assembled = false;
         gM.nCells = gM.nIntFaces = gM.nBFaces = 0;
     }
 }
@@ -609,8 +611,8 @@ __global__ void uCellAssemble
     const int nc, const double dtInv, const double* __restrict__ rdt,
     const double* __restrict__ rho, const double* __restrict__ rhoOld,
     const double* __restrict__ V,
-    const double* __restrict__ U3old, const double* __restrict__ srcExp3,
-    double* __restrict__ diag, double* __restrict__ b3
+    const double* __restrict__ U3old, const double* srcExp3,
+    double* __restrict__ diag, double* b3
 )
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
@@ -968,8 +970,8 @@ __global__ void pcPsis
 __global__ void pcPhiRecon
 (
     const int nf, const double* __restrict__ rhof,
-    const double* __restrict__ phiH, const double* __restrict__ flux,
-    double* __restrict__ phiOut
+    const double* __restrict__ phiH, const double* flux,
+    double* phiOut
 )
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
@@ -1120,7 +1122,7 @@ namespace
             rgppeqn::setRef<<<1, 1>>>(refCell, refValue, gB.diag, gB.b);
         }
         // CSR 구조가 준비돼 있으면 값 산포 (무-atomics SpMV 경로)
-        if (gM.dVals)
+        if (gM.dVals && gM.dRowPtr)
         {
             rgppeqn::csrScatterDiag<<<nb(nc), BS>>>
                 (nc, gM.dDiagSlot, gB.diag, gM.dVals);
@@ -1135,7 +1137,7 @@ namespace
     //- pEqn용 A·x: CSR 준비 시 무-atomics, 아니면 LDU+atomics
     void pSpmv(const int nc, const int nf, const double* x, double* y)
     {
-        if (gM.dVals)
+        if (gM.dVals && gM.dRowPtr)
         {
             rgppeqn::csrSpmv<<<nb(nc), BS>>>
                 (nc, gM.dRowPtr, gM.dColInd, gM.dVals, x, y);
@@ -2106,7 +2108,8 @@ int rgpUEqnSolve
 
     cudaError_t e;
 
-    // 지연 할당 (UEqn 퍼시스턴트)
+    // 지연 할당 (UEqn 퍼시스턴트) — 독립 호출(Grad/Prep2 없이)도
+    // 안전하도록 src3/gradP까지 포함하고 0으로 초기화
     if (!gU.diag)
     {
         const size_t bc = (size_t)nc*sizeof(double);
@@ -2117,12 +2120,16 @@ int rgpUEqnSolve
             {&gU.diag, bc}, {&gU.upper, bf}, {&gU.lower, bf},
             {&gU.b3, 3*bc}, {&gU.U3, 3*bc},
             {&gU.bDiag3, bb}, {&gU.bSrc3, bb},
-            {&gU.workDiag, bc}, {&gU.workB, bc}, {&gU.H, bc}
+            {&gU.workDiag, bc}, {&gU.workB, bc}, {&gU.H, bc},
+            {&gU.src3, 3*bc}, {&gU.gradP, 3*bc}
         };
         for (auto& a : al)
         {
+            if (*a.d) continue;
             if ((e = cudaMalloc(a.d, a.bytes)) != cudaSuccess)
                 return pfail(e, "ueqn/malloc");
+            if ((e = cudaMemset(*a.d, 0, a.bytes)) != cudaSuccess)
+                return pfail(e, "ueqn/memset");
         }
     }
 
@@ -2186,6 +2193,7 @@ int rgpUEqnSolve
          gM.gg, gU.diag, gU.upper, gU.lower);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "ueqn/assemble launch");
+    gU.assembled = true;
 
     // grad p (솔브 전용 소스) — null이면 Prep2의 디바이스 상주본 사용
     if (gradP3)
@@ -2251,7 +2259,7 @@ int rgpUEqnSolve
 int rgpUEqnAH(const double* U3, double* rAU, double* H3)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
-    if (!gU.diag)
+    if (!gU.diag || !gU.assembled)
     {
         snprintf(gPErr, sizeof(gPErr), "ueqn: not assembled");
         return -1;
