@@ -54,6 +54,7 @@ Description
 #include "extrapolatedCalculatedFvPatchFields.H"
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
+#include "fixedFluxPressureFvPatchScalarField.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -448,13 +449,27 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         // pCorrGPU: rhof/rAUf(조화)/phiHbyAv(flux(HbyA)+Euler ddtCorr)/
         // psis를 디바이스 상주 생성 (경계 ddtCorr=0은 OF 규약 그대로 —
         // phiHbyAv 경계는 HbyA_b&Sf_b, 아래 pEqn 경계 배열에서 처리).
-        // v1: psisCapRatio/psisIsentropic/constrainPressure류 p BC 미지원
+        // psisCapRatio/psisIsentropic은 호스트 계산본 override 업로드.
+        tmp<volScalarField> tpsisOv;
         if (psisCapRatio < GREAT || psisIsentropic)
         {
-            FatalErrorInFunction
-                << "pCorrGPU (v1) does not support psisCapRatio/"
-                << "psisIsentropic"
-                << exit(FatalError);
+            tpsisOv = volScalarField::New
+            (
+                "psis",
+                psisIsentropic
+              ? volScalarField(thermo.psi()/(rho*thermo.gamma()))
+              : volScalarField(thermo.psi()/rho)
+            );
+            if (psisCapRatio < GREAT)
+            {
+                volScalarField& psisOv = tpsisOv.ref();
+                const volScalarField psisSm
+                (
+                    fvc::average(fvc::interpolate(psisOv))
+                );
+                psisOv = max(psisOv, psisSm/psisCapRatio);
+                psisOv.correctBoundaryConditions();
+            }
         }
 
         const label nc = mesh.nCells();
@@ -467,6 +482,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 U3old,
                 phi.oldTime().primitiveField().begin(),
                 psi.primitiveField().begin(),
+                tpsisOv.valid()
+              ? tpsisOv().primitiveField().begin() : nullptr,
                 LTS ? 1.0 : 1.0/runTime.deltaTValue(),
                 LTS
               ? fv::localEulerDdt::localRDeltaT(mesh)
@@ -478,6 +495,51 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             FatalErrorInFunction
                 << "rgpPCorrPrep: " << rgpPEqnLastError()
                 << exit(FatalError);
+        }
+
+        // constrainPressure형 p BC(fixedFluxPressure류) 지원: 경계값만
+        // 유효한 surface 필드를 구성해 표준 호출 (내부값은 미사용)
+        {
+            bool needConstrain = false;
+            forAll(p.boundaryField(), patchi)
+            {
+                if
+                (
+                    isA<fixedFluxPressureFvPatchScalarField>
+                    (
+                        p.boundaryField()[patchi]
+                    )
+                )
+                {
+                    needConstrain = true;
+                }
+            }
+            if (needConstrain)
+            {
+                tmp<surfaceScalarField> tphiB = surfaceScalarField::New
+                (
+                    "phiHbyAvB", mesh,
+                    dimensionedScalar(dimVelocity*dimArea, 0)
+                );
+                tmp<surfaceScalarField> trAUfB = surfaceScalarField::New
+                (
+                    "rAUfB", mesh,
+                    dimensionedScalar(rAU.dimensions(), 1)
+                );
+                forAll(p.boundaryField(), patchi)
+                {
+                    const label np = p.boundaryField()[patchi].size();
+                    if (np == 0) continue;
+                    tphiB.ref().boundaryFieldRef()[patchi] ==
+                        (
+                            HbyA.boundaryField()[patchi]
+                          & mesh.Sf().boundaryField()[patchi]
+                        );
+                    trAUfB.ref().boundaryFieldRef()[patchi] ==
+                        rAU.boundaryField()[patchi];
+                }
+                constrainPressure(p, rho, U, tphiB(), trAUfB(), MRF);
+            }
         }
     }
 
@@ -542,12 +604,6 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         // --- pEqnGPU: fvMatrix 우회 — 디바이스 조립 + Jacobi-PCG + 플럭스.
         // 'Gauss linear orthogonal' laplacian + Euler ddt + 비커플드 패치
         // 전용(v1). 경계 기여만 호스트가 fvPatchField API로 정확 계산.
-        if (LADrhoCoeff > 0)
-        {
-            FatalErrorInFunction
-                << "gpuPEqn (v1) does not support LADrhoCoeff > 0"
-                << exit(FatalError);
-        }
 
         const label nc = mesh.nCells();
         const label nif = mesh.owner().size();
@@ -619,6 +675,16 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         const label refCell = needRef ? pressureReference.refCell() : 0;
         const scalar refValue = needRef ? pressureReference.refValue() : 0;
         const scalar dtInv = LTS ? 1.0 : 1.0/runTime.deltaTValue();
+
+        // AMD(-fvc::laplacian(Dr,rho)/rho): 저장 소스로 주입 (b += X*V)
+        tmp<volScalarField> tamdSrc;
+        if (LADrhoCoeff > 0)
+        {
+            tamdSrc = fvc::laplacian(Dr, rho)/rho;
+        }
+        const double* amdSrc =
+            tamdSrc.valid()
+          ? tamdSrc().primitiveField().begin() : nullptr;
         const double* rdtCell =
             LTS
           ? fv::localEulerDdt::localRDeltaT(mesh).primitiveField().begin()
@@ -665,7 +731,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             List<double> dG(nc), uG(nif), bG(nc);
             const int rc = rgpPEqnAssembleDump
             (
-                dtInv, rdtCell, trAUf().primitiveField().begin(),
+                dtInv, rdtCell, amdSrc,
+                trAUf().primitiveField().begin(),
                 tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
                 tphiHbyAv().primitiveField().begin(),
@@ -749,7 +816,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             double normFactor = 0;
             int rc = rgpPEqnAssembleCsr
             (
-                dtInv, rdtCell,
+                dtInv, rdtCell, amdSrc,
                 devChain ? nullptr : trAUf().primitiveField().begin(),
                 devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
@@ -821,7 +888,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         {
             const int rc = rgpPEqnSolve
             (
-                dtInv, rdtCell,
+                dtInv, rdtCell, amdSrc,
                 devChain ? nullptr : trAUf().primitiveField().begin(),
                 devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
@@ -1041,7 +1108,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         {
             nbf += p.boundaryField()[patchi].size();
         }
-        double* pB = gpuUBuf_.begin() + 12*nc + 3*nbf;   // pB 슬롯 재사용
+        double* pB = gpuUBuf_.begin() + 15*nc + 3*nbf;   // pB 슬롯 재사용
         double* U3out = gpuUBuf_.begin() + 6*nc;
         {
             label off = 0;

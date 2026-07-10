@@ -1063,6 +1063,7 @@ namespace
         const double* rAUfInt, const double* psis, const double* pOld,
         const double* phiInt, const double* phiB,
         const double* bDiag, const double* bSrc,
+        const double* srcExtra,
         int needRef, int refCell, double refValue
     )
     {
@@ -1100,6 +1101,12 @@ namespace
         if (er != cudaSuccess) return pfail(er, "peqn/rdt");
         rgppeqn::cellAssemble<<<nb(nc), BS>>>
             (nc, dtInv, dRdt, dPsis, gM.V, gB.pOld, gB.diag, gB.b);
+        if (srcExtra)   // AMD 등 명시항 (저장 소스: b += extra*V)
+        {
+            const double* dX = rgpInPtr(srcExtra, gB.pA, (size_t)nc, &er);
+            if (er != cudaSuccess) return pfail(er, "peqn/srcExtra");
+            rgppeqn::uAddVolSrc<<<nb(nc), BS>>>(nc, 1.0, dX, gM.V, gB.b);
+        }
         rgppeqn::faceAssemble<<<nb(nf), BS>>>
             (nf, gM.own, gM.nei, gM.gg, dRAUf, dPhi,
              gB.diag, gB.upper, gB.b);
@@ -1345,6 +1352,7 @@ int rgpPEqnMeshUpload
 int rgpPEqnSolve
 (
     double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -1358,7 +1366,8 @@ int rgpPEqnSolve
     const int nc = gM.nCells, nf = gM.nIntFaces;
 
     int rc = assemble(dtInv, rdtCell, rAUfInt, psis, pOld, phiInt, phiB,
-                      bDiag, bSrc, needRef, refCell, refValue);
+                      bDiag, bSrc, srcCellExtra, needRef, refCell,
+                      refValue);
     if (rc) return rc;
 
     cudaError_t e;
@@ -1472,6 +1481,7 @@ int rgpPEqnSolve
 int rgpPEqnAssembleDump
 (
     double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
     const double* rAUfInt,
     const double* psis, const double* pOld,
     const double* phiInt, const double* phiB,
@@ -1482,7 +1492,8 @@ int rgpPEqnAssembleDump
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
     int rc = assemble(dtInv, rdtCell, rAUfInt, psis, pOld, phiInt, phiB,
-                      bDiag, bSrc, needRef, refCell, refValue);
+                      bDiag, bSrc, srcCellExtra, needRef, refCell,
+                      refValue);
     if (rc) return rc;
 
     cudaError_t e;
@@ -1603,6 +1614,7 @@ void* rgpPEqnDevX(void) { return gB.x; }
 int rgpPEqnAssembleCsr
 (
     double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -1619,7 +1631,8 @@ int rgpPEqnAssembleCsr
     }
 
     int rc = assemble(dtInv, rdtCell, rAUfInt, psis, pOld, phiInt, phiB,
-                      bDiag, bSrc, needRef, refCell, refValue);
+                      bDiag, bSrc, srcCellExtra, needRef, refCell,
+                      refValue);
     if (rc) return rc;
 
     // LDU → CSR 값 산포
@@ -2071,7 +2084,8 @@ int rgpUEqnSolve
     const double* rho, const double* rhoOld,
     const double* U3old, const double* U3,
     const double* phiInt, const double* w, const double* mu,
-    const double* srcExp3, const double* gradP3,
+    const double* srcExp3, const double* srcExtra3,
+    const double* gradP3,
     const double* bDiag3, const double* bSrc3,
     const int* solveCmpt,
     double tol, double relTol, int maxIter,
@@ -2150,6 +2164,18 @@ int rgpUEqnSolve
     rgppeqn::uCellAssemble<<<nb(nc), BS>>>
         (nc, dtInv, dRdt, gST.rho, gST.rhoOld, gM.V, gST.grad, gU.b3,
          gU.diag, gU.b3);
+    if (srcExtra3)   // LAD-bulk 등 명시항 (저장 소스 — H()에 포함)
+    {
+        const double* dX =
+            rgpInPtr(srcExtra3, gST.grad, (size_t)3*nc, &e);
+        if (e != cudaSuccess) return pfail(e, "ueqn/srcExtra");
+        for (int c = 0; c < 3; c++)
+        {
+            rgppeqn::uAddVolSrc<<<nb(nc), BS>>>
+                (nc, 1.0, dX + (size_t)c*nc, gM.V,
+                 gU.b3 + (size_t)c*nc);
+        }
+    }
     rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
          gM.gg, gU.diag, gU.upper, gU.lower);
@@ -2290,6 +2316,7 @@ int rgpPCorrPrep
 (
     const double* rho, const double* rhoOld,
     const double* Uold3, const double* phiOld, const double* psi,
+    const double* psisOverride,
     double rDeltaT, const double* rdtCell, double rcDdtScale
 )
 {
@@ -2337,7 +2364,19 @@ int rgpPCorrPrep
         (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf,
          gST.rho, gU.rAU, gU.HbyA3, gPC.rhoOld, gPC.Uold3, gPC.phiOld,
          rDeltaT, dRdt, rcDdtScale, gPC.rhof, gPC.rAUf, gPC.phiH);
-    rgppeqn::pcPsis<<<nb(nc), BS>>>(nc, gST.gamma, gST.rho, gPC.psis);
+    if (psisOverride)
+    {
+        // psisCapRatio/psisIsentropic: 호스트 계산본 업로드 (정확 경로)
+        if ((e = cudaMemcpy(gPC.psis, psisOverride,
+                            (size_t)nc*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "pcorr/psis override");
+    }
+    else
+    {
+        rgppeqn::pcPsis<<<nb(nc), BS>>>(nc, gST.gamma, gST.rho,
+                                        gPC.psis);
+    }
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "pcorr/launch");
     return 0;

@@ -40,6 +40,7 @@ int rgpPEqnMeshUpload
 int rgpPEqnSolve
 (
     double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -55,6 +56,7 @@ int rgpPEqnSolve
 int rgpPEqnAssembleDump
 (
     double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
     const double* rAUfInt,
     const double* psis, const double* pOld,
     const double* phiInt, const double* phiB,
@@ -76,6 +78,7 @@ void* rgpPEqnDevX(void);             /* [nCells] 디바이스 (x0=p, 솔브 후 
 int rgpPEqnAssembleCsr
 (
     double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -136,7 +139,8 @@ int rgpUEqnSolve
     const double* rho, const double* rhoOld,
     const double* U3old, const double* U3,
     const double* phiInt, const double* w, const double* mu,
-    const double* srcExp3, const double* gradP3,
+    const double* srcExp3, const double* srcExtra3,
+    const double* gradP3,
     const double* bDiag3, const double* bSrc3,
     const int* solveCmpt,
     double tol, double relTol, int maxIter,
@@ -155,6 +159,7 @@ int rgpPCorrPrep
 (
     const double* rho, const double* rhoOld,
     const double* Uold3, const double* phiOld, const double* psi,
+    const double* psisOverride,
     double rDeltaT, const double* rdtCell, double rcDdtScale
 );
 int rgpPEqnFinish2(double* pOut, double* phiOut);

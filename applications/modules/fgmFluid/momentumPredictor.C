@@ -109,10 +109,10 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         // --- UEqnGPU: 물리 필드(가중치·muEff·dev2 명시항·grad p)는 OF
         // 스킴으로 호스트가 정확 계산 → GPU가 LDU 조립+성분별 BiCGStab.
         // 행렬은 스텝 내내 디바이스 상주(pCorr가 rAU/HbyA를 GPU 산출).
-        if (LADUCoeff > 0 || LADbulkCoeff > 0 || MRF.size() > 0)
+        if (MRF.size() > 0)
         {
             FatalErrorInFunction
-                << "gpuUEqn (v1) does not support LAD/MRF"
+                << "gpuUEqn (v1) does not support MRF"
                 << exit(FatalError);
         }
 
@@ -125,16 +125,53 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             nbf += U.boundaryField()[patchi].size();
         }
 
-        // muEff = (rho*nuEff) — laplacian 계수 + 명시항/경계 계수용
+        // muEff = (rho*nuEff) — dev2 명시항용. 라플라시안 계수는
+        // muEff+muArt (LAD-U는 implicit laplacian에만 들어감 —
+        // fvm::laplacian(a,U)+fvm::laplacian(b,U) == fvm::laplacian(a+b,U))
         const volScalarField muEff(rho*momentumTransport->nuEff());
+        tmp<volScalarField> tmuLap;
+        if (LADUCoeff > 0)
+        {
+            tmuLap = muEff + muArt;
+        }
+        const volScalarField& muLap =
+            tmuLap.valid() ? tmuLap() : muEff;
+
+        // LAD-bulk: -fvc::grad(betaArt*divU)는 저장 소스(H() 포함)
+        tmp<volVectorField> tsrcBulk;
+        if (LADbulkCoeff > 0)
+        {
+            const volScalarField divU(fvc::div(U));
+            volScalarField betaArt
+            (
+                IOobject
+                (
+                    "betaArt", mesh.time().name(), mesh,
+                    IOobject::NO_READ, IOobject::NO_WRITE
+                ),
+                mesh,
+                dimensionedScalar(dimensionSet(1, -1, -1, 0, 0, 0, 0), 0),
+                zeroGradientFvPatchScalarField::typeName
+            );
+            const scalarField V23(pow(scalarField(mesh.V()), 2.0/3.0));
+            betaArt.primitiveFieldRef() =
+                LADbulkCoeff*rho.primitiveField()*V23
+               *mag(divU.primitiveField());
+            betaArt.correctBoundaryConditions();
+            Info<< "LAD-bulk: betaArt max = "
+                << gMax(betaArt.primitiveField()) << " kg/(m s)" << endl;
+            // UEqn -= grad(...) → 저장 소스 += grad(...)
+            tsrcBulk = fvc::grad(betaArt*divU);
+        }
 
         // SoA gather (v2: 물리 필드는 GPU — 호스트는 U/경계값만)
-        gpuUBuf_.setSize(12*nc + 22*nbf);
+        gpuUBuf_.setSize(15*nc + 22*nbf);
         double* U3 = gpuUBuf_.begin();          // [3*nc]
         double* U3old = U3 + 3*nc;
         double* U3out = U3old + 3*nc;
         double* H3 = U3out + 3*nc;              // [3*nc] (pCorr)
-        double* UB3 = H3 + 3*nc;                // [3*nbf]
+        double* srcX3 = H3 + 3*nc;              // [3*nc] LAD-bulk 소스
+        double* UB3 = srcX3 + 3*nc;             // [3*nbf]
         double* pB = UB3 + 3*nbf;               // [nbf]
         double* bDiag3 = pB + nbf;              // [3*nbf]
         double* bSrc3 = bDiag3 + 3*nbf;
@@ -151,6 +188,17 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                 {
                     U3[k*nc + i] = Uc[i][k];
                     U3old[k*nc + i] = Uo[i][k];
+                }
+            }
+            if (tsrcBulk.valid())
+            {
+                const vectorField& sb = tsrcBulk().primitiveField();
+                for (label i = 0; i < nc; i++)
+                {
+                    for (label k = 0; k < 3; k++)
+                    {
+                        srcX3[k*nc + i] = sb[i][k];
+                    }
                 }
             }
         }
@@ -258,7 +306,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                 const vectorField vbc(pp.valueBoundaryCoeffs(wb));
                 const scalarField gMsf
                 (
-                    muEff.boundaryField()[patchi]
+                    muLap.boundaryField()[patchi]
                    *mesh.magSf().boundaryField()[patchi]
                 );
                 const vectorField gic(pp.gradientInternalCoeffs());
@@ -310,8 +358,12 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             rho.primitiveField().begin(),
             rho.oldTime().primitiveField().begin(),
             U3old, nullptr /*U3: 디바이스 상주*/,
-            nullptr /*phi*/, nullptr /*w*/, nullptr /*mu*/,
-            nullptr /*srcExp3*/, nullptr /*gradP3*/,
+            nullptr /*phi*/, nullptr /*w*/,
+            tmuLap.valid()
+          ? muLap.primitiveField().begin() : nullptr /*mu: LAD-U 합산*/,
+            nullptr /*srcExp3*/,
+            tsrcBulk.valid() ? srcX3 : nullptr /*LAD-bulk*/,
+            nullptr /*gradP3*/,
             bDiag3, bSrc3, solveCmpt,
             tol, rtol, maxIter,
             U3out, res0, resF, iters
