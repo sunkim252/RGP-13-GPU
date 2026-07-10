@@ -37,6 +37,61 @@ License
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
+void Foam::solvers::fgmFluid::armGpuSTMesh()
+{
+    if (gpuZCArmed_) return;
+
+    armGpuPEqnMesh();
+
+    const label nif = mesh.owner().size();
+    label nbf = 0;
+    forAll(Z_.boundaryField(), patchi)
+    {
+        nbf += Z_.boundaryField()[patchi].size();
+    }
+
+    const surfaceScalarField& wCD = mesh.surfaceInterpolation::weights();
+    const surfaceVectorField& Sff = mesh.Sf();
+    const volVectorField& CC = mesh.C();
+
+    List<double> wl(nif), sf3(3*nif), d3(3*nif);
+    List<double> bsf(3*max(nbf, label(1)), 0.0);
+    forAll(mesh.owner(), f)
+    {
+        wl[f] = wCD.primitiveField()[f];
+        const vector d(CC[mesh.neighbour()[f]] - CC[mesh.owner()[f]]);
+        for (label k = 0; k < 3; k++)
+        {
+            sf3[k*nif + f] = Sff.primitiveField()[f][k];
+            d3[k*nif + f] = d[k];
+        }
+    }
+    label off = 0;
+    forAll(Z_.boundaryField(), patchi)
+    {
+        const vectorField& Sfb = Sff.boundaryField()[patchi];
+        forAll(Sfb, fi)
+        {
+            for (label k = 0; k < 3; k++)
+            {
+                bsf[k*nbf + off + fi] = Sfb[fi][k];
+            }
+        }
+        off += Sfb.size();
+    }
+
+    if (rgpSTEqnMeshUpload(wl.begin(), sf3.begin(), d3.begin(),
+                           bsf.begin()))
+    {
+        FatalErrorInFunction
+            << "rgpSTEqnMeshUpload: " << rgpPEqnLastError()
+            << exit(FatalError);
+    }
+    gpuZCArmed_ = true;
+    Info<< "fgmFluid: GPU transport mesh armed" << nl << endl;
+}
+
+
 void Foam::solvers::fgmFluid::thermophysicalPredictor()
 {
     std::chrono::steady_clock::time_point tTot;
@@ -66,57 +121,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                 << exit(FatalError);
         }
 
-        if (!gpuZCArmed_)
-        {
-            armGpuPEqnMesh();
-
-            const label nif = mesh.owner().size();
-            label nbf = 0;
-            forAll(Z_.boundaryField(), patchi)
-            {
-                nbf += Z_.boundaryField()[patchi].size();
-            }
-
-            const surfaceScalarField& wCD = mesh.surfaceInterpolation::weights();
-            const surfaceVectorField& Sff = mesh.Sf();
-            const volVectorField& CC = mesh.C();
-
-            List<double> wl(nif), sf3(3*nif), d3(3*nif);
-            List<double> bsf(3*max(nbf, label(1)), 0.0);
-            forAll(mesh.owner(), f)
-            {
-                wl[f] = wCD.primitiveField()[f];
-                const vector d(CC[mesh.neighbour()[f]] - CC[mesh.owner()[f]]);
-                for (label k = 0; k < 3; k++)
-                {
-                    sf3[k*nif + f] = Sff.primitiveField()[f][k];
-                    d3[k*nif + f] = d[k];
-                }
-            }
-            label off = 0;
-            forAll(Z_.boundaryField(), patchi)
-            {
-                const vectorField& Sfb = Sff.boundaryField()[patchi];
-                forAll(Sfb, fi)
-                {
-                    for (label k = 0; k < 3; k++)
-                    {
-                        bsf[k*nbf + off + fi] = Sfb[fi][k];
-                    }
-                }
-                off += Sfb.size();
-            }
-
-            if (rgpSTEqnMeshUpload(wl.begin(), sf3.begin(), d3.begin(),
-                                   bsf.begin()))
-            {
-                FatalErrorInFunction
-                    << "rgpSTEqnMeshUpload: " << rgpPEqnLastError()
-                    << exit(FatalError);
-            }
-            gpuZCArmed_ = true;
-            Info<< "fgmFluid: GPU Z/C transport armed" << nl << endl;
-        }
+        armGpuSTMesh();
 
         if (rgpSTWeightsBegin(phi.primitiveField().begin()))
         {

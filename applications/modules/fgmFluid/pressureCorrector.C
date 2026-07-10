@@ -51,6 +51,7 @@ Description
 #include "fvcLaplacian.H"
 #include "fvcAverage.H"
 #include "zeroGradientFvPatchFields.H"
+#include "extrapolatedCalculatedFvPatchFields.H"
 #include "solutionControl.H"
 #include "gpu/rgpPEqnTypes.H"
 
@@ -204,27 +205,108 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     rho = thermo.rho();
     rho.relax();
 
-    fvVectorMatrix& UEqn = tUEqn.ref();
-
     // Thermodynamic density needs to be updated by psi*d(p) after the
     // pressure solution
     const volScalarField psip0(psi*p);
 
     const surfaceScalarField rhof(fvc::interpolate(rho));
 
-    const volScalarField rAU("rAU", 1.0/UEqn.A());
+    // UEqnGPU: 행렬이 디바이스 상주이므로 rAU=1/A(), H(U)를 GPU에서 산출
+    // (fvMatrix::D/H 1:1). 그 외에는 기존 CPU 경로.
+    tmp<volScalarField> trAU;
+    tmp<volVectorField> tHbyA;
+    if (gpuUEqn_)
+    {
+        if (pimple.consistent())
+        {
+            FatalErrorInFunction
+                << "gpuUEqn (v1) does not support 'consistent'"
+                << exit(FatalError);
+        }
+
+        const label nc = mesh.nCells();
+        label nbf = 0;
+        forAll(U.boundaryField(), patchi)
+        {
+            nbf += U.boundaryField()[patchi].size();
+        }
+
+        double* U3 = gpuUBuf_.begin();
+        double* rAUh = U3 + 9*nc;               // U3out 슬롯 재사용
+        double* H3 = U3 + 15*nc + 6*nbf;
+
+        {
+            const vectorField& Uc = U.primitiveField();
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    U3[k*nc + i] = Uc[i][k];
+                }
+            }
+        }
+
+        const int rc = rgpUEqnAH(U3, rAUh, H3);
+        if (rc)
+        {
+            FatalErrorInFunction
+                << "rgpUEqnAH: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        trAU = volScalarField::New
+        (
+            "rAU", mesh,
+            dimensionedScalar(dimVolume*dimTime/dimMass, 0),
+            extrapolatedCalculatedFvPatchScalarField::typeName
+        );
+        {
+            scalarField& r = trAU.ref().primitiveFieldRef();
+            for (label i = 0; i < nc; i++) { r[i] = rAUh[i]; }
+        }
+        trAU.ref().correctBoundaryConditions();
+
+        tmp<volVectorField> tH = volVectorField::New
+        (
+            "H(U)", mesh,
+            dimensionedVector(dimDensity*dimVelocity/dimTime, Zero),
+            extrapolatedCalculatedFvPatchScalarField::typeName
+        );
+        {
+            vectorField& h = tH.ref().primitiveFieldRef();
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    h[i][k] =
+                        (mesh.solutionD()[k] == 1) ? H3[k*nc + i] : 0.0;
+                }
+            }
+        }
+        tH.ref().correctBoundaryConditions();
+
+        tHbyA = constrainHbyA(trAU()*tH, U, p);
+    }
+    else
+    {
+        fvVectorMatrix& UEqn = tUEqn.ref();
+        trAU = volScalarField::New("rAU", 1.0/UEqn.A());
+        tHbyA = constrainHbyA(trAU()*UEqn.H(), U, p);
+    }
+
+    const volScalarField& rAU = trAU();
     const surfaceScalarField rhorAUf("rhorAUf", fvc::interpolate(rho*rAU));
 
     tmp<volScalarField> rAtU
     (
-        pimple.consistent()
-      ? volScalarField::New("rAtU", 1.0/(1.0/rAU - UEqn.H1()))
+        (!gpuUEqn_ && pimple.consistent())
+      ? volScalarField::New("rAtU", 1.0/(1.0/rAU - tUEqn.ref().H1()))
       : tmp<volScalarField>(nullptr)
     );
 
     tmp<surfaceScalarField> rhorAtUf
     (
-        pimple.consistent()
+        (!gpuUEqn_ && pimple.consistent())
       ? surfaceScalarField::New("rhoRAtUf", fvc::interpolate(rho*rAtU()))
       : tmp<surfaceScalarField>(nullptr)
     );
@@ -233,9 +315,9 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     const surfaceScalarField& rhorAAtUf =
         pimple.consistent() ? rhorAtUf() : rhorAUf;
 
-    volVectorField HbyA(constrainHbyA(rAU*UEqn.H(), U, p));
+    volVectorField HbyA(tHbyA);
 
-    if (pimple.nCorrPiso() <= 1)
+    if (!gpuUEqn_ && pimple.nCorrPiso() <= 1)
     {
         tUEqn.clear();
     }

@@ -110,6 +110,27 @@ int rgpSTWeightsBegin(const double* phiInt);
 int rgpSTWeightsField(const double* psi, const double* bPsi);
 int rgpSTWeightsEnd(void);
 
+/*  UEqn(벡터, 성분 공유 LDU): ddt(rho,U) + div(phi,U;w) − laplacian(mu,U)
+    를 디바이스 조립(가중치 w·mu·명시소스 srcExp3=(divDevTau 명시항−grad p)
+    는 호스트가 OF 스킴으로 정확 계산해 업로드), 유효 성분별
+    Jacobi-BiCGStab 솔브. 행렬은 스텝 내내 디바이스 상주 —
+    rgpUEqnAH가 pCorr용 rAU=1/A()와 H(U)를 산출(fvMatrix::D/H 1:1).
+    SoA 규약: [3*n], 경계 배열 [3*nbf].                                */
+int rgpUEqnSolve
+(
+    double dtInv,
+    const double* rho, const double* rhoOld,
+    const double* U3old, const double* U3,
+    const double* phiInt, const double* w, const double* mu,
+    const double* srcExp3, const double* gradP3,
+    const double* bDiag3, const double* bSrc3,
+    const int* solveCmpt,
+    double tol, double relTol, int maxIter,
+    double* U3out, double* initRes3, double* finalRes3, int* iters3
+);
+
+int rgpUEqnAH(const double* U3, double* rAU, double* H3);
+
 /*  검증용: 마지막 rgpSTEqnSolve의 조립 계수/가중치 D2H (null 허용) */
 int rgpSTEqnDump
 (

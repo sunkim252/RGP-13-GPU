@@ -127,6 +127,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuPEqnNnz_(0),
     gpuZC_(fgmTable_.lookupOrDefault<Switch>("gpuZC", false)),
     gpuZCArmed_(false),
+    gpuUEqn_(fgmTable_.lookupOrDefault<Switch>("gpuUEqn", false)),
     gpuPEqnArmed_(false),
     gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
     gpuManifoldArmed_(false),

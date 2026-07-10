@@ -29,6 +29,9 @@ License
 #include "fvcGrad.H"
 #include "fvcDiv.H"
 #include "zeroGradientFvPatchFields.H"
+#include "limitedSurfaceInterpolationScheme.H"
+#include "solutionControl.H"
+#include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
 
@@ -99,6 +102,200 @@ void Foam::solvers::fgmFluid::momentumPredictor()
 
     std::chrono::steady_clock::time_point tAsm;
     if (thermoTimings_) { tAsm = std::chrono::steady_clock::now(); }
+
+    if (gpuUEqn_)
+    {
+        // --- UEqnGPU: 물리 필드(가중치·muEff·dev2 명시항·grad p)는 OF
+        // 스킴으로 호스트가 정확 계산 → GPU가 LDU 조립+성분별 BiCGStab.
+        // 행렬은 스텝 내내 디바이스 상주(pCorr가 rAU/HbyA를 GPU 산출).
+        if (LTS || LADUCoeff > 0 || LADbulkCoeff > 0 || MRF.size() > 0)
+        {
+            FatalErrorInFunction
+                << "gpuUEqn (v1) does not support LTS/LAD/MRF"
+                << exit(FatalError);
+        }
+
+        armGpuSTMesh();
+
+        const label nc = mesh.nCells();
+        label nbf = 0;
+        forAll(U.boundaryField(), patchi)
+        {
+            nbf += U.boundaryField()[patchi].size();
+        }
+
+        // div(phi,U) 스킴의 실제 가중치 (Gauss 토큰 소비 후 구성)
+        ITstream divIs(mesh.schemes().div("div(phi,U)"));
+        const word gaussWord(divIs);
+        tmp<surfaceScalarField> twU
+        (
+            limitedSurfaceInterpolationScheme<vector>::New
+            (
+                mesh, phi, divIs
+            )().weights(U)
+        );
+        const surfaceScalarField& wU = twU();
+
+        // muEff = (rho*nuEff) — divDevTau/laplacian 계수 (이름 규약 유지:
+        // fvc::div 스킴 조회가 "div(((rho*nuEff)*dev2(T(grad(U)))))"와
+        // 일치해야 함)
+        const volScalarField muEff(rho*momentumTransport->nuEff());
+
+        // 저장 소스: divDevTau의 fvc 항만. −grad p는 solve() 전용 임시
+        // 소스라 행렬 소스(H()에 반영되는)에 넣으면 안 된다 —
+        // OF의 solve(UEqn == -fvc::grad(p)) 의미론 그대로.
+        const volVectorField srcExp
+        (
+            fvc::div(muEff*dev2(T(fvc::grad(U))))
+        );
+        const volVectorField gradP(fvc::grad(p));
+
+        // SoA gather + 경계 계수
+        gpuUBuf_.setSize(15*nc + 6*nbf + 3*nc);
+        double* U3 = gpuUBuf_.begin();          // [3*nc]
+        double* U3old = U3 + 3*nc;
+        double* src3 = U3old + 3*nc;
+        double* U3out = src3 + 3*nc;
+        double* gp3 = U3out + 3*nc;             // [3*nc] grad p
+        double* bDiag3 = gp3 + 3*nc;            // [3*nbf]
+        double* bSrc3 = bDiag3 + 3*nbf;
+        double* H3 = bSrc3 + 3*nbf;             // [3*nc] (pCorr에서 사용)
+        (void)H3;
+
+        {
+            const vectorField& Uc = U.primitiveField();
+            const vectorField& Uo = U.oldTime().primitiveField();
+            const vectorField& sc = srcExp.primitiveField();
+            const vectorField& gp = gradP.primitiveField();
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    U3[k*nc + i] = Uc[i][k];
+                    U3old[k*nc + i] = Uo[i][k];
+                    src3[k*nc + i] = sc[i][k];
+                    gp3[k*nc + i] = gp[i][k];
+                }
+            }
+        }
+
+        {
+            label off = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pp = U.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+
+                const scalarField& phb = phi.boundaryField()[patchi];
+                const vectorField vic
+                (
+                    pp.valueInternalCoeffs
+                    (
+                        wU.boundaryField()[patchi]
+                    )
+                );
+                const vectorField vbc
+                (
+                    pp.valueBoundaryCoeffs
+                    (
+                        wU.boundaryField()[patchi]
+                    )
+                );
+                const scalarField gMsf
+                (
+                    muEff.boundaryField()[patchi]
+                   *mesh.magSf().boundaryField()[patchi]
+                );
+                const vectorField gic(pp.gradientInternalCoeffs());
+                const vectorField gbc(pp.gradientBoundaryCoeffs());
+
+                for (label f = 0; f < np; f++)
+                {
+                    for (label k = 0; k < 3; k++)
+                    {
+                        bDiag3[k*nbf + off + f] =
+                            phb[f]*vic[f][k] - gMsf[f]*gic[f][k];
+                        bSrc3[k*nbf + off + f] =
+                            -phb[f]*vbc[f][k] + gMsf[f]*gbc[f][k];
+                    }
+                }
+                off += np;
+            }
+        }
+
+        const dictionary& sd = mesh.solution().solverDict
+        (
+            U.select
+            (
+                !mesh.schemes().steady()
+             && solutionControl::finalIteration(mesh)
+            )
+        );
+        const scalar tol = sd.lookup<scalar>("tolerance");
+        const scalar rtol = sd.lookupOrDefault<scalar>("relTol", 0);
+        const label maxIter = sd.lookupOrDefault<label>("maxIter", 1000);
+
+        int solveCmpt[3];
+        for (label k = 0; k < 3; k++)
+        {
+            solveCmpt[k] =
+                (mesh.solutionD()[k] == 1 && pimple.momentumPredictor())
+              ? 1 : 0;
+        }
+
+        double res0[3], resF[3];
+        int iters[3];
+        const int rc = rgpUEqnSolve
+        (
+            1.0/runTime.deltaTValue(),
+            rho.primitiveField().begin(),
+            rho.oldTime().primitiveField().begin(),
+            U3old, U3,
+            phi.primitiveField().begin(), wU.primitiveField().begin(),
+            muEff.primitiveField().begin(),
+            src3, gp3, bDiag3, bSrc3, solveCmpt,
+            tol, rtol, maxIter,
+            U3out, res0, resF, iters
+        );
+        if (rc)
+        {
+            FatalErrorInFunction
+                << "rgpUEqnSolve: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        if (pimple.momentumPredictor())
+        {
+            vectorField& Uc = U.primitiveFieldRef();
+            for (label k = 0; k < 3; k++)
+            {
+                if (!solveCmpt[k]) continue;
+                Info<< "rgpBiCGStab: Solving for "
+                    << word(U.name() + vector::componentNames[k])
+                    << ", Initial residual = " << res0[k]
+                    << ", Final residual = " << resF[k]
+                    << ", No Iterations " << iters[k] << endl;
+                for (label i = 0; i < nc; i++)
+                {
+                    Uc[i][k] = U3out[k*nc + i];
+                }
+            }
+
+            U.correctBoundaryConditions();
+            fvConstraints().constrain(U);
+            K = 0.5*magSqr(U);
+        }
+
+        if (thermoTimings_)
+        {
+            Info<< "momentum predictor total = "
+                << std::chrono::duration<double>
+                   (std::chrono::steady_clock::now() - tTot).count()
+                << " s" << endl;
+        }
+        return;
+    }
 
     tUEqn =
     (

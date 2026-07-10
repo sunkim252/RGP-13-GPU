@@ -249,6 +249,12 @@ protected:
         mutable bool gpuZCArmed_;
         mutable List<double> gpuZCBuf_;   // 경계 연접 (bDiag,bSrc,bPsi)
 
+        //- UEqnGPU: 운동량 방정식을 GPU 조립+성분별 솔브, 행렬 디바이스
+        //  상주로 pCorr의 rAU/HbyA도 GPU 산출. 'gpuUEqn on;'
+        //  (가중치·dev2 명시항 등 물리 필드는 호스트가 OF 스킴으로 계산)
+        Switch gpuUEqn_;
+        mutable List<double> gpuUBuf_;    // SoA/경계 스테이징
+
         //- pEqnGPU 메시 업로드 완료 플래그 + 작업 버퍼
         mutable bool gpuPEqnArmed_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
@@ -346,6 +352,10 @@ private:
         //- pEqnGPU: 정적 메시(owner/neigh/기하계수/V/경계 faceCells)
         //  업로드 (1회, idempotent). gpuPEqn/gpuZC 양쪽에서 사용.
         void armGpuPEqnMesh();
+
+        //- 수송용 정적 메시(선형 가중치/Sf/d/경계 Sf) 업로드 (1회,
+        //  idempotent). gpuZC/gpuUEqn 양쪽에서 사용.
+        void armGpuSTMesh();
 
         //- Effective (dynamic) diffusivity [kg/m/s] for a transported control
         //  variable, using its Lewis number:
