@@ -221,8 +221,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // Update the pressure BCs for flux consistency (3D: waveTransmissive
     // outlet, fixedFluxPressure walls). Volumetric-flux form: pass the
     // volumetric predicted flux and the rAUf (velocity-level) coefficient,
-    // matching the pEqn's laplacian(rAUf, p).
-    constrainPressure(p, rho, U, phiHbyAv, rAUf, MRF);
+    // matching the pEqn's laplacian(rAUf, p). The rho overload is for MASS
+    // flux; on a flow-carrying fixedFluxPressure patch it would subtract
+    // rho_b*(Sf&U_b) from the volumetric phiHbyAv and skew snGrad(p) by
+    // ~rho_b (LOX ~1000x). (backport RGP-13-GPU 2005bc9)
+    constrainPressure(p, U, phiHbyAv, rAUf, MRF);
 
     // --- RANK 4: Artificial Mass Diffusivity (AMD) on DENSITY -----------------
     // Kawai, Terashima & Negishi, J. Comput. Phys. 300 (2015) 116: at a large
