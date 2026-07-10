@@ -69,14 +69,46 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
 
     // AMR/재분배로 토폴로지가 바뀌면 stale owner/neigh/V/가중치로
     // 조용히 틀린 행렬을 조립하게 된다 — 상태 불일치 시 전체 재아밍
-    // (rgpPEqnMeshUpload가 디바이스 버퍼 전체 해제 후 재할당)
+    // (rgpPEqnMeshUpload가 디바이스 버퍼 전체 해제 후 재할당).
+    // 셀/면 수 비교만으로는 (a) 수 보존 topo 변화(refine+unrefine 상쇄)
+    // (b) 메시 이동(연결성 불변, V/Sf/deltaCoeffs 변화)을 놓치므로
+    // topoChanged()/moving() 플래그도 본다. 플래그는 스텝 내내 유지되고
+    // 이 함수는 스텝 중간에도 불리므로(재아밍이 devChain의 조립된 UEqn
+    // 행렬까지 해제) timeIndex 래치로 스텝당 1회만 재아밍한다 — 메시
+    // 변화(preSolve의 topo, firstIter의 move)는 predictor들보다 먼저
+    // 일어나므로 스텝 첫 아밍 호출에서의 재아밍이 정확하다.
     if (gpuPEqnArmed_)
     {
-        if (nc == gpuMeshCells_ && nif == gpuMeshFaces_) return;
-        Info<< "fgmFluid: mesh topology changed ("
+        const bool flagged =
+            (mesh.topoChanged() || mesh.moving())
+         && mesh.time().timeIndex() != gpuMeshStampTime_;
+
+        if (nc == gpuMeshCells_ && nif == gpuMeshFaces_ && !flagged)
+        {
+            return;
+        }
+        Info<< "fgmFluid: mesh topology/geometry changed ("
             << gpuMeshCells_ << " -> " << nc
             << " cells) -- re-arming GPU mesh structures" << nl << endl;
         gpuZCArmed_ = false;   // ST 메시(가중치/Sf/d)도 재업로드 필요
+    }
+
+    // 외부 반복마다 이동하는 mover는 스텝-단위 래치 가정을 깬다 (v1)
+    if
+    (
+        mesh.dynamic()
+     && pimple.dict().lookupOrDefault<Switch>
+        (
+            "moveMeshOuterCorrectors", false
+        )
+    )
+    {
+        FatalErrorInFunction
+            << "gpuPEqn/gpuZC/gpuUEqn (v1) do not support "
+            << "moveMeshOuterCorrectors (mesh geometry would change "
+            << "between outer iterations while the GPU copy is armed "
+            << "once per time step)"
+            << exit(FatalError);
     }
 
     label nbf = 0;
@@ -138,6 +170,7 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
     gpuPEqnArmed_ = true;
     gpuMeshCells_ = nc;
     gpuMeshFaces_ = nif;
+    gpuMeshStampTime_ = mesh.time().timeIndex();
     Info<< "fgmFluid: GPU pEqn mesh armed -- " << nc << " cells, "
         << nif << " internal faces, " << nbf
         << " boundary faces (pEqn solver: " << gpuPEqnSolver_ << ")"
@@ -619,6 +652,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         // 'Gauss linear orthogonal' laplacian + Euler ddt + 비커플드 패치
         // 전용(v1). 경계 기여만 호스트가 fvPatchField API로 정확 계산.
 
+        // 행렬-레벨 fvConstraint 차단 (CPU 경로의 constrain(pEqn)은 GPU
+        // 조립에 미반영; limitPressure류 필드-레벨은 솔브 후 적용됨)
+        checkGpuConstraints(p.name(), "gpuPEqn");
+
         const label nc = mesh.nCells();
         const label nif = mesh.owner().size();
 
@@ -811,7 +848,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             typedef int (*AmgxFn)
             (
                 int, int, const int*, const int*,
-                void*, void*, void*, double, int, int*
+                void*, void*, void*, int, int, int*
             );
             typedef const char* (*AmgxErrFn)(void);
             static AmgxFn amgxFn = nullptr;
@@ -862,8 +899,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             // AmgX per-solve 톨 주입은 라이브 솔버에 반영되지 않으므로
             // (config_add_parameters 잠복 이슈) 고정 4-iter 블록으로
             // 돌리고 OF 규약 잔차로 외부에서 수렴 판정한다. x는 블록 간
-            // 연속이라 정확히 이어서 수렴한다.
-            for (int round = 0; round < 25 && resF >= target; round++)
+            // 연속이라 정확히 이어서 수렴한다. 블록 수는 fvSolution
+            // maxIter를 존중 (블록당 4 iter).
+            const int maxRounds = max(label(1), (maxIter + 3)/4);
+            for (int round = 0; round < maxRounds && resF >= target; round++)
             {
                 int it = 0;
                 rc = amgxFn
@@ -871,7 +910,9 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     nc, gpuPEqnNnz_,
                     rgpPEqnCsrRowPtr(), rgpPEqnCsrColInd(),
                     rgpPEqnDevValues(), rgpPEqnDevB(), rgpPEqnDevX(),
-                    0.0, setupInterval, &it
+                    round == 0 ? 1 : 0,   // newSolve: 계층 동결 주기는
+                    setupInterval,        // 압력 솔브 횟수 기준으로 센다
+                    &it
                 );
                 if (rc)
                 {
@@ -886,12 +927,27 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                         << "rgpPEqnResidual: " << rgpPEqnLastError()
                         << exit(FatalError);
                 }
+                // NaN은 모든 비교에서 false → 루프가 수렴처럼 조용히
+                // 끝나므로 명시적으로 잡는다 (동결 계층 발산 감지)
+                if (resF != resF)
+                {
+                    FatalErrorInFunction
+                        << "AmgX p-solve diverged (NaN residual) -- "
+                        << "frozen AMG hierarchy may be stale; reduce "
+                        << "gpuPEqnSetupInterval"
+                        << exit(FatalError);
+                }
             }
 
-            if (rgpPEqnFinish
+            // devChain은 Finish2가 p/플럭스를 회수한다 — 이중 D2H 회피
+            if
+            (
+                !devChain
+             && rgpPEqnFinish
                 (
                     p.primitiveFieldRef().begin(), gpuPEqnFlux_.begin()
-                ))
+                )
+            )
             {
                 FatalErrorInFunction
                     << "rgpPEqnFinish: " << rgpPEqnLastError()

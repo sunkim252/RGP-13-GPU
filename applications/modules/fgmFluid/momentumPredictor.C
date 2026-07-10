@@ -116,20 +116,25 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                 << exit(FatalError);
         }
         // 침묵 오차 방지: CPU 경로의 relax/fvModels/fvConstraints(행렬)
-        // 는 GPU 조립에 미반영 — 활성 상태면 다른 방정식을 풀게 되므로
-        // 명시적으로 차단
-        if (mesh.solution().relaxEquation(U.name()))
+        // 는 GPU 조립에 미반영 — U에 실제로 작용하는 것만 차단 (계수 1의
+        // no-op relax, 다른 필드의 모델, 필드-레벨 제약은 무해하므로 허용)
+        if
+        (
+            mesh.solution().relaxEquation(U.name())
+         && mesh.solution().equationRelaxationFactor(U.name()) != 1
+        )
         {
             FatalErrorInFunction
                 << "gpuUEqn (v1) does not support equation relaxation "
                 << "on U" << exit(FatalError);
         }
-        if (fvModels().size() > 0 || fvConstraints().size() > 0)
+        if (fvModels().addsSupToField(U.name()))
         {
             FatalErrorInFunction
-                << "gpuUEqn (v1) does not support fvModels/fvConstraints"
+                << "gpuUEqn (v1) does not support fvModels sources on U"
                 << exit(FatalError);
         }
+        checkGpuConstraints(U.name(), "gpuUEqn");
 
         armGpuSTMesh();
 

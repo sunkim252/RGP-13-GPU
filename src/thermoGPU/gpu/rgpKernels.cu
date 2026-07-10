@@ -1186,10 +1186,17 @@ int rgpGpuEvaluateHa
 
 int rgpPinHost(void* p, size_t bytes)
 {
-    cudaError_t e = cudaHostRegister
-    (
-        p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped
-    );
+    // Mapped(디바이스 별칭)는 unified mode 1 검증 경로에서만 필요.
+    // mode 0에서 Mapped로 등록하면 WSL2에서 AmgX(자체 pinned 풀)와
+    // 공존 시 이후의 일반 H2D 복사가 invalid argument로 깨지는
+    // 상호작용이 실측됨(amgx+devChain+pin 조합, 2026-07-11) —
+    // 전송 가속만 필요한 mode 0은 Portable 등록으로 충분하다.
+    unsigned flags = cudaHostRegisterPortable;
+    if (gRgpUnified == 1)
+    {
+        flags |= cudaHostRegisterMapped;
+    }
+    cudaError_t e = cudaHostRegister(p, bytes, flags);
     if (e != cudaSuccess)
     {
         snprintf(gErr, sizeof(gErr), "pinHost: %s", cudaGetErrorString(e));

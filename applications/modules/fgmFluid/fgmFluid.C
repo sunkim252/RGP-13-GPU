@@ -131,9 +131,11 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuPinned_(false),
     gpuMeshCells_(-1),
     gpuMeshFaces_(-1),
+    gpuMeshStampTime_(-1),
     gpuPEqnArmed_(false),
     gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
     gpuManifoldArmed_(false),
+    gpuHeMode_(-1),
     gpuNFields_(0),
     thermoTimings_(fgmTable_.lookupOrDefault<Switch>("thermoTimings", false)),
 
@@ -845,8 +847,17 @@ void Foam::solvers::fgmFluid::updateManifold()
     bool gpuDone = false;
     if (gpuManifold_)
     {
-        // 스텝 2부터 1회: 모든 grow-only 버퍼가 최종 크기 도달 후 pin
-        if (!gpuPinned_ && gpuManifoldArmed_ && gpuFgmOut_.size() > 0)
+        // 스텝 2부터 1회: 모든 grow-only 버퍼가 최종 크기 도달 후 pin —
+        // per-corrector D2H 버퍼(gpuRho_.. / gpuPEqnFlux_)는 첫 스텝의
+        // pressureCorrector에서 처음 사이징되므로, 켜진 스위치의 버퍼가
+        // 전부 채워진 뒤에만 등록 (안 그러면 size-0 스킵이 영구화됨)
+        if
+        (
+            !gpuPinned_ && gpuManifoldArmed_ && gpuFgmOut_.size() > 0
+         && (!gpuThermo_ || gpuRho_.size() > 0)
+         && (!gpuPEqn_ || gpuPEqnFlux_.size() > 0)
+         && (!gpuUEqn_ || gpuUBuf_.size() > 0)
+        )
         {
             pinGpuHostBuffers();
         }
@@ -854,6 +865,20 @@ void Foam::solvers::fgmFluid::updateManifold()
         // 1회 아밍: 축 4개 + [sourcePV, T, Y_k.., RG_.., LeZ?, LeC?] 순서로
         // 연접한 테이블을 업로드 (테이블은 런 중 불변; 산포 순서와 동일).
         if (!gpuManifoldArmed_)
+        {
+            // 멀티-GPU 병렬: 테이블 디바이스 할당 전에 랭크→디바이스
+            // 매핑을 먼저 수행 (armGpuThermo와 동일 매핑). 이게 없으면
+            // 테이블이 device 0에 올라간 채 다른 랭크의 디바이스에서
+            // 참조돼 cudaErrorIllegalAddress가 난다.
+            if (gpuSelectDevice() < 0)
+            {
+                WarningInFunction
+                    << "gpuManifold: no usable CUDA device -- "
+                    << "falling back to CPU" << endl;
+                gpuManifold_ = Switch(false);
+            }
+        }
+        if (gpuManifold_ && !gpuManifoldArmed_)
         {
             DynamicList<const List<scalar>*> tbls;
             tbls.append(&srcTbl);
@@ -1142,6 +1167,39 @@ void Foam::solvers::fgmFluid::updateManifold()
             << std::chrono::duration<double>
                (std::chrono::steady_clock::now() - tSec).count()
             << " s" << endl;
+    }
+}
+
+
+void Foam::solvers::fgmFluid::checkGpuConstraints
+(
+    const word& fieldName,
+    const char* gpuSwitch
+) const
+{
+    const Foam::fvConstraints& cs = fvConstraints();
+    forAll(cs, i)
+    {
+        if (!cs[i].constrainsField(fieldName)) continue;
+
+        const word& t = cs[i].type();
+        if
+        (
+            t == "bound" || t == "limitPressure"
+         || t == "limitTemperature" || t == "limitMag"
+        )
+        {
+            // 필드-레벨 전용 제약: 행렬을 건드리지 않고 솔브 후
+            // constrain(field)로 적용됨 — CPU 경로와 동일하게 동작
+            continue;
+        }
+
+        FatalErrorInFunction
+            << gpuSwitch << " (v1) does not support the matrix-level "
+            << "fvConstraint '" << cs[i].name() << "' (type " << t
+            << ") on " << fieldName << " -- the GPU-assembled matrix "
+            << "would silently solve a different equation"
+            << exit(FatalError);
     }
 }
 

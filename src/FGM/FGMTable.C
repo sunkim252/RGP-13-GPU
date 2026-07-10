@@ -582,9 +582,13 @@ void Foam::FGMTable::interpStencil
     bracket(C_axis_,   C,   iC, wC);
     bracket(chi_axis_, chi, iK, wK);
 
-    // Fold the chi-high neighbour to the same slice for a 3-D table (mirrors
-    // interpolateTable), so the chi-high corners are valid indices with the
-    // weight (1-wK)/wK distribution -- wK=0 here, so they contribute nothing.
+    // Degenerate-axis folding on ALL axes (same as makeStencil): a length-1
+    // axis brackets to i=0, w=0 and its +1 corner must fold onto the same
+    // slice -- the folded corner carries weight 0 but its index must stay
+    // in-bounds (consumers may inspect nodes[] before checking weights).
+    const label iZp = (Z_axis_.size()   >= 2) ? (iZ + 1) : iZ;
+    const label iGp = (gZ_axis_.size()  >= 2) ? (iG + 1) : iG;
+    const label iCp = (C_axis_.size()   >= 2) ? (iC + 1) : iC;
     const label iKp = (chi_axis_.size() >= 2) ? (iK + 1) : iK;
 
     label m = 0;
@@ -600,8 +604,13 @@ void Foam::FGMTable::interpStencil
                 for (label dK = 0; dK <= 1; dK++)
                 {
                     const scalar fK = dK ? wK : (scalar(1) - wK);
-                    nodes[m] =
-                        flatIndex(iZ + dZ, iG + dG, iC + dC, dK ? iKp : iK);
+                    nodes[m] = flatIndex
+                    (
+                        dZ ? iZp : iZ,
+                        dG ? iGp : iG,
+                        dC ? iCp : iC,
+                        dK ? iKp : iK
+                    );
                     weights[m] = fZ*fG*fC*fK;
                     m++;
                 }

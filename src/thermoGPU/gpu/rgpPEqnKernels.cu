@@ -1981,6 +1981,10 @@ int rgpUEqnGrad
             if (*a.d) continue;
             if ((e = cudaMalloc(a.d, a.bytes)) != cudaSuccess)
                 return pfail(e, "ueqn/malloc");
+            // Grad가 먼저 할당해도 (Prep2 없는) 독립 rgpUEqnSolve 호출이
+            // 쓰레기 src3/gradP를 읽지 않도록 여기서도 0-초기화
+            if ((e = cudaMemset(*a.d, 0, a.bytes)) != cudaSuccess)
+                return pfail(e, "ueqn/memset");
         }
     }
 
@@ -2178,6 +2182,9 @@ int rgpUEqnSolve
          gU.diag, gU.b3);
     if (srcExtra3)   // LAD-bulk 등 명시항 (저장 소스 — H()에 포함)
     {
+        // gST.grad 재사용: 위 uCellAssemble(gST.grad=U3old 읽음)와 이
+        // H2D가 모두 legacy NULL 스트림이라 스트림 순서가 보장된다 —
+        // 커널을 비-디폴트 스트림으로 옮기면 이 재사용부터 깨진다
         const double* dX =
             rgpInPtr(srcExtra3, gST.grad, (size_t)3*nc, &e);
         if (e != cudaSuccess) return pfail(e, "ueqn/srcExtra");

@@ -263,6 +263,10 @@ protected:
         mutable label gpuMeshCells_;
         mutable label gpuMeshFaces_;
 
+        //- topoChanged()/moving() 플래그 기반 재아밍의 스텝-단위 래치
+        //  (플래그가 스텝 내내 유지되므로 timeIndex당 1회만 재아밍)
+        mutable label gpuMeshStampTime_;
+
         //- pEqnGPU 메시 업로드 완료 플래그 + 작업 버퍼
         mutable bool gpuPEqnArmed_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
@@ -274,6 +278,10 @@ protected:
 
         //- 테이블 업로드 완료 플래그 + 보간 출력 호스트 버퍼
         mutable bool gpuManifoldArmed_;
+
+        //- he 재시드 경로: -1 미확정, 0 CPU 폴백(믹스처가 GPU thermo
+        //  테이블을 제공하지 않음 — gpuManifold만 켠 경우), 1 GPU
+        mutable int gpuHeMode_;
         mutable label gpuNFields_;
         mutable List<double> gpuFgmOut_;
 
@@ -360,6 +368,22 @@ private:
         //- 대용량 전송에 쓰이는 상주 호스트 버퍼/필드를 page-lock 등록
         //  (pageable 전송 병목 완화). 버퍼 크기 확정 후 1회.
         void pinGpuHostBuffers();
+
+        //- 랭크→CUDA 디바이스 매핑 후 rgpGpuInit (idempotent). 모든 GPU
+        //  아밍(thermo 테이블·fgm 테이블)은 디바이스 할당 전에 이걸 거쳐야
+        //  멀티-GPU 병렬에서 랭크별 디바이스에 올라간다.
+        //  반환: 선택된 디바이스(>=0) | -1 디바이스 없음 | -2 init 실패
+        int gpuSelectDevice() const;
+
+        //- GPU 경로가 재현하지 않는 행렬-레벨 fvConstraint가 해당 필드에
+        //  걸려 있으면 FatalError. 필드-레벨 전용 타입(bound/limitPressure/
+        //  limitTemperature/limitMag)은 CPU 경로와 동일하게 솔브 후
+        //  constrain(field)로 적용되므로 허용.
+        void checkGpuConstraints
+        (
+            const word& fieldName,
+            const char* gpuSwitch
+        ) const;
 
         //- pEqnGPU: 정적 메시(owner/neigh/기하계수/V/경계 faceCells)
         //  업로드 (1회, idempotent). gpuPEqn/gpuZC 양쪽에서 사용.

@@ -4,9 +4,9 @@
   thermoGPU(rgpPEqnKernels.cu)가 조립한 디바이스 CSR 값/벡터를 호스트
   왕복 없이 AmgX PCG+AMG로 솔브한다. 구조(rowPtr/colInd 호스트)는 첫
   호출에서 1회 바인딩, 이후 AMGX_matrix_replace_coefficients(디바이스
-  값 포인터)만. AMG 계층은 setupInterval 주기로만 resetup(동결 전략,
-  amgxSolver.C와 동일). 수렴 목표는 호출자가 OF 규약으로 환산한 절대
-  톨러런스(absTol)를 per-solve config_add_parameters로 주입.
+  값 포인터)만. AMG 계층은 setupInterval번의 압력 솔브마다만 resetup
+  (동결 전략, amgxSolver.C와 동일; newSolve 플래그가 솔브 경계 표시).
+  수렴 판정은 호출자가 4-iter 블록 사이에서 OF 규약 잔차로 수행.
 
   fgmFluid는 이 함수를 dlsym으로 찾는다(하드 링크 없음) — controlDict
   libs에 libRGP13amgx.so가 있어야 활성화된다.
@@ -75,7 +75,7 @@ int rgpPEqnAmgxSolve
     int nCells, int nnz,
     const int* rowPtrHost, const int* colIndHost,
     void* dValues, void* dB, void* dX,
-    double absTol, int setupInterval, int* nIters
+    int newSolve, int setupInterval, int* nIters
 )
 {
     if (!gS.globalInit)
@@ -87,6 +87,11 @@ int rgpPEqnAmgxSolve
     const bool rebuild = (gS.nCells != nCells || gS.nnz != nnz);
     if (rebuild)
     {
+        // 실패-후-재시도가 반쯤 파괴된 핸들로 non-rebuild 분기를 타지
+        // 않도록 캐시 키를 먼저 무효화 (성공 시 setup 후 재설정)
+        gS.nCells = -1;
+        gS.nnz = -1;
+
         if (gS.solver)
         {
             AMGX_solver_destroy(gS.solver);
@@ -96,6 +101,11 @@ int rgpPEqnAmgxSolve
             AMGX_resources_destroy(gS.rsrc);
             AMGX_config_destroy(gS.cfg);
             gS.solver = nullptr;
+            gS.A = nullptr;
+            gS.x = nullptr;
+            gS.b = nullptr;
+            gS.rsrc = nullptr;
+            gS.cfg = nullptr;
         }
 
         CHK(AMGX_config_create(&gS.cfg, kJson), "config_create");
@@ -116,10 +126,6 @@ int rgpPEqnAmgxSolve
                 gS.A, nCells, nnz, 1, 1,
                 rowPtrHost, colIndHost, dValues, nullptr
             ), "matrix_upload_all");
-
-        gS.nCells = nCells;
-        gS.nnz = nnz;
-        gS.solveCount = 0;
     }
     else
     {
@@ -129,18 +135,26 @@ int rgpPEqnAmgxSolve
             ), "replace_coefficients");
     }
 
-    (void)absTol;   // 수렴 판정은 호출자(OF 잔차)가 블록 단위로 수행
-
-    // AMG 계층 동결: 구조 (재)생성 시 full setup, setupInterval마다 resetup
+    // AMG 계층 동결: 구조 (재)생성 시 full setup, 이후 setupInterval번의
+    // '압력 솔브'마다 resetup. 한 압력 솔브가 4-iter 블록을 여러 번
+    // 호출하므로 카운트는 newSolve(솔브의 첫 블록)에서만 올린다 —
+    // 블록 단위로 세면 resetup이 의도의 ~수 배로 잦아지고 같은 계수의
+    // 솔브 중간에 낭비 resetup이 낀다.
     if (rebuild)
     {
         CHK(AMGX_solver_setup(gS.solver, gS.A), "solver_setup");
+        gS.nCells = nCells;
+        gS.nnz = nnz;
+        gS.solveCount = 1;
     }
-    else if (setupInterval > 0 && (gS.solveCount % setupInterval) == 0)
+    else if (newSolve)
     {
-        CHK(AMGX_solver_resetup(gS.solver, gS.A), "solver_resetup");
+        if (setupInterval > 0 && (gS.solveCount % setupInterval) == 0)
+        {
+            CHK(AMGX_solver_resetup(gS.solver, gS.A), "solver_resetup");
+        }
+        gS.solveCount++;
     }
-    gS.solveCount++;
 
     CHK(AMGX_vector_upload(gS.x, nCells, 1, dX), "vector_upload x");
     CHK(AMGX_vector_upload(gS.b, nCells, 1, dB), "vector_upload b");

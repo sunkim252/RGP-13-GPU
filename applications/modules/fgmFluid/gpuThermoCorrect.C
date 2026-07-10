@@ -21,8 +21,29 @@
 #include "gpu/rgpKernelTypes.H"
 #include "gpu/rgpFgmTypes.H"
 #include <cstring>
+#include <cstdlib>
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
+
+int Foam::solvers::fgmFluid::gpuSelectDevice() const
+{
+    const int nDev = rgpGpuDeviceCount();
+    if (nDev == 0)
+    {
+        return -1;
+    }
+
+    // 랭크→디바이스 매핑 (단일 GPU면 전 랭크가 device 0을 공유).
+    // cudaSetDevice는 idempotent — thermo/manifold 아밍 어느 쪽이 먼저
+    // 호출해도 같은 디바이스에 할당이 이뤄진다.
+    const int dev = Pstream::parRun() ? (Pstream::myProcNo() % nDev) : 0;
+    if (rgpGpuInit(dev))
+    {
+        return -2;
+    }
+    return dev;
+}
+
 
 void Foam::solvers::fgmFluid::armGpuThermo()
 {
@@ -50,8 +71,8 @@ void Foam::solvers::fgmFluid::armGpuThermo()
             << exit(FatalError);
     }
 
-    const int nDev = rgpGpuDeviceCount();
-    if (nDev == 0)
+    const int dev = gpuSelectDevice();
+    if (dev == -1)
     {
         FatalErrorInFunction
             << "'gpuThermo on;' but no CUDA device is visible "
@@ -59,16 +80,14 @@ void Foam::solvers::fgmFluid::armGpuThermo()
             << "LD_LIBRARY_PATH=/usr/lib/wsl/lib)."
             << exit(FatalError);
     }
-
-    // 랭크→디바이스 매핑 (단일 GPU면 전 랭크가 device 0을 공유)
-    const int dev = Pstream::parRun() ? (Pstream::myProcNo() % nDev) : 0;
-    int err = rgpGpuInit(dev);
-    if (err)
+    if (dev < 0)
     {
         FatalErrorInFunction
-            << "rgpGpuInit(" << dev << "): " << rgpGpuLastError()
+            << "rgpGpuInit: " << rgpGpuLastError()
             << exit(FatalError);
     }
+
+    int err = 0;
 
     rgpGpuTables t;
     t.nSpecies   = W.size();
@@ -96,7 +115,8 @@ void Foam::solvers::fgmFluid::armGpuThermo()
     const int um = rgpGpuUnifiedMode();
     Info<< "fgmFluid: thermoGPU ARMED -- " << W.size()
         << "-species SRK+Chung tables on CUDA device " << dev
-        << " (of " << nDev << "); thermo_.correct() replaced by the "
+        << " (of " << rgpGpuDeviceCount()
+        << "); thermo_.correct() replaced by the "
         << "batched GPU property refresh" << nl
         << "    memory mode: "
         << (um == 2 ? "unified-native (coherent, zero-copy)"
@@ -318,11 +338,69 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         }
         off += np;
     }
+
+    // gpuManifold 없이 gpuThermo만 켠 경우의 pin 훅 (updateManifold의
+    // 트리거가 닿지 않음). 켜진 스위치의 grow-only 버퍼가 전부 최종
+    // 크기에 도달한 뒤 1회.
+    if
+    (
+        !gpuPinned_ && !gpuManifold_
+     && (!gpuPEqn_ || gpuPEqnFlux_.size() > 0)
+     && (!gpuUEqn_ || gpuUBuf_.size() > 0)
+    )
+    {
+        pinGpuHostBuffers();
+    }
 }
 
 
 void Foam::solvers::fgmFluid::gpuHeReseed()
 {
+    // gpuManifold만 켠 경우: 믹스처가 GPU thermo 테이블을 제공하지 않으면
+    // (예: elyHanley) he 재시드만 CPU에 남기고 매니폴드 보간은 GPU 유지.
+    // gpuThermo가 켜져 있으면 armGpuThermo가 Fatal로 명시 처리한다.
+    if (gpuHeMode_ < 0)
+    {
+        if (gpuArmed_ || gpuThermo_)
+        {
+            gpuHeMode_ = 1;
+        }
+        else
+        {
+            const tabulatedRealGasMixture* hook =
+                dynamic_cast<const tabulatedRealGasMixture*>(&thermo_);
+
+            scalarList W, BM, CM, jH, jL;
+            List<scalarList> pair;
+            scalar TlowJ = 0, ThighJ = 0, Tcommon = 0;
+            bool stableRoot = false;
+
+            gpuHeMode_ =
+            (
+                hook
+             && hook->gpuThermoTables
+                (
+                    W, BM, CM, jH, jL, pair, TlowJ, ThighJ, Tcommon,
+                    stableRoot
+                )
+            ) ? 1 : 0;
+
+            if (!gpuHeMode_)
+            {
+                WarningInFunction
+                    << "gpuManifold: the active mixture does not provide "
+                    << "gpuThermoTables() -- the he re-seed stays on the "
+                    << "CPU (manifold interpolation remains on the GPU)"
+                    << endl;
+            }
+        }
+    }
+    if (!gpuHeMode_)
+    {
+        thermo_.he() = thermo_.he(thermo_.p(), thermo_.T());
+        return;
+    }
+
     if (!gpuArmed_)
     {
         armGpuThermo();
@@ -501,6 +579,15 @@ void Foam::solvers::fgmFluid::pinGpuHostBuffers()
 {
     if (gpuPinned_) return;
 
+    // 디버그/격리용: env RGP_NO_PIN=1 이면 page-lock 등록을 끈다
+    if (getenv("RGP_NO_PIN"))
+    {
+        Info<< "fgmFluid: RGP_NO_PIN set -- host buffer pinning disabled"
+            << nl << endl;
+        gpuPinned_ = true;
+        return;
+    }
+
     // 동적 메시(AMR/이동): 필드/버퍼 재할당 시 page-lock 등록이 해제
     // 없이 무효화(dangling registration)될 수 있어 pinning을 끈다 —
     // 전송은 pageable로 동작(정합 무관, 성능 ~2%)
@@ -509,6 +596,30 @@ void Foam::solvers::fgmFluid::pinGpuHostBuffers()
         Info<< "fgmFluid: dynamic mesh -- host buffer pinning disabled"
             << nl << endl;
         gpuPinned_ = true;   // 재시도 방지
+        return;
+    }
+
+    // 병렬: fvMeshDistributor(부하 재분배)는 mesh.dynamic()에 잡히지
+    // 않으면서 필드 스토리지를 재할당한다 — dangling registration을
+    // 원천 차단 (병렬 GPU는 thermo/manifold 폴백 경로뿐이라 손실 미미)
+    if (Pstream::parRun())
+    {
+        Info<< "fgmFluid: parallel run -- host buffer pinning disabled"
+            << nl << endl;
+        gpuPinned_ = true;
+        return;
+    }
+
+    // AmgX: 자체 pinned 풀과의 공존 시 누적 등록량이 한계(WSL2
+    // paravirt pinned 상한)를 넘으면 이후의 일반 H2D 복사가 invalid
+    // argument로 깨진다 — devChain(+gpuUBuf_ ~240MB)과 겹칠 때 실측
+    // (2026-07-11, Portable-only 등록으로도 재현). pin 이득은 ~2%라
+    // amgx 경로에서는 끈다.
+    if (gpuPEqn_ && gpuPEqnSolver_ == "amgx")
+    {
+        Info<< "fgmFluid: amgx pressure solver -- host buffer pinning "
+            << "disabled (pinned-pool interaction)" << nl << endl;
+        gpuPinned_ = true;
         return;
     }
 

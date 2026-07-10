@@ -158,20 +158,34 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         }
         if
         (
-            mesh.solution().relaxEquation(Z_.name())
-         || mesh.solution().relaxEquation(C_.name())
+            (
+                mesh.solution().relaxEquation(Z_.name())
+             && mesh.solution().equationRelaxationFactor(Z_.name()) != 1
+            )
+         || (
+                mesh.solution().relaxEquation(C_.name())
+             && mesh.solution().equationRelaxationFactor(C_.name()) != 1
+            )
         )
         {
             FatalErrorInFunction
                 << "gpuZC (v1) does not support equation relaxation "
                 << "on Z/C" << exit(FatalError);
         }
-        if (fvModels().size() > 0)
+        if
+        (
+            fvModels().addsSupToField(Z_.name())
+         || fvModels().addsSupToField(C_.name())
+        )
         {
             FatalErrorInFunction
-                << "gpuZC (v1) does not support fvModels sources"
+                << "gpuZC (v1) does not support fvModels sources on Z/C"
                 << exit(FatalError);
         }
+        // 행렬-레벨 fvConstraint 차단 (CPU 경로는 constrain(ZEqn/CEqn)을
+        // 적용 — GPU 조립은 미반영이므로 켜져 있으면 침묵 발산)
+        checkGpuConstraints(Z_.name(), "gpuZC");
+        checkGpuConstraints(C_.name(), "gpuZC");
         addWeightField(thermo.he());
         addWeightField(Z_);
         addWeightField(C_);
@@ -345,8 +359,15 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             off += np;
         }
 
-        // CPU 경로의 ZEqn.solve("Yi")는 Final 선택을 하지 않음 — 동일 규약
-        const dictionary& sd = mesh.solution().solverDict(word("Yi"));
+        // fvMatrix::solve(word) 규약과 1:1 — transient 최종 이터레이션이면
+        // "YiFinal" 딕셔너리 선택 (CPU 경로 ZEqn.solve("Yi")와 동일)
+        const dictionary& sd = mesh.solution().solverDict
+        (
+            !mesh.schemes().steady()
+         && solutionControl::finalIteration(mesh)
+          ? word("YiFinal")
+          : word("Yi")
+        );
         const scalar tol = sd.lookup<scalar>("tolerance");
         const scalar rtol = sd.lookupOrDefault<scalar>("relTol", 0);
         const label maxIter = sd.lookupOrDefault<label>("maxIter", 1000);
