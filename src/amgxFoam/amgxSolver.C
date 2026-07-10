@@ -104,8 +104,8 @@ Foam::amgxSolver::amgxSolver
             string
             (
                 "{\"config_version\":2,\"solver\":{"
-                "\"solver\":\"PCG\",\"max_iters\":200,"
-                "\"convergence\":\"ABSOLUTE\",\"norm\":\"L2\","
+                "\"solver\":\"PCG\",\"max_iters\":4,\"tolerance\":1e-30,"
+                "\"convergence\":\"ABSOLUTE\",\"norm\":\"L1\","
                 "\"monitor_residual\":1,"
                 "\"preconditioner\":{"
                 "\"solver\":\"AMG\",\"algorithm\":\"CLASSICAL\","
@@ -265,16 +265,6 @@ Foam::solverPerformance Foam::amgxSolver::solve
         ));
     }
 
-    // 수렴 목표: OF tolerance*normFactor (절대 L2)
-    {
-        const scalar absTol =
-            max(this->tolerance_*normFactor, small);
-        char buf[96];
-        snprintf(buf, sizeof(buf),
-                 "config_version=2, solver:tolerance=%.6e", absTol);
-        AMGX_CHK(AMGX_config_add_parameters(&F.cfg, buf));
-    }
-
     // AMG 계층 재사용: 구조 재생성/주기적 리프레시 때만 full setup,
     // 그 외에는 resetup(기존 계층에 새 계수만 반영) — setup 비용 제거.
     const label setupInterval =
@@ -294,17 +284,41 @@ Foam::solverPerformance Foam::amgxSolver::solve
     AMGX_CHK(AMGX_vector_upload(F.x, n, 1, psi.begin()));
     AMGX_CHK(AMGX_vector_upload(F.b, n, 1, const_cast<scalar*>(source.begin())));
 
-    AMGX_CHK(AMGX_solver_solve(F.solver, F.b, F.x));
-
-    AMGX_CHK(AMGX_vector_download(F.x, psi.begin()));
-
+    // ── 고정 4-iter 블록 + 외부(OF 규약) 수렴 판정 ──────────────────
+    // AMGX_config_add_parameters의 per-solve tolerance 주입은 라이브
+    // 솔버에 반영되지 않는다(rgpPEqnAmgx.C에서 확인된 잠복 이슈) —
+    // 내부 톨을 1e-30으로 잠그고 블록 사이에서 OF 정규화 잔차로
+    // 판정한다. x는 블록 간 연속이라 정확히 이어서 수렴한다.
     int iters = 0;
-    AMGX_solver_get_iterations_number(F.solver, &iters);
-    solverPerf.nIterations() = iters;
+    const label maxRounds = max(label(1), (this->maxIter_ + 3)/4);
+    for (label round = 0; round < maxRounds; round++)
+    {
+        AMGX_CHK(AMGX_solver_solve(F.solver, F.b, F.x));
 
-    // 최종 잔차 (OF 정규화로 보고)
-    matrix_.Amul(wA, psi, interfaceBouCoeffs_, interfaces_, cmpt);
-    solverPerf.finalResidual() = gSumMag(source - wA)/normFactor;
+        int it = 0;
+        AMGX_solver_get_iterations_number(F.solver, &it);
+        iters += it;
+
+        AMGX_CHK(AMGX_vector_download(F.x, psi.begin()));
+        matrix_.Amul(wA, psi, interfaceBouCoeffs_, interfaces_, cmpt);
+        const scalar resF = gSumMag(source - wA)/normFactor;
+        solverPerf.finalResidual() = resF;
+
+        // NaN은 모든 비교에서 false → 수렴 위장 방지, 명시 탈출
+        if (resF != resF)
+        {
+            WarningInFunction
+                << "amgx: diverged (NaN residual) for " << fieldName_
+                << " -- frozen AMG hierarchy may be stale; reduce "
+                << "setupInterval" << endl;
+            break;
+        }
+        if (solverPerf.checkConvergence(this->tolerance_, this->relTol_))
+        {
+            break;
+        }
+    }
+    solverPerf.nIterations() = iters;
 
     return solverPerf;
 }

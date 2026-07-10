@@ -31,7 +31,8 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
     export FOAM_INST_DIR=/opt/OpenFOAM
     export CUDA_HOME=/usr/local/cuda
     export PATH=${CUDA_HOME}/bin:${PATH}
-    export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linux64Gcc/amgx-2.4.0
+    export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${AMGX_DIR}/lib:${LD_LIBRARY_PATH}
     export LIB_RGP13_SRC=/opt/OpenFOAM/RGP-13-realFluid/src
     . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc || true
 
@@ -133,6 +134,9 @@ CUDA_RULES
     ( cd applications/utilities/fgmTabulateRealGasCoeffs && wmake ) 2>&1 | tail -3
     ( cd applications/utilities/fgmTabulateLewis && wmake ) 2>&1 | tail -3
 
+    # GPU finite-rate 화학 (chemistryType { solver gpu; })
+    ( cd src/gpuChemistry && wmake libso ) 2>&1 | tail -3
+
     # ─── thermoGPU 검증 유틸 ───
     ( cd applications/utilities/Test-rgpThermoGPU && wmake ) 2>&1 | tail -3
 
@@ -158,22 +162,31 @@ CUDA_RULES
         sed -i '/^    specie$/a\    rfSpecie' "$TEMPLATE"
 
 
-    # ─── (옵션) PETSc + AmgX 선형솔버 오프로드 스택 ──────────────────────
-    # 선형솔버 오프로드 착수 시 아래 주석 해제 + petsc4Foam Foundation-13
-    # 포팅 필요. AmgX는 CUDA 12.4 호환 태그 사용.
-    #
+    # ─── AmgX 스택 (libRGP13amgx — fvSolution 'solver amgx' +
+    #     fgmProperties 'gpuPEqnSolver amgx') ────────────────────────────
+    # 로컬 ThirdParty에 빌드된 amgx-2.4.0이 %files로 함께 복사된다.
+    # 없으면(새 호스트) 소스에서 sm_89+sm_90으로 빌드.
+    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linux64Gcc/amgx-2.4.0
+    if [ ! -f $AMGX_DIR/lib/libamgxsh.so ]; then
+        cd /opt/OpenFOAM/ThirdParty-13
+        git clone --recursive --depth 1 -b v2.4.0 \
+            https://github.com/NVIDIA/AMGX.git amgx-src
+        mkdir -p amgx-src/build && cd amgx-src/build
+        cmake .. -DCUDA_ARCH="89;90" -DCMAKE_INSTALL_PREFIX=$AMGX_DIR
+        make -j$(nproc) && make install
+        cd /opt/OpenFOAM/ThirdParty-13 && rm -rf amgx-src
+    fi
+    ( cd /opt/OpenFOAM/RGP-13-realFluid/src/amgxFoam && wmake libso ) \
+        2>&1 | tail -3
+    ls -lh $FOAM_LIBBIN/libRGP13amgx.so
+
+    # ─── (옵션) PETSc — petsc4Foam Foundation-13 포팅 필요, 미착수 ───────
     # cd /opt/OpenFOAM/ThirdParty-13
     # git clone --depth 1 -b v3.21.4 https://gitlab.com/petsc/petsc.git petsc-3.21.4
     # cd petsc-3.21.4
     # ./configure --with-cuda --with-cudac=nvcc --with-precision=double \
     #     --with-mpi-dir=/usr/lib/x86_64-linux-gnu/openmpi \
     #     --prefix=/opt/OpenFOAM/ThirdParty-13/platforms/linux64Gcc/petsc-3.21.4
-    # make -j$(nproc) && make install
-    #
-    # cd /opt/OpenFOAM/ThirdParty-13
-    # git clone --recursive --depth 1 -b v2.4.0 https://github.com/NVIDIA/AMGX.git amgx-2.4.0
-    # mkdir -p amgx-2.4.0/build && cd amgx-2.4.0/build
-    # cmake .. -DCUDA_ARCH=89 -DCMAKE_INSTALL_PREFIX=/opt/OpenFOAM/ThirdParty-13/platforms/linux64Gcc/amgx-2.4.0
     # make -j$(nproc) && make install
     # ─────────────────────────────────────────────────────────────────────
 
