@@ -31,6 +31,7 @@ License
 #include "fvcGrad.H"
 #include "zeroGradientFvPatchFields.H"
 #include "solutionControl.H"
+#include "localEulerDdtScheme.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -114,13 +115,6 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         // ZCGPU: multivariate limitedLinear 가중치를 mvConvection 생성
         // 시점(= manifold 갱신 전 필드 값)에 GPU에서 준비. limiter =
         // fields 테이블(he, Z, C[, h, W]) 각 필드 limiter의 min.
-        if (LTS)
-        {
-            FatalErrorInFunction
-                << "gpuZC (v1) does not support LTS"
-                << exit(FatalError);
-        }
-
         armGpuSTMesh();
 
         if (rgpSTWeightsBegin(phi.primitiveField().begin()))
@@ -353,7 +347,11 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         int nIter = 0;
         const int rc = rgpSTEqnSolve
         (
-            1.0/runTime.deltaTValue(),
+            LTS ? 1.0 : 1.0/runTime.deltaTValue(),
+            LTS
+          ? fv::localEulerDdt::localRDeltaT(mesh)
+               .primitiveField().begin()
+          : nullptr,
             srcPtr ? 1 : 0,
             rho.primitiveField().begin(),
             rho.oldTime().primitiveField().begin(),

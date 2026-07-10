@@ -31,6 +31,7 @@ License
 #include "zeroGradientFvPatchFields.H"
 #include "limitedSurfaceInterpolationScheme.H"
 #include "solutionControl.H"
+#include "localEulerDdtScheme.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -108,10 +109,10 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         // --- UEqnGPU: 물리 필드(가중치·muEff·dev2 명시항·grad p)는 OF
         // 스킴으로 호스트가 정확 계산 → GPU가 LDU 조립+성분별 BiCGStab.
         // 행렬은 스텝 내내 디바이스 상주(pCorr가 rAU/HbyA를 GPU 산출).
-        if (LTS || LADUCoeff > 0 || LADbulkCoeff > 0 || MRF.size() > 0)
+        if (LADUCoeff > 0 || LADbulkCoeff > 0 || MRF.size() > 0)
         {
             FatalErrorInFunction
-                << "gpuUEqn (v1) does not support LTS/LAD/MRF"
+                << "gpuUEqn (v1) does not support LAD/MRF"
                 << exit(FatalError);
         }
 
@@ -301,7 +302,11 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         int iters[3];
         const int rc = rgpUEqnSolve
         (
-            1.0/runTime.deltaTValue(),
+            LTS ? 1.0 : 1.0/runTime.deltaTValue(),
+            LTS
+          ? fv::localEulerDdt::localRDeltaT(mesh)
+               .primitiveField().begin()
+          : nullptr,
             rho.primitiveField().begin(),
             rho.oldTime().primitiveField().begin(),
             U3old, nullptr /*U3: 디바이스 상주*/,

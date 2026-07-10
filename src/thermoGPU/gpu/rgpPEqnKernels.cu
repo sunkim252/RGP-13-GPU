@@ -12,6 +12,7 @@
 \*---------------------------------------------------------------------------*/
 
 #include "rgpPEqnTypes.H"
+#include "rgpStage.H"
 
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -98,6 +99,7 @@ namespace
                *bDiag = nullptr, *bSrc = nullptr;
         double *flux = nullptr;
         double *red = nullptr;   // 리덕션 스칼라 [4]
+        double *rdt = nullptr;   // LTS rDeltaT [nc] (없으면 균일 dtInv)
     } gB;
 
     void pFreeAll()
@@ -119,7 +121,7 @@ namespace
             &gM.gg, &gM.V,
             &gB.diag, &gB.upper, &gB.b, &gB.x, &gB.rA, &gB.pA, &gB.wA,
             &gB.rowSum, &gB.rAUf, &gB.psis, &gB.pOld, &gB.phiInt,
-            &gB.phiB, &gB.bDiag, &gB.bSrc, &gB.flux, &gB.red,
+            &gB.phiB, &gB.bDiag, &gB.bSrc, &gB.flux, &gB.red, &gB.rdt,
             &gSTM.wLin, &gSTM.sf, &gSTM.dvec, &gSTM.bSf,
             &gST.rho, &gST.rhoOld, &gST.psiOld, &gST.gamma, &gST.sp,
             &gST.src, &gST.phi, &gST.wLim, &gST.lower, &gST.grad,
@@ -143,7 +145,7 @@ constexpr int BS = 128;
 
 __global__ void cellAssemble
 (
-    const int n, const double dtInv,
+    const int n, const double dtInv, const double* __restrict__ rdt,
     const double* __restrict__ psis, const double* __restrict__ V,
     const double* __restrict__ pOld,
     double* __restrict__ diag, double* __restrict__ b
@@ -151,7 +153,7 @@ __global__ void cellAssemble
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const double a = psis[i]*V[i]*dtInv;
+    const double a = psis[i]*V[i]*(rdt ? rdt[i] : dtInv);
     diag[i] = a;
     b[i] = a*pOld[i];
 }
@@ -480,7 +482,8 @@ __global__ void stWeightsEnd
 //- 셀 항: fvm::ddt(rho,ψ) − fvm::Sp(sp,ψ) (+ src)
 __global__ void stCellAssemble
 (
-    const int n, const double dtInv, const int hasSrc,
+    const int n, const double dtInv, const double* __restrict__ rdt,
+    const int hasSrc,
     const double* __restrict__ rho, const double* __restrict__ rhoOld,
     const double* __restrict__ psiOld, const double* __restrict__ sp,
     const double* __restrict__ src, const double* __restrict__ V,
@@ -489,8 +492,9 @@ __global__ void stCellAssemble
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
-    diag[i] = rho[i]*V[i]*dtInv - sp[i]*V[i];
-    b[i] = rhoOld[i]*V[i]*dtInv*psiOld[i] + (hasSrc ? src[i]*V[i] : 0.0);
+    const double r = rdt ? rdt[i] : dtInv;
+    diag[i] = rho[i]*V[i]*r - sp[i]*V[i];
+    b[i] = rhoOld[i]*V[i]*r*psiOld[i] + (hasSrc ? src[i]*V[i] : 0.0);
 }
 
 //- 면 항: fvm::div(phi,ψ)[limited w] − fvm::laplacian(γ,ψ) + negSumDiag
@@ -602,7 +606,7 @@ __global__ void stX2
 //- fvm::ddt(rho,U): 공유 diag + 성분별 b (명시 소스 srcExp3는 per-volume)
 __global__ void uCellAssemble
 (
-    const int nc, const double dtInv,
+    const int nc, const double dtInv, const double* __restrict__ rdt,
     const double* __restrict__ rho, const double* __restrict__ rhoOld,
     const double* __restrict__ V,
     const double* __restrict__ U3old, const double* __restrict__ srcExp3,
@@ -611,8 +615,9 @@ __global__ void uCellAssemble
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= nc) return;
-    diag[i] = rho[i]*V[i]*dtInv;
-    const double ao = rhoOld[i]*V[i]*dtInv;
+    const double r = rdt ? rdt[i] : dtInv;
+    diag[i] = rho[i]*V[i]*r;
+    const double ao = rhoOld[i]*V[i]*r;
     for (int k = 0; k < 3; k++)
     {
         b3[(size_t)k*nc + i] =
@@ -909,7 +914,8 @@ __global__ void pcPrepFace
     const double* __restrict__ HbyA3,
     const double* __restrict__ rhoOld, const double* __restrict__ Uold3,
     const double* __restrict__ phiOld,
-    const double rDeltaT, const double rcDdtScale,
+    const double rDeltaT, const double* __restrict__ rdt,
+    const double rcDdtScale,
     double* __restrict__ rhof, double* __restrict__ rAUf,
     double* __restrict__ phiH
 )
@@ -939,7 +945,11 @@ __global__ void pcPrepFace
     const double coeff =
         1.0 - fmin(fabs(phiCorr)/(fabs(phiOld[f]) + 1e-15), 1.0);
 
-    phiH[f] = fluxH + rcDdtScale*rrAUf*coeff*rDeltaT*phiCorr/rf;
+    // localEuler: rDeltaT_f = 선형보간 (fvc::interpolate(localRDeltaT))
+    const double rdtf =
+        rdt ? (w*rdt[o] + (1.0 - w)*rdt[n]) : rDeltaT;
+
+    phiH[f] = fluxH + rcDdtScale*rrAUf*coeff*rdtf*phiCorr/rf;
 }
 
 //- psis = psi/rho
@@ -1038,10 +1048,18 @@ namespace
         return 0;
     }
 
+    //- LTS rDeltaT 스테이징: null이면 null 유지(균일 dtInv)
+    const double* stageRdt(const double* rdtH, cudaError_t* e)
+    {
+        *e = cudaSuccess;
+        if (!rdtH) return nullptr;
+        return rgpInPtr(rdtH, gB.rdt, (size_t)gM.nCells, e);
+    }
+
     //- 조립 공통부 (업로드 + diag/upper/b 완성). 0=성공.
     int assemble
     (
-        double dtInv,
+        double dtInv, const double* rdtH,
         const double* rAUfInt, const double* psis, const double* pOld,
         const double* phiInt, const double* phiB,
         const double* bDiag, const double* bSrc,
@@ -1077,8 +1095,11 @@ namespace
                 return pfail(e, "peqn/H2D");
         }
 
+        cudaError_t er;
+        const double* dRdt = stageRdt(rdtH, &er);
+        if (er != cudaSuccess) return pfail(er, "peqn/rdt");
         rgppeqn::cellAssemble<<<nb(nc), BS>>>
-            (nc, dtInv, dPsis, gM.V, gB.pOld, gB.diag, gB.b);
+            (nc, dtInv, dRdt, dPsis, gM.V, gB.pOld, gB.diag, gB.b);
         rgppeqn::faceAssemble<<<nb(nf), BS>>>
             (nf, gM.own, gM.nei, gM.gg, dRAUf, dPhi,
              gB.diag, gB.upper, gB.b);
@@ -1307,7 +1328,7 @@ int rgpPEqnMeshUpload
     {
         {&gB.diag, bc}, {&gB.b, bc}, {&gB.x, bc}, {&gB.rA, bc},
         {&gB.pA, bc}, {&gB.wA, bc}, {&gB.rowSum, bc}, {&gB.psis, bc},
-        {&gB.pOld, bc},
+        {&gB.pOld, bc}, {&gB.rdt, bc},
         {&gB.upper, bf}, {&gB.rAUf, bf}, {&gB.phiInt, bf}, {&gB.flux, bf},
         {&gB.phiB, bb}, {&gB.bDiag, bb}, {&gB.bSrc, bb},
         {&gB.red, 4*sizeof(double)}
@@ -1323,7 +1344,7 @@ int rgpPEqnMeshUpload
 
 int rgpPEqnSolve
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -1336,7 +1357,7 @@ int rgpPEqnSolve
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
 
-    int rc = assemble(dtInv, rAUfInt, psis, pOld, phiInt, phiB,
+    int rc = assemble(dtInv, rdtCell, rAUfInt, psis, pOld, phiInt, phiB,
                       bDiag, bSrc, needRef, refCell, refValue);
     if (rc) return rc;
 
@@ -1450,7 +1471,7 @@ int rgpPEqnSolve
 
 int rgpPEqnAssembleDump
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rAUfInt,
     const double* psis, const double* pOld,
     const double* phiInt, const double* phiB,
@@ -1460,7 +1481,7 @@ int rgpPEqnAssembleDump
 )
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
-    int rc = assemble(dtInv, rAUfInt, psis, pOld, phiInt, phiB,
+    int rc = assemble(dtInv, rdtCell, rAUfInt, psis, pOld, phiInt, phiB,
                       bDiag, bSrc, needRef, refCell, refValue);
     if (rc) return rc;
 
@@ -1581,7 +1602,7 @@ void* rgpPEqnDevX(void) { return gB.x; }
 
 int rgpPEqnAssembleCsr
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -1597,7 +1618,7 @@ int rgpPEqnAssembleCsr
         return -1;
     }
 
-    int rc = assemble(dtInv, rAUfInt, psis, pOld, phiInt, phiB,
+    int rc = assemble(dtInv, rdtCell, rAUfInt, psis, pOld, phiInt, phiB,
                       bDiag, bSrc, needRef, refCell, refValue);
     if (rc) return rc;
 
@@ -1808,7 +1829,7 @@ int rgpSTWeightsEnd(void)
 
 int rgpSTEqnSolve
 (
-    double dtInv, int hasSrc,
+    double dtInv, const double* rdtCell, int hasSrc,
     const double* rho, const double* rhoOld, const double* psiOld,
     const double* p0,
     const double* phiInt, const double* gammaCell, const double* spCell,
@@ -1848,9 +1869,11 @@ int rgpSTEqnSolve
     // (가중치 gST.wLim은 rgpSTWeightsBegin/Field/End가 사전 준비)
 
     // ── 조립 ─────────────────────────────────────────────────────────
+    const double* dRdt = stageRdt(rdtCell, &e);
+    if (e != cudaSuccess) return pfail(e, "steqn/rdt");
     rgppeqn::stCellAssemble<<<nb(nc), BS>>>
-        (nc, dtInv, hasSrc, gST.rho, gST.rhoOld, gST.psiOld, gST.sp,
-         gST.src, gM.V, gB.diag, gB.b);
+        (nc, dtInv, dRdt, hasSrc, gST.rho, gST.rhoOld, gST.psiOld,
+         gST.sp, gST.src, gM.V, gB.diag, gB.b);
     rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
          gM.gg, gB.diag, gB.upper, gST.lower);
@@ -2044,7 +2067,7 @@ int rgpUEqnPrep2
 
 int rgpUEqnSolve
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rho, const double* rhoOld,
     const double* U3old, const double* U3,
     const double* phiInt, const double* w, const double* mu,
@@ -2122,8 +2145,10 @@ int rgpUEqnSolve
     }
 
     // ── 조립 ─────────────────────────────────────────────────────────
+    const double* dRdt = stageRdt(rdtCell, &e);
+    if (e != cudaSuccess) return pfail(e, "ueqn/rdt");
     rgppeqn::uCellAssemble<<<nb(nc), BS>>>
-        (nc, dtInv, gST.rho, gST.rhoOld, gM.V, gST.grad, gU.b3,
+        (nc, dtInv, dRdt, gST.rho, gST.rhoOld, gM.V, gST.grad, gU.b3,
          gU.diag, gU.b3);
     rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
@@ -2265,7 +2290,7 @@ int rgpPCorrPrep
 (
     const double* rho, const double* rhoOld,
     const double* Uold3, const double* phiOld, const double* psi,
-    double rDeltaT, double rcDdtScale
+    double rDeltaT, const double* rdtCell, double rcDdtScale
 )
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
@@ -2306,10 +2331,12 @@ int rgpPCorrPrep
             return pfail(e, "pcorr/H2D");
     }
 
+    const double* dRdt = stageRdt(rdtCell, &e);
+    if (e != cudaSuccess) return pfail(e, "pcorr/rdt");
     rgppeqn::pcPrepFace<<<nb(nf), BS>>>
         (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf,
          gST.rho, gU.rAU, gU.HbyA3, gPC.rhoOld, gPC.Uold3, gPC.phiOld,
-         rDeltaT, rcDdtScale, gPC.rhof, gPC.rAUf, gPC.phiH);
+         rDeltaT, dRdt, rcDdtScale, gPC.rhof, gPC.rAUf, gPC.phiH);
     rgppeqn::pcPsis<<<nb(nc), BS>>>(nc, gST.gamma, gST.rho, gPC.psis);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "pcorr/launch");

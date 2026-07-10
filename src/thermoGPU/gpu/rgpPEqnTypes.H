@@ -39,7 +39,7 @@ int rgpPEqnMeshUpload
     경계 플럭스는 호스트에서 iC*p[fc] - bC 로 계산할 것.               */
 int rgpPEqnSolve
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -54,7 +54,7 @@ int rgpPEqnSolve
     CPU fvMatrix 계수와의 비트-수준 대조에 사용.                       */
 int rgpPEqnAssembleDump
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rAUfInt,
     const double* psis, const double* pOld,
     const double* phiInt, const double* phiB,
@@ -75,7 +75,7 @@ void* rgpPEqnDevX(void);             /* [nCells] 디바이스 (x0=p, 솔브 후 
 
 int rgpPEqnAssembleCsr
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rAUfInt,
     const double* psis, const double* pOld, const double* p0,
     const double* phiInt, const double* phiB,
@@ -132,7 +132,7 @@ int rgpUEqnPrep2
 
 int rgpUEqnSolve
 (
-    double dtInv,
+    double dtInv, const double* rdtCell,
     const double* rho, const double* rhoOld,
     const double* U3old, const double* U3,
     const double* phiInt, const double* w, const double* mu,
@@ -155,7 +155,7 @@ int rgpPCorrPrep
 (
     const double* rho, const double* rhoOld,
     const double* Uold3, const double* phiOld, const double* psi,
-    double rDeltaT, double rcDdtScale
+    double rDeltaT, const double* rdtCell, double rcDdtScale
 );
 int rgpPEqnFinish2(double* pOut, double* phiOut);
 int rgpPCorrU(const double* pNew, const double* pB, double* U3out);
@@ -169,7 +169,7 @@ int rgpSTEqnDump
 
 int rgpSTEqnSolve
 (
-    double dtInv, int hasSrc,
+    double dtInv, const double* rdtCell, int hasSrc,
     const double* rho, const double* rhoOld, const double* psiOld,
     const double* p0,
     const double* phiInt, const double* gammaCell, const double* spCell,

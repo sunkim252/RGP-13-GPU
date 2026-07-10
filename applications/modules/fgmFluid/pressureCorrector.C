@@ -53,6 +53,7 @@ Description
 #include "zeroGradientFvPatchFields.H"
 #include "extrapolatedCalculatedFvPatchFields.H"
 #include "solutionControl.H"
+#include "localEulerDdtScheme.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -466,7 +467,12 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 U3old,
                 phi.oldTime().primitiveField().begin(),
                 psi.primitiveField().begin(),
-                1.0/runTime.deltaTValue(), rcDdtScale
+                LTS ? 1.0 : 1.0/runTime.deltaTValue(),
+                LTS
+              ? fv::localEulerDdt::localRDeltaT(mesh)
+                   .primitiveField().begin()
+              : nullptr,
+                rcDdtScale
             ))
         {
             FatalErrorInFunction
@@ -536,10 +542,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         // --- pEqnGPU: fvMatrix 우회 — 디바이스 조립 + Jacobi-PCG + 플럭스.
         // 'Gauss linear orthogonal' laplacian + Euler ddt + 비커플드 패치
         // 전용(v1). 경계 기여만 호스트가 fvPatchField API로 정확 계산.
-        if (LTS || LADrhoCoeff > 0)
+        if (LADrhoCoeff > 0)
         {
             FatalErrorInFunction
-                << "gpuPEqn (v1) does not support LTS or LADrhoCoeff > 0"
+                << "gpuPEqn (v1) does not support LADrhoCoeff > 0"
                 << exit(FatalError);
         }
 
@@ -612,7 +618,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         const bool needRef = p.needReference();
         const label refCell = needRef ? pressureReference.refCell() : 0;
         const scalar refValue = needRef ? pressureReference.refValue() : 0;
-        const scalar dtInv = 1.0/runTime.deltaTValue();
+        const scalar dtInv = LTS ? 1.0 : 1.0/runTime.deltaTValue();
+        const double* rdtCell =
+            LTS
+          ? fv::localEulerDdt::localRDeltaT(mesh).primitiveField().begin()
+          : nullptr;
 
         // ── 검증 모드: CPU fvMatrix 계수와 대조 (devChain 미지원) ────
         if (gpuPEqnCheck_ && devChain)
@@ -655,7 +665,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             List<double> dG(nc), uG(nif), bG(nc);
             const int rc = rgpPEqnAssembleDump
             (
-                dtInv, trAUf().primitiveField().begin(),
+                dtInv, rdtCell, trAUf().primitiveField().begin(),
                 tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
                 tphiHbyAv().primitiveField().begin(),
@@ -739,7 +749,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             double normFactor = 0;
             int rc = rgpPEqnAssembleCsr
             (
-                dtInv,
+                dtInv, rdtCell,
                 devChain ? nullptr : trAUf().primitiveField().begin(),
                 devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
@@ -811,7 +821,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         {
             const int rc = rgpPEqnSolve
             (
-                dtInv,
+                dtInv, rdtCell,
                 devChain ? nullptr : trAUf().primitiveField().begin(),
                 devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
