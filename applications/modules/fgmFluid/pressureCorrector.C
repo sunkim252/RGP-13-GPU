@@ -209,7 +209,15 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // pressure solution
     const volScalarField psip0(psi*p);
 
-    const surfaceScalarField rhof(fvc::interpolate(rho));
+    // pCorrGPU 디바이스 체인: gpuUEqn(rAU/HbyA 디바이스) + gpuPEqn일 때
+    // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체
+    const bool devChain = gpuUEqn_ && gpuPEqn_;
+
+    tmp<surfaceScalarField> trhof;
+    if (!devChain)
+    {
+        trhof = surfaceScalarField::New("rhof", fvc::interpolate(rho));
+    }
 
     // UEqnGPU: 행렬이 디바이스 상주이므로 rAU=1/A(), H(U)를 GPU에서 산출
     // (fvMatrix::D/H 1:1). 그 외에는 기존 CPU 경로.
@@ -295,7 +303,14 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     }
 
     const volScalarField& rAU = trAU();
-    const surfaceScalarField rhorAUf("rhorAUf", fvc::interpolate(rho*rAU));
+    tmp<surfaceScalarField> trhorAUf;
+    if (!devChain)
+    {
+        trhorAUf = surfaceScalarField::New
+        (
+            "rhorAUf", fvc::interpolate(rho*rAU)
+        );
+    }
 
     tmp<volScalarField> rAtU
     (
@@ -312,8 +327,6 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     );
 
     const volScalarField& rAAtU = pimple.consistent() ? rAtU() : rAU;
-    const surfaceScalarField& rhorAAtUf =
-        pimple.consistent() ? rhorAtUf() : rhorAUf;
 
     volVectorField HbyA(tHbyA);
 
@@ -344,7 +357,14 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // harmonic (series-resistance-correct) mean is the density-jump-robust
     // choice for a face mobility (Ferziger & Peric; Rhie & Chow, AIAA J. 21
     // (1983) 1525). 1/rAU = A() > 0 (momentum diagonal) so no floor needed.
-    const surfaceScalarField rAUf("rAUf", 1.0/fvc::interpolate(1.0/rAU));
+    tmp<surfaceScalarField> trAUf;
+    if (!devChain)
+    {
+        trAUf = surfaceScalarField::New
+        (
+            "rAUf", 1.0/fvc::interpolate(1.0/rAU)
+        );
+    }
     // ATTEMPT 2: real SRK isothermal compressibility psis = (drho/dp)_T/rho =
     // kappa_T (thermo.psi() now returns the real (drho/dp)_T -- see SRKGasI.H).
     // This supplies the true dense-fluid stiffness that the ideal-gas 1/(gamma
@@ -371,18 +391,26 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     (
         pimple.dict().lookupOrDefault<Switch>("psisIsentropic", false)
     );
-    volScalarField psis
-    (
-        "psis",
-        psisIsentropic
-      ? volScalarField(thermo.psi()/(rho*thermo.gamma()))
-      : volScalarField(thermo.psi()/rho)
-    );
-    if (psisCapRatio < GREAT)
+    tmp<volScalarField> tpsis;
+    if (!devChain)
     {
-        const volScalarField psisSm(fvc::average(fvc::interpolate(psis)));
-        psis = max(psis, psisSm/psisCapRatio);
-        psis.correctBoundaryConditions();
+        tpsis = volScalarField::New
+        (
+            "psis",
+            psisIsentropic
+          ? volScalarField(thermo.psi()/(rho*thermo.gamma()))
+          : volScalarField(thermo.psi()/rho)
+        );
+        if (psisCapRatio < GREAT)
+        {
+            volScalarField& psis = tpsis.ref();
+            const volScalarField psisSm
+            (
+                fvc::average(fvc::interpolate(psis))
+            );
+            psis = max(psis, psisSm/psisCapRatio);
+            psis.correctBoundaryConditions();
+        }
     }
 
     // Volumetric predicted face flux with the RHO-CONSISTENT transient
@@ -402,19 +430,54 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     (
         pimple.dict().lookupOrDefault<scalar>("rcDdtScale", scalar(1))
     );
-    surfaceScalarField phiHbyAv
-    (
-        "phiHbyAv",
-        fvc::flux(HbyA)
-      + rcDdtScale*rhorAUf*fvc::ddtCorr(rho, U, phi, rhoUf)/rhof  // rho-consistent RC
-    );
-    MRF.makeRelative(phiHbyAv);
+    tmp<surfaceScalarField> tphiHbyAv;
+    if (!devChain)
+    {
+        tphiHbyAv = surfaceScalarField::New
+        (
+            "phiHbyAv",
+            fvc::flux(HbyA)
+          + rcDdtScale*trhorAUf()*fvc::ddtCorr(rho, U, phi, rhoUf)
+           /trhof()  // rho-consistent RC
+        );
+        MRF.makeRelative(tphiHbyAv.ref());
 
-    // Update the pressure BCs for flux consistency (3D: waveTransmissive
-    // outlet, fixedFluxPressure walls). Volumetric-flux form: pass the
-    // volumetric predicted flux and the rAUf (velocity-level) coefficient,
-    // matching the pEqn's laplacian(rAUf, p).
-    constrainPressure(p, rho, U, phiHbyAv, rAUf, MRF);
+        // Update the pressure BCs for flux consistency (3D:
+        // waveTransmissive outlet, fixedFluxPressure walls).
+        constrainPressure(p, rho, U, tphiHbyAv(), trAUf(), MRF);
+    }
+    else
+    {
+        // pCorrGPU: rhof/rAUf(조화)/phiHbyAv(flux(HbyA)+Euler ddtCorr)/
+        // psis를 디바이스 상주 생성 (경계 ddtCorr=0은 OF 규약 그대로 —
+        // phiHbyAv 경계는 HbyA_b&Sf_b, 아래 pEqn 경계 배열에서 처리).
+        // v1: psisCapRatio/psisIsentropic/constrainPressure류 p BC 미지원
+        if (psisCapRatio < GREAT || psisIsentropic)
+        {
+            FatalErrorInFunction
+                << "pCorrGPU (v1) does not support psisCapRatio/"
+                << "psisIsentropic"
+                << exit(FatalError);
+        }
+
+        const label nc = mesh.nCells();
+        // U.oldTime SoA는 momentumPredictor의 gather 재사용
+        const double* U3old = gpuUBuf_.begin() + 3*nc;
+        if (rgpPCorrPrep
+            (
+                rho.primitiveField().begin(),
+                rho.oldTime().primitiveField().begin(),
+                U3old,
+                phi.oldTime().primitiveField().begin(),
+                psi.primitiveField().begin(),
+                1.0/runTime.deltaTValue(), rcDdtScale
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpPCorrPrep: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+    }
 
     // --- RANK 4: Artificial Mass Diffusivity (AMD) on DENSITY -----------------
     // Kawai, Terashima & Negishi, J. Comput. Phys. 300 (2015) 116: at a large
@@ -516,15 +579,29 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 const label np = pp.size();
                 if (np == 0) continue;
 
+                // devChain: rAUf_b = rAU_b (조화평균 경계 = 패치값),
+                // phiHbyAv_b = HbyA_b & Sf_b (경계 ddtCorr = 0)
                 const scalarField pGamma
                 (
-                    rAUf.boundaryField()[patchi]
+                    (
+                        devChain
+                      ? scalarField(rAU.boundaryField()[patchi])
+                      : scalarField(trAUf().boundaryField()[patchi])
+                    )
                    *mesh.magSf().boundaryField()[patchi]
                 );
                 const scalarField gic(pp.gradientInternalCoeffs());
                 const scalarField gbc(pp.gradientBoundaryCoeffs());
-                const scalarField& phb =
-                    phiHbyAv.boundaryField()[patchi];
+                const scalarField phb
+                (
+                    devChain
+                  ? scalarField
+                    (
+                        HbyA.boundaryField()[patchi]
+                      & mesh.Sf().boundaryField()[patchi]
+                    )
+                  : scalarField(tphiHbyAv().boundaryField()[patchi])
+                );
 
                 for (label k = 0; k < np; k++)
                 {
@@ -541,15 +618,25 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         const scalar refValue = needRef ? pressureReference.refValue() : 0;
         const scalar dtInv = 1.0/runTime.deltaTValue();
 
-        // ── 검증 모드: CPU fvMatrix 계수와 대조 ──────────────────────
+        // ── 검증 모드: CPU fvMatrix 계수와 대조 (devChain 미지원) ────
+        if (gpuPEqnCheck_ && devChain)
+        {
+            FatalErrorInFunction
+                << "gpuPEqnCheck requires the host fvc chain "
+                << "(disable gpuUEqn or gpuPEqnCheck)"
+                << exit(FatalError);
+        }
         if (gpuPEqnCheck_)
         {
             fvScalarMatrix pDDtEqnChk
             (
-                psis*fvm::ddt(p)
-              + fvc::div(phiHbyAv)
+                tpsis()*fvm::ddt(p)
+              + fvc::div(tphiHbyAv())
             );
-            fvScalarMatrix pEqnChk(pDDtEqnChk - fvm::laplacian(rAUf, p));
+            fvScalarMatrix pEqnChk
+            (
+                pDDtEqnChk - fvm::laplacian(trAUf(), p)
+            );
             pEqnChk.setReference
             (
                 pressureReference.refCell(), pressureReference.refValue()
@@ -572,10 +659,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             List<double> dG(nc), uG(nif), bG(nc);
             const int rc = rgpPEqnAssembleDump
             (
-                dtInv, rAUf.primitiveField().begin(),
-                psis.primitiveField().begin(),
+                dtInv, trAUf().primitiveField().begin(),
+                tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
-                phiHbyAv.primitiveField().begin(),
+                tphiHbyAv().primitiveField().begin(),
                 phiBA, bDiagA, bSrcA,
                 needRef, refCell, refValue,
                 dG.begin(), uG.begin(), bG.begin()
@@ -657,11 +744,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             int rc = rgpPEqnAssembleCsr
             (
                 dtInv,
-                rAUf.primitiveField().begin(),
-                psis.primitiveField().begin(),
+                devChain ? nullptr : trAUf().primitiveField().begin(),
+                devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
                 p.primitiveField().begin(),
-                phiHbyAv.primitiveField().begin(),
+                devChain ? nullptr : tphiHbyAv().primitiveField().begin(),
                 phiBA, bDiagA, bSrcA,
                 needRef, refCell, refValue,
                 &normFactor, &res0
@@ -729,11 +816,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             const int rc = rgpPEqnSolve
             (
                 dtInv,
-                rAUf.primitiveField().begin(),
-                psis.primitiveField().begin(),
+                devChain ? nullptr : trAUf().primitiveField().begin(),
+                devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
                 p.primitiveField().begin(),
-                phiHbyAv.primitiveField().begin(),
+                devChain ? nullptr : tphiHbyAv().primitiveField().begin(),
                 phiBA, bDiagA, bSrcA,
                 needRef, refCell, refValue,
                 tol, rtol, maxIter,
@@ -764,15 +851,35 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
         // ── 질량 플럭스 재구성: phi = rhof*(phiHbyAv + pEqn.flux()) ──
         {
-            scalarField& phic = phi.primitiveFieldRef();
-            const scalarField& rf = rhof.primitiveField();
-            const scalarField& ph = phiHbyAv.primitiveField();
-            forAll(phic, f)
+            if (devChain)
             {
-                phic[f] = rf[f]*(ph[f] + gpuPEqnFlux_[f]);
+                // 내부 전체(rhof*(phiHbyAv+flux))를 디바이스에서
+                if (rgpPEqnFinish2
+                    (
+                        p.primitiveFieldRef().begin(),
+                        gpuPEqnFlux_.begin()
+                    ))
+                {
+                    FatalErrorInFunction
+                        << "rgpPEqnFinish2: " << rgpPEqnLastError()
+                        << exit(FatalError);
+                }
+                scalarField& phic = phi.primitiveFieldRef();
+                forAll(phic, f) { phic[f] = gpuPEqnFlux_[f]; }
+            }
+            else
+            {
+                scalarField& phic = phi.primitiveFieldRef();
+                const scalarField& rf = trhof().primitiveField();
+                const scalarField& ph = tphiHbyAv().primitiveField();
+                forAll(phic, f)
+                {
+                    phic[f] = rf[f]*(ph[f] + gpuPEqnFlux_[f]);
+                }
             }
 
             // 경계: fvMatrix::flux() 규약 — iC*p_internal - bC
+            // (devChain: rhof_b = rho_b, phiHbyAv_b = HbyA_b & Sf_b)
             label off = 0;
             forAll(p.boundaryField(), patchi)
             {
@@ -781,9 +888,22 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 if (np == 0) continue;
 
                 const scalarField pi(pp.patchInternalField());
-                const scalarField& rfb = rhof.boundaryField()[patchi];
-                const scalarField& phb =
-                    phiHbyAv.boundaryField()[patchi];
+                const scalarField rfb
+                (
+                    devChain
+                  ? scalarField(rho.boundaryField()[patchi])
+                  : scalarField(trhof().boundaryField()[patchi])
+                );
+                const scalarField phb
+                (
+                    devChain
+                  ? scalarField
+                    (
+                        HbyA.boundaryField()[patchi]
+                      & mesh.Sf().boundaryField()[patchi]
+                    )
+                  : scalarField(tphiHbyAv().boundaryField()[patchi])
+                );
                 scalarField& phibf = phi.boundaryFieldRef()[patchi];
 
                 for (label k = 0; k < np; k++)
@@ -800,8 +920,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     {
         fvScalarMatrix pDDtEqn
         (
-            psis*fvm::ddt(p)
-          + fvc::div(phiHbyAv)
+            tpsis()*fvm::ddt(p)
+          + fvc::div(tphiHbyAv())
         );
         if (LADrhoCoeff > 0)
         {
@@ -811,7 +931,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
         while (pimple.correctNonOrthogonal())
         {
-            fvScalarMatrix pEqn(pDDtEqn - fvm::laplacian(rAUf, p));
+            fvScalarMatrix pEqn
+            (
+                pDDtEqn - fvm::laplacian(trAUf(), p)
+            );
 
             pEqn.setReference
             (
@@ -841,7 +964,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             {
                 // Reconstruct the mass flux from the corrected volumetric
                 // flux
-                phi = rhof*(phiHbyAv + pEqn.flux());
+                phi = trhof()*(tphiHbyAv() + pEqn.flux());
             }
         }
     }
@@ -903,7 +1026,49 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // its min and the surgical max) -- only the pMinPa floor was active.
     fvConstraints().constrain(p);
 
-    U = HbyA - rAAtU*fvc::grad(p);
+    if (gpuUEqn_ && gpuPEqn_)
+    {
+        // U = HbyA − rAU∇p — grad p·연산을 디바이스에서 (HbyA/rAU 상주)
+        const label nc = mesh.nCells();
+        label nbf = 0;
+        forAll(p.boundaryField(), patchi)
+        {
+            nbf += p.boundaryField()[patchi].size();
+        }
+        double* pB = gpuUBuf_.begin() + 12*nc + 3*nbf;   // pB 슬롯 재사용
+        double* U3out = gpuUBuf_.begin() + 6*nc;
+        {
+            label off = 0;
+            forAll(p.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pbf =
+                    p.boundaryField()[patchi];
+                forAll(pbf, k) { pB[off + k] = pbf[k]; }
+                off += pbf.size();
+            }
+        }
+        if (rgpPCorrU(p.primitiveField().begin(), pB, U3out))
+        {
+            FatalErrorInFunction
+                << "rgpPCorrU: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+        vectorField& Uc = U.primitiveFieldRef();
+        for (label i = 0; i < nc; i++)
+        {
+            for (label k = 0; k < 3; k++)
+            {
+                if (mesh.solutionD()[k] == 1)
+                {
+                    Uc[i][k] = U3out[k*nc + i];
+                }
+            }
+        }
+    }
+    else
+    {
+        U = HbyA - rAAtU*fvc::grad(p);
+    }
     U.correctBoundaryConditions();
     fvConstraints().constrain(U);
     K = 0.5*magSqr(U);

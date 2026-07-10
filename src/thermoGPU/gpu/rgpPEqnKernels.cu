@@ -74,7 +74,16 @@ namespace
         double *src3 = nullptr, *gradP = nullptr;     // [3*nc]
         double *UB3 = nullptr, *bfx3 = nullptr;       // [3*nbf]
         double *bg9 = nullptr;                        // [9*nbf]
+        double *rAU = nullptr, *HbyA3 = nullptr;      // [nc], [3*nc]
     } gU;
+
+    //- pCorr 준비체인 디바이스 버퍼 (rAUf/phiHbyAv/psis/rhof 상주)
+    struct PCBuf
+    {
+        double *rAUf = nullptr, *phiH = nullptr, *rhof = nullptr;
+        double *psis = nullptr;
+        double *rhoOld = nullptr, *Uold3 = nullptr, *phiOld = nullptr;
+    } gPC;
 
     struct PBuf
     {
@@ -114,7 +123,10 @@ namespace
             &gST.bPsi, &gST.rA0, &gST.sA, &gST.yz, &gST.AyA, &gST.AzA,
             &gU.diag, &gU.upper, &gU.lower, &gU.b3, &gU.U3,
             &gU.bDiag3, &gU.bSrc3, &gU.workDiag, &gU.workB, &gU.H,
-            &gU.grad9, &gU.src3, &gU.gradP, &gU.UB3, &gU.bfx3, &gU.bg9
+            &gU.grad9, &gU.src3, &gU.gradP, &gU.UB3, &gU.bfx3, &gU.bg9,
+            &gU.rAU, &gU.HbyA3,
+            &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
+            &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gM.nCells = gM.nIntFaces = gM.nBFaces = 0;
@@ -850,6 +862,106 @@ __global__ void uSrc3DivV
     for (int j = 0; j < 3; j++) { s3[(size_t)j*nc + i] /= V[i]; }
 }
 
+//- HbyA = rAU*H (성분별 — AH에서 디바이스 상주 사본 유지용)
+__global__ void uHbyA
+(
+    const int nc, const int cmpt,
+    const double* __restrict__ rAU, const double* __restrict__ H,
+    double* __restrict__ HbyA3
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    HbyA3[(size_t)cmpt*nc + i] = rAU[i]*H[i];
+}
+
+//- pCorr 준비 면 커널: rhof/rAUf(조화)/phiHbyAv(= flux(HbyA) +
+//  rcDdtScale*rhorAUf*coeff*rDeltaT*phiCorr/rhof; coeff = OF
+//  fvcDdtPhiCoeff flux-normalised, 경계 0은 호스트 처리)
+__global__ void pcPrepFace
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin, const double* __restrict__ sf,
+    const double* __restrict__ rho, const double* __restrict__ rAU,
+    const double* __restrict__ HbyA3,
+    const double* __restrict__ rhoOld, const double* __restrict__ Uold3,
+    const double* __restrict__ phiOld,
+    const double rDeltaT, const double rcDdtScale,
+    double* __restrict__ rhof, double* __restrict__ rAUf,
+    double* __restrict__ phiH
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const int o = own[f], n = nei[f];
+    const double w = wLin[f];
+
+    const double rf = w*rho[o] + (1.0 - w)*rho[n];
+    rhof[f] = rf;
+    rAUf[f] = 1.0/(w*(1.0/rAU[o]) + (1.0 - w)*(1.0/rAU[n]));
+    const double rrAUf = w*rho[o]*rAU[o] + (1.0 - w)*rho[n]*rAU[n];
+
+    double fluxH = 0.0, phiCorr = 0.0;
+    for (int k = 0; k < 3; k++)
+    {
+        const double sfk = sf[(size_t)k*nf + f];
+        fluxH += sfk*(w*HbyA3[(size_t)k*nc + o]
+                    + (1.0 - w)*HbyA3[(size_t)k*nc + n]);
+        // rhoU0 = rho.old*U.old의 선형보간 · Sf
+        phiCorr -= sfk*(w*rhoOld[o]*Uold3[(size_t)k*nc + o]
+                      + (1.0 - w)*rhoOld[n]*Uold3[(size_t)k*nc + n]);
+    }
+    phiCorr += phiOld[f];
+
+    const double coeff =
+        1.0 - fmin(fabs(phiCorr)/(fabs(phiOld[f]) + 1e-15), 1.0);
+
+    phiH[f] = fluxH + rcDdtScale*rrAUf*coeff*rDeltaT*phiCorr/rf;
+}
+
+//- psis = psi/rho
+__global__ void pcPsis
+(
+    const int nc, const double* __restrict__ psi,
+    const double* __restrict__ rho, double* __restrict__ psis
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    psis[i] = psi[i]/rho[i];
+}
+
+//- phi 재구성: phi = rhof*(phiHbyAv + flux)
+__global__ void pcPhiRecon
+(
+    const int nf, const double* __restrict__ rhof,
+    const double* __restrict__ phiH, const double* __restrict__ flux,
+    double* __restrict__ phiOut
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    phiOut[f] = rhof[f]*(phiH[f] + flux[f]);
+}
+
+//- U = HbyA − rAU*grad(p) (성분별 SoA out)
+__global__ void pcUUpdate
+(
+    const int nc,
+    const double* __restrict__ HbyA3, const double* __restrict__ rAU,
+    const double* __restrict__ gradP, double* __restrict__ U3
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    for (int k = 0; k < 3; k++)
+    {
+        U3[(size_t)k*nc + i] =
+            HbyA3[(size_t)k*nc + i] - rAU[i]*gradP[(size_t)k*nc + i];
+    }
+}
+
 //- 솔브 전용 소스: workB += s*g*V (grad p는 저장 소스가 아니라
 //  solve(UEqn == -grad p)의 임시 소스 — H()에 포함되면 안 됨)
 __global__ void uAddVolSrc
@@ -922,25 +1034,31 @@ namespace
         }
 
         cudaError_t e;
+        // null 입력 → rgpPCorrPrep 디바이스 상주본(rAUf/psis/phiHbyAv)
+        const double* dRAUf = rAUfInt ? gB.rAUf : gPC.rAUf;
+        const double* dPsis = psis ? gB.psis : gPC.psis;
+        const double* dPhi = phiInt ? gB.phiInt : gPC.phiH;
         struct { double* d; const double* s; size_t n; } up[] =
         {
-            {gB.rAUf, rAUfInt, (size_t)nf}, {gB.psis, psis, (size_t)nc},
-            {gB.pOld, pOld, (size_t)nc}, {gB.phiInt, phiInt, (size_t)nf},
+            {gB.rAUf, rAUfInt, rAUfInt ? (size_t)nf : 0},
+            {gB.psis, psis, psis ? (size_t)nc : 0},
+            {gB.pOld, pOld, (size_t)nc},
+            {gB.phiInt, phiInt, phiInt ? (size_t)nf : 0},
             {gB.phiB, phiB, (size_t)nbf}, {gB.bDiag, bDiag, (size_t)nbf},
             {gB.bSrc, bSrc, (size_t)nbf}
         };
         for (auto& u : up)
         {
-            if (u.n == 0) continue;
+            if (u.n == 0 || !u.s) continue;
             if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
                                 cudaMemcpyHostToDevice)) != cudaSuccess)
                 return pfail(e, "peqn/H2D");
         }
 
         rgppeqn::cellAssemble<<<nb(nc), BS>>>
-            (nc, dtInv, gB.psis, gM.V, gB.pOld, gB.diag, gB.b);
+            (nc, dtInv, dPsis, gM.V, gB.pOld, gB.diag, gB.b);
         rgppeqn::faceAssemble<<<nb(nf), BS>>>
-            (nf, gM.own, gM.nei, gM.gg, gB.rAUf, gB.phiInt,
+            (nf, gM.own, gM.nei, gM.gg, dRAUf, dPhi,
              gB.diag, gB.upper, gB.b);
         if (nbf > 0)
         {
@@ -2045,6 +2163,16 @@ int rgpUEqnAH(const double* U3, double* rAU, double* H3)
     if ((e = cudaMemcpy(rAU, gU.workB, (size_t)nc*sizeof(double),
                         cudaMemcpyDeviceToHost)) != cudaSuccess)
         return pfail(e, "ueqnAH/D2H rAU");
+    if (!gU.rAU)
+    {
+        if ((e = cudaMalloc(&gU.rAU, (size_t)nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "ueqnAH/malloc rAU");
+        if ((e = cudaMalloc(&gU.HbyA3, (size_t)3*nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "ueqnAH/malloc HbyA");
+    }
+    if ((e = cudaMemcpy(gU.rAU, gU.workB, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToDevice)) != cudaSuccess)
+        return pfail(e, "ueqnAH/rAU D2D");
 
     // H(U) 성분별
     for (int c = 0; c < 3; c++)
@@ -2062,6 +2190,7 @@ int rgpUEqnAH(const double* U3, double* rAU, double* H3)
                 (nbf, nc, c, gM.bfc, gU.bDiag3, gU.bSrc3, gU.U3, gU.H);
         }
         rgppeqn::uDivV<<<nb(nc), BS>>>(nc, gM.V, gU.H);
+        rgppeqn::uHbyA<<<nb(nc), BS>>>(nc, c, gU.rAU, gU.H, gU.HbyA3);
         if ((e = cudaGetLastError()) != cudaSuccess)
             return pfail(e, "ueqnAH/launch");
         if ((e = cudaMemcpy(H3 + (size_t)c*nc, gU.H,
@@ -2069,6 +2198,127 @@ int rgpUEqnAH(const double* U3, double* rAU, double* H3)
                             cudaMemcpyDeviceToHost)) != cudaSuccess)
             return pfail(e, "ueqnAH/D2H H");
     }
+    return 0;
+}
+
+
+//- pCorr 준비체인: rhof/rAUf(조화)/phiHbyAv/psis 디바이스 상주 생성.
+//  rAU/HbyA는 직전 rgpUEqnAH의 디바이스 사본 사용. ddtCorr는 OF
+//  EulerDdt fvcDdtPhiCorr(rho,U,phi) 1:1 (경계 기여 0은 호스트 담당).
+int rgpPCorrPrep
+(
+    const double* rho, const double* rhoOld,
+    const double* Uold3, const double* phiOld, const double* psi,
+    double rDeltaT, double rcDdtScale
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    if (!gU.rAU)
+    {
+        snprintf(gPErr, sizeof(gPErr), "pcorr: rgpUEqnAH not run");
+        return -1;
+    }
+
+    cudaError_t e;
+    if (!gPC.rAUf)
+    {
+        const size_t bc = (size_t)nc*sizeof(double);
+        const size_t bf = (size_t)nf*sizeof(double);
+        struct { double** d; size_t bytes; } al[] =
+        {
+            {&gPC.rAUf, bf}, {&gPC.phiH, bf}, {&gPC.rhof, bf},
+            {&gPC.psis, bc}, {&gPC.rhoOld, bc}, {&gPC.Uold3, 3*bc},
+            {&gPC.phiOld, bf}
+        };
+        for (auto& a : al)
+        {
+            if ((e = cudaMalloc(a.d, a.bytes)) != cudaSuccess)
+                return pfail(e, "pcorr/malloc");
+        }
+    }
+
+    struct { double* d; const double* s; size_t n; } up[] =
+    {
+        {gST.rho, rho, (size_t)nc}, {gPC.rhoOld, rhoOld, (size_t)nc},
+        {gPC.Uold3, Uold3, (size_t)3*nc}, {gPC.phiOld, phiOld, (size_t)nf},
+        {gST.gamma, psi, (size_t)nc}
+    };
+    for (auto& u : up)
+    {
+        if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "pcorr/H2D");
+    }
+
+    rgppeqn::pcPrepFace<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf,
+         gST.rho, gU.rAU, gU.HbyA3, gPC.rhoOld, gPC.Uold3, gPC.phiOld,
+         rDeltaT, rcDdtScale, gPC.rhof, gPC.rAUf, gPC.phiH);
+    rgppeqn::pcPsis<<<nb(nc), BS>>>(nc, gST.gamma, gST.rho, gPC.psis);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "pcorr/launch");
+    return 0;
+}
+
+
+//- 솔브 후처리 v2: 플럭스 → phi = rhof*(phiHbyAv + flux)까지 디바이스
+int rgpPEqnFinish2(double* pOut, double* phiOut)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+
+    rgppeqn::faceFlux<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
+                                      gB.x, gB.flux);
+    rgppeqn::pcPhiRecon<<<nb(nf), BS>>>(nf, gPC.rhof, gPC.phiH,
+                                        gB.flux, gB.flux);
+    cudaError_t e;
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "pcorr/finish launch");
+
+    if ((e = cudaMemcpy(pOut, gB.x, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "pcorr/D2H p");
+    if ((e = cudaMemcpy(phiOut, gB.flux, (size_t)nf*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "pcorr/D2H phi");
+    return 0;
+}
+
+
+//- 후처리: U = HbyA − rAU*grad(p_new) (grad p 디바이스 계산)
+int rgpPCorrU(const double* pNew, const double* pB, double* U3out)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+
+    cudaError_t e;
+    if ((e = cudaMemcpy(gB.pOld, pNew, (size_t)nc*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "pcorrU/H2D p");
+    if (nbf > 0)
+    {
+        if ((e = cudaMemcpy(gST.bPsi, pB, (size_t)nbf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "pcorrU/H2D pB");
+    }
+
+    if ((e = cudaMemset(gU.gradP, 0, (size_t)3*nc*sizeof(double)))
+        != cudaSuccess) return pfail(e, "pcorrU/memset");
+    rgppeqn::stGradFace<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf, gB.pOld, gU.gradP);
+    if (nbf > 0)
+    {
+        rgppeqn::stGradBFace<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gSTM.bSf, gST.bPsi, gU.gradP);
+    }
+    rgppeqn::stGradDivV<<<nb(nc), BS>>>(nc, gM.V, gU.gradP);
+
+    rgppeqn::pcUUpdate<<<nb(nc), BS>>>
+        (nc, gU.HbyA3, gU.rAU, gU.gradP, gU.src3);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "pcorrU/launch");
+
+    if ((e = cudaMemcpy(U3out, gU.src3, (size_t)3*nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "pcorrU/D2H U");
     return 0;
 }
 

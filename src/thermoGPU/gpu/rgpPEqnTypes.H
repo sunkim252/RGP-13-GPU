@@ -145,6 +145,21 @@ int rgpUEqnSolve
 
 int rgpUEqnAH(const double* U3, double* rAU, double* H3);
 
+/*  pCorr 준비체인 (gpuUEqn+gpuPEqn 디바이스 체인 전용):
+    Prep — rhof/rAUf(조화)/phiHbyAv(flux(HbyA)+Euler ddtCorr)/psis를
+    디바이스 상주 생성(rAU/HbyA는 직전 rgpUEqnAH 사본). 이후
+    rgpPEqnSolve/AssembleCsr에 rAUfInt/psis/phiInt를 null로 넘기면
+    상주본 사용. Finish2 — 플럭스+phi 재구성까지 디바이스.
+    U — U = HbyA − rAU∇p(신규 p) 후처리.                                */
+int rgpPCorrPrep
+(
+    const double* rho, const double* rhoOld,
+    const double* Uold3, const double* phiOld, const double* psi,
+    double rDeltaT, double rcDdtScale
+);
+int rgpPEqnFinish2(double* pOut, double* phiOut);
+int rgpPCorrU(const double* pNew, const double* pB, double* U3out);
+
 /*  검증용: 마지막 rgpSTEqnSolve의 조립 계수/가중치 D2H (null 허용) */
 int rgpSTEqnDump
 (
