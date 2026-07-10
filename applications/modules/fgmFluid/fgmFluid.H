@@ -255,6 +255,10 @@ protected:
         Switch gpuUEqn_;
         mutable List<double> gpuUBuf_;    // SoA/경계 스테이징
 
+        //- 호스트 버퍼/필드 page-lock 등록 완료 플래그 (스텝 2에서
+        //  1회 — 모든 grow-only 버퍼가 최종 크기에 도달한 뒤)
+        mutable bool gpuPinned_;
+
         //- pEqnGPU 메시 업로드 완료 플래그 + 작업 버퍼
         mutable bool gpuPEqnArmed_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
@@ -348,6 +352,10 @@ private:
         //  mixture departure, same tables as armGpuThermo) for internal
         //  cells and all patch faces. Arms the thermo tables if needed.
         void gpuHeReseed();
+
+        //- 대용량 전송에 쓰이는 상주 호스트 버퍼/필드를 page-lock 등록
+        //  (pageable 전송 병목 완화). 버퍼 크기 확정 후 1회.
+        void pinGpuHostBuffers();
 
         //- pEqnGPU: 정적 메시(owner/neigh/기하계수/V/경계 faceCells)
         //  업로드 (1회, idempotent). gpuPEqn/gpuZC 양쪽에서 사용.

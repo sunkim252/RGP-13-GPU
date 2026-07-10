@@ -492,4 +492,59 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
 }
 
 
+void Foam::solvers::fgmFluid::pinGpuHostBuffers()
+{
+    if (gpuPinned_) return;
+
+    // grow-only 스테이징 버퍼 (첫 스텝 후 최종 크기)
+    auto pinList = [&](List<double>& l)
+    {
+        if (l.size() > 0)
+        {
+            rgpPinHost(l.begin(), l.size()*sizeof(double));
+        }
+    };
+    pinList(gpuFgmOut_);
+    pinList(gpuP_); pinList(gpuT_); pinList(gpuY_);
+    pinList(gpuRho_); pinList(gpuMu_); pinList(gpuKappa_);
+    pinList(gpuCp_); pinList(gpuCv_); pinList(gpuPsi_);
+    pinList(gpuUBuf_);
+    pinList(gpuPEqnFlux_);
+    pinList(gpuZCBuf_);
+
+    // 직접 포인터로 전송되는 상주 필드 (주소는 필드 수명 동안 고정)
+    auto pinField = [&](const scalarField& f)
+    {
+        if (f.size() > 0)
+        {
+            rgpPinHost
+            (
+                const_cast<scalar*>(f.begin()), f.size()*sizeof(double)
+            );
+        }
+    };
+    pinField(Z_.primitiveField());
+    pinField(C_.primitiveField());
+    pinField(gZ_.primitiveField());
+    pinField(chi_st_.primitiveField());
+    pinField(sourcePV_.primitiveField());
+    pinField(thermo_.T().primitiveField());
+    pinField(thermo_.p().primitiveField());
+    pinField(thermo_.he().primitiveField());
+    pinField(thermo_.psi().primitiveField());
+    pinField(rho_.primitiveField());
+    pinField(rho_.oldTime().primitiveField());
+    pinField(p_.oldTime().primitiveField());
+    pinField(phi_.primitiveField());
+    pinField(phi_.oldTime().primitiveField());
+    forAll(tabSpecieIDs_, k)
+    {
+        pinField(Y_[tabSpecieIDs_[k]].primitiveField());
+    }
+
+    gpuPinned_ = true;
+    Info<< "fgmFluid: GPU host buffers page-locked (pinned)" << nl << endl;
+}
+
+
 // ************************************************************************* //

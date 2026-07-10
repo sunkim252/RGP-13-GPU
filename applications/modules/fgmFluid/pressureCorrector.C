@@ -111,7 +111,7 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
             << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
             << exit(FatalError);
     }
-    if (gpuPEqnSolver_ == "amgx")
+    // CSR 구조는 솔버 무관 준비: amgx 직결 + PCG의 무-atomics SpMV 겸용
     {
         int nnz = 0;
         if (rgpPEqnCsrPrepare(&nnz))
@@ -204,10 +204,6 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     const volScalarField& psi = thermo.psi();
     rho = thermo.rho();
     rho.relax();
-
-    // Thermodynamic density needs to be updated by psi*d(p) after the
-    // pressure solution
-    const volScalarField psip0(psi*p);
 
     // pCorrGPU 디바이스 체인: gpuUEqn(rAU/HbyA 디바이스) + gpuPEqn일 때
     // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체

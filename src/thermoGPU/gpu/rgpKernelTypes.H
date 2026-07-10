@@ -10,6 +10,8 @@
 #ifndef rgpKernelTypes_H
 #define rgpKernelTypes_H
 
+#include <stddef.h>
+
 /* 스레드-로컬 스택 배열 상한 (FPV 케이스: 4-7종, 여유 포함) */
 #define RGP_GPU_MAX_SPECIES 40
 
@@ -110,6 +112,11 @@ int  rgpGpuEvaluateHaFromFgm
     const double* yHost,
     double* ha
 );
+
+/*  호스트 버퍼 page-lock 등록/해제 (pageable 전송 병목 완화).
+    등록된 범위가 살아있는 동안만 유효 — 재할당 전 반드시 해제.     */
+int rgpPinHost(void* p, size_t bytes);
+int rgpUnpinHost(void* p);
 
 void rgpGpuFree(void);
 const char* rgpGpuLastError(void);

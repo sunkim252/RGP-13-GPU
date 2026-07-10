@@ -1148,6 +1148,31 @@ int rgpGpuEvaluateHa
 }
 
 
+int rgpPinHost(void* p, size_t bytes)
+{
+    cudaError_t e = cudaHostRegister(p, bytes, cudaHostRegisterPortable);
+    if (e != cudaSuccess)
+    {
+        snprintf(gErr, sizeof(gErr), "pinHost: %s", cudaGetErrorString(e));
+        return int(e);
+    }
+    return 0;
+}
+
+
+int rgpUnpinHost(void* p)
+{
+    cudaError_t e = cudaHostUnregister(p);
+    if (e != cudaSuccess)
+    {
+        snprintf(gErr, sizeof(gErr), "unpinHost: %s",
+                 cudaGetErrorString(e));
+        return int(e);
+    }
+    return 0;
+}
+
+
 void rgpGpuFree(void)
 {
     freeTables();

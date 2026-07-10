@@ -128,6 +128,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuZC_(fgmTable_.lookupOrDefault<Switch>("gpuZC", false)),
     gpuZCArmed_(false),
     gpuUEqn_(fgmTable_.lookupOrDefault<Switch>("gpuUEqn", false)),
+    gpuPinned_(false),
     gpuPEqnArmed_(false),
     gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
     gpuManifoldArmed_(false),
@@ -828,6 +829,12 @@ void Foam::solvers::fgmFluid::updateManifold()
     bool gpuDone = false;
     if (gpuManifold_)
     {
+        // 스텝 2부터 1회: 모든 grow-only 버퍼가 최종 크기 도달 후 pin
+        if (!gpuPinned_ && gpuManifoldArmed_ && gpuFgmOut_.size() > 0)
+        {
+            pinGpuHostBuffers();
+        }
+
         // 1회 아밍: 축 4개 + [sourcePV, T, Y_k.., RG_.., LeZ?, LeC?] 순서로
         // 연접한 테이블을 업로드 (테이블은 런 중 불변; 산포 순서와 동일).
         if (!gpuManifoldArmed_)

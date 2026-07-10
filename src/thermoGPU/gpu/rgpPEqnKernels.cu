@@ -39,6 +39,7 @@ namespace
         std::vector<int> hOwn, hNei, hRowPtr, hColInd;
         int nnz = 0;
         int *dDiagSlot = nullptr, *dUpSlot = nullptr, *dLoSlot = nullptr;
+        int *dRowPtr = nullptr, *dColInd = nullptr;
         double *dVals = nullptr;
     } gM;
 
@@ -102,10 +103,12 @@ namespace
     void pFreeAll()
     {
         int* ip[] = {gM.own, gM.nei, gM.bfc,
-                     gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot};
+                     gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot,
+                     gM.dRowPtr, gM.dColInd};
         for (auto p : ip) { if (p) cudaFree(p); }
         gM.own = gM.nei = gM.bfc = nullptr;
         gM.dDiagSlot = gM.dUpSlot = gM.dLoSlot = nullptr;
+        gM.dRowPtr = gM.dColInd = nullptr;
         if (gM.dVals) { cudaFree(gM.dVals); gM.dVals = nullptr; }
         gM.hOwn.clear(); gM.hNei.clear();
         gM.hRowPtr.clear(); gM.hColInd.clear();
@@ -331,6 +334,25 @@ __global__ void csrScatterFace
     vals[loSlot[f]] = upper[f];
 }
 
+
+//- 무-atomics CSR SpMV (행당 1스레드, 7-포인트)
+__global__ void csrSpmv
+(
+    const int nc, const int* __restrict__ rowPtr,
+    const int* __restrict__ colInd, const double* __restrict__ vals,
+    const double* __restrict__ x, double* __restrict__ y
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    double s = 0.0;
+    const int e = rowPtr[i + 1];
+    for (int k = rowPtr[i]; k < e; k++)
+    {
+        s += vals[k]*x[colInd[k]];
+    }
+    y[i] = s;
+}
 
 //- 내부면 플럭스: faceH = upper*x_n - lower*x_o = -upper*(x_o - x_n)...
 //  대칭(lower=upper)이므로 faceH_f = upper_f*(x_n - x_o)
@@ -1069,9 +1091,33 @@ namespace
         {
             rgppeqn::setRef<<<1, 1>>>(refCell, refValue, gB.diag, gB.b);
         }
+        // CSR 구조가 준비돼 있으면 값 산포 (무-atomics SpMV 경로)
+        if (gM.dVals)
+        {
+            rgppeqn::csrScatterDiag<<<nb(nc), BS>>>
+                (nc, gM.dDiagSlot, gB.diag, gM.dVals);
+            rgppeqn::csrScatterFace<<<nb(nf), BS>>>
+                (nf, gM.dUpSlot, gM.dLoSlot, gB.upper, gM.dVals);
+        }
         if ((e = cudaGetLastError()) != cudaSuccess)
             return pfail(e, "peqn/assemble launch");
         return 0;
+    }
+
+    //- pEqn용 A·x: CSR 준비 시 무-atomics, 아니면 LDU+atomics
+    void pSpmv(const int nc, const int nf, const double* x, double* y)
+    {
+        if (gM.dVals)
+        {
+            rgppeqn::csrSpmv<<<nb(nc), BS>>>
+                (nc, gM.dRowPtr, gM.dColInd, gM.dVals, x, y);
+        }
+        else
+        {
+            rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, x, y);
+            rgppeqn::faceSpmv<<<nb(nf), BS>>>
+                (nf, gM.own, gM.nei, gB.upper, x, y);
+        }
     }
     //- Jacobi-BiCGStab (OF PBiCGStab 구조/잔차 규약) — 임의 디바이스
     //  포인터의 (diag, upper, lower, b, x)에 대해. 스크래치는 gB/gST 공유.
@@ -1299,9 +1345,7 @@ int rgpPEqnSolve
                         cudaMemcpyHostToDevice)) != cudaSuccess)
         return pfail(e, "peqn/H2D x0");
 
-    // rowSum (normFactor용): rs = diag + Σ upper 기여
-    rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gB.x, gB.wA);
-    // rowSum은 diag 복사 후 면 누적 — diagSpmv를 x=1로 쓰는 대신 직접
+    // rowSum (normFactor용)
     if ((e = cudaMemcpy(gB.rowSum, gB.diag, (size_t)nc*sizeof(double),
                         cudaMemcpyDeviceToDevice)) != cudaSuccess)
         return pfail(e, "peqn/rowSum D2D");
@@ -1309,8 +1353,7 @@ int rgpPEqnSolve
                                         gB.rowSum);
 
     // wA = A x0
-    rgppeqn::faceSpmv<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
-                                      gB.x, gB.wA);
+    pSpmv(nc, nf, gB.x, gB.wA);
     rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "peqn/init launch");
@@ -1366,9 +1409,7 @@ int rgpPEqnSolve
                                                 gB.pA);   // pA = z + beta*pA
 
             // wA = A pA
-            rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gB.pA, gB.wA);
-            rgppeqn::faceSpmv<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
-                                              gB.pA, gB.wA);
+            pSpmv(nc, nf, gB.pA, gB.wA);
 
             double pAwA = 0;
             if ((rc = reduceHost(nc, 2, gB.pA, gB.wA, 0, nullptr, pAwA)))
@@ -1507,6 +1548,23 @@ int rgpPEqnCsrPrepare(int* nnzOut)
         if ((e = cudaMalloc(&gM.dVals, (size_t)nnz*sizeof(double)))
             != cudaSuccess) return pfail(e, "peqn/csr vals malloc");
     }
+    // CSR 구조 디바이스 사본 (무-atomics SpMV용)
+    struct { int** d; const int* s; size_t n; } cs[] =
+    {
+        {&gM.dRowPtr, gM.hRowPtr.data(), (size_t)(nc + 1)},
+        {&gM.dColInd, gM.hColInd.data(), (size_t)nnz}
+    };
+    for (auto& c : cs)
+    {
+        if (!*c.d)
+        {
+            if ((e = cudaMalloc(c.d, c.n*sizeof(int))) != cudaSuccess)
+                return pfail(e, "peqn/csr struct malloc");
+        }
+        if ((e = cudaMemcpy(*c.d, c.s, c.n*sizeof(int),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "peqn/csr struct H2D");
+    }
 
     gM.nnz = nnz;
     *nnzOut = nnz;
@@ -1590,9 +1648,7 @@ int rgpPEqnResidual(double normFactor, double* res)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
 
-    rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, gB.diag, gB.x, gB.wA);
-    rgppeqn::faceSpmv<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
-                                      gB.x, gB.wA);
+    pSpmv(nc, nf, gB.x, gB.wA);
     rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
     cudaError_t e;
     if ((e = cudaGetLastError()) != cudaSuccess)
