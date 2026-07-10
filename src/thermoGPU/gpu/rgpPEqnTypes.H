@@ -51,6 +51,22 @@ int rgpPEqnSolve
     double* initRes, double* finalRes, int* nIters
 );
 
+/*  병렬 pEqn (pcg 전용): processor 패치의 halo 교환 + 전역 리덕션.
+    ParArm은 메시 아밍 시 1회 — nbrRank/nFaces[nProcPatches],
+    faceCells는 패치-연접, globalCells는 전역 셀 수(xRef용).
+    이 랭크에 processor 패치가 없어도(0, NULL 허용) 호출해야
+    전역 리덕션 collective가 성립한다.
+    ParCoeffs는 솔브마다 — 인터페이스 계수 bC(=+pGamma*gbc, OF
+    boundaryCoeffs 규약; SpMV가 y[fc] -= bC*x_nbr).
+    경계 concat(bDiag/bSrc/phiB)에서 processor 패치는 bDiag=-pGamma*gic,
+    bSrc=0, phiB=phiHbyAv_b 로 채울 것.                                */
+int rgpPEqnParArm
+(
+    int nProcPatches, const int* nbrRank, const int* nFaces,
+    const int* faceCells, double globalCells
+);
+int rgpPEqnParCoeffs(const double* bCoeffs);
+
 /*  pEqn PCG 전처리기 선택: 0=Jacobi(기본), 1=멀티컬러 DIC.
     DIC 구조(그리디 셀 컬러링 + 면 fwd/bwd 그룹)는 첫 솔브에서 지연
     아밍되고 메시 재아밍 시 해제·재구축된다. rD는 솔브마다 재계산.

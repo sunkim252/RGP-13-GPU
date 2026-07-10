@@ -275,6 +275,7 @@ protected:
         mutable bool gpuPEqnArmed_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
         mutable List<double> gpuPEqnFlux_;  // 내부면 플럭스 out
+        mutable List<double> gpuPEqnParB_;  // processor 인터페이스 계수
 
         //- fgmGPU: updateManifold의 셀 루프(대수 gZ/chi_st + 전 필드
         //  16-코너 보간)를 CUDA로 오프로드. 'gpuManifold on;' (fgmProperties).

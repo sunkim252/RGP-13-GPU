@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <vector>
+#include <mpi.h>
 
 namespace
 {
@@ -120,6 +121,26 @@ namespace
 
     int gPrecon = 0;   // 0=Jacobi, 1=multicolour DIC
 
+    //- 병렬 pEqn: processor 패치 halo 교환 + 전역 리덕션 상태.
+    //  bC(=+pGamma*gbc, OF boundaryCoeffs 규약)는 솔브마다 갱신,
+    //  SpMV가 y[fc] -= bC*x_nbr 로 인터페이스 기여를 더한다
+    //  (lduMatrix::updateMatrixInterfaces 1:1). MPI는 호스트 스테이징
+    //  (컨테이너 OpenMPI가 CUDA-aware가 아님).
+    struct ParState
+    {
+        int active = 0;
+        int nP = 0;                 // processor 패치 수
+        std::vector<int> nbr;       // [nP] 상대 랭크
+        std::vector<int> off;       // [nP+1] 연접 오프셋
+        int totF = 0;
+        int* fc = nullptr;          // [totF] faceCells (디바이스)
+        double* bC = nullptr;       // [totF] 인터페이스 계수 (디바이스)
+        double* dSend = nullptr;    // [totF]
+        double* dRecv = nullptr;
+        std::vector<double> hSend, hRecv;
+        double gnCells = 0;         // 전역 셀 수 (xRef용)
+    } gPar;
+
     void pFreeAll()
     {
         int* ip[] = {gM.own, gM.nei, gM.bfc,
@@ -162,6 +183,12 @@ namespace
         gDIC.hColStart.clear(); gDIC.hFwdStart.clear();
         gDIC.hBwdStart.clear();
         gDIC.nColors = 0;
+
+        if (gPar.fc)    { cudaFree(gPar.fc);    gPar.fc = nullptr; }
+        if (gPar.bC)    { cudaFree(gPar.bC);    gPar.bC = nullptr; }
+        if (gPar.dSend) { cudaFree(gPar.dSend); gPar.dSend = nullptr; }
+        if (gPar.dRecv) { cudaFree(gPar.dRecv); gPar.dRecv = nullptr; }
+        gPar = ParState();
 
         gU.assembled = false;
         gM.nCells = gM.nIntFaces = gM.nBFaces = 0;
@@ -339,6 +366,44 @@ __global__ void cgUpdate
     if (i >= n) return;
     x[i] += alpha*pA[i];
     r[i] -= alpha*wA[i];
+}
+
+//- 병렬: 인터페이스 x 게더 (송신 버퍼)
+__global__ void parGather
+(
+    const int n, const int* __restrict__ fc,
+    const double* __restrict__ x, double* __restrict__ sendB
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    sendB[k] = x[fc[k]];
+}
+
+//- 병렬: 인터페이스 기여 y[fc] -= bC * x_nbr (updateMatrixInterfaces 규약).
+//  한 셀이 여러 processor 면에 접할 수 있어 atomicAdd.
+__global__ void parApply
+(
+    const int n, const int* __restrict__ fc,
+    const double* __restrict__ bC, const double* __restrict__ recvB,
+    double* __restrict__ y
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    atomicAdd(&y[fc[k]], -bC[k]*recvB[k]);
+}
+
+//- 병렬: rowSum(normFactor용)에 인터페이스 계수 반영 (lduMatrix::sumA)
+__global__ void parRowSum
+(
+    const int n, const int* __restrict__ fc,
+    const double* __restrict__ bC, double* __restrict__ rs
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    atomicAdd(&rs[fc[k]], -bC[k]);
 }
 
 //- 방향 갱신: pA = z + beta*pA (beta=0이면 초기화) — 전처리기 공용
@@ -1277,8 +1342,49 @@ namespace
         return 0;
     }
 
-    //- pEqn용 A·x: CSR 준비 시 무-atomics, 아니면 LDU+atomics
-    void pSpmv(const int nc, const int nf, const double* x, double* y)
+    //- 병렬: 인터페이스 halo 교환 — x[fc] 게더 → D2H → MPI 쌍교환 →
+    //  H2D(dRecv). 이후 parApply가 y에 반영한다. 0=성공.
+    int haloExchange(const double* x)
+    {
+        cudaError_t e;
+        rgppeqn::parGather<<<nb(gPar.totF), BS>>>
+            (gPar.totF, gPar.fc, x, gPar.dSend);
+        if ((e = cudaMemcpy(gPar.hSend.data(), gPar.dSend,
+                            (size_t)gPar.totF*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "par/D2H send");
+
+        std::vector<MPI_Request> req(2*gPar.nP);
+        for (int i = 0; i < gPar.nP; i++)
+        {
+            const int n = gPar.off[i + 1] - gPar.off[i];
+            MPI_Irecv(gPar.hRecv.data() + gPar.off[i], n, MPI_DOUBLE,
+                      gPar.nbr[i], 42, MPI_COMM_WORLD, &req[2*i]);
+            MPI_Isend(gPar.hSend.data() + gPar.off[i], n, MPI_DOUBLE,
+                      gPar.nbr[i], 42, MPI_COMM_WORLD, &req[2*i + 1]);
+        }
+        MPI_Waitall(2*gPar.nP, req.data(), MPI_STATUSES_IGNORE);
+
+        if ((e = cudaMemcpy(gPar.dRecv, gPar.hRecv.data(),
+                            (size_t)gPar.totF*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "par/H2D recv");
+        return 0;
+    }
+
+    //- 전역 리덕션 (병렬 활성 시 allreduce-sum)
+    void greduce(double& v)
+    {
+        if (gPar.active)
+        {
+            MPI_Allreduce(MPI_IN_PLACE, &v, 1, MPI_DOUBLE, MPI_SUM,
+                          MPI_COMM_WORLD);
+        }
+    }
+
+    //- pEqn용 A·x: CSR 준비 시 무-atomics, 아니면 LDU+atomics.
+    //  병렬이면 processor 인터페이스 기여(-bC*x_nbr)까지 포함.
+    int pSpmv(const int nc, const int nf, const double* x, double* y)
     {
         if (gM.dVals && gM.dRowPtr)
         {
@@ -1291,6 +1397,14 @@ namespace
             rgppeqn::faceSpmv<<<nb(nf), BS>>>
                 (nf, gM.own, gM.nei, gB.upper, x, y);
         }
+        if (gPar.active && gPar.totF > 0)
+        {
+            int rc = haloExchange(x);
+            if (rc) return rc;
+            rgppeqn::parApply<<<nb(gPar.totF), BS>>>
+                (gPar.totF, gPar.fc, gPar.bC, gPar.dRecv, y);
+        }
+        return 0;
     }
     //- 멀티컬러 DIC 아밍(지연, 메시 종속): own/nei를 D2H로 회수해
     //  그리디 first-fit 컬러링 → 셀 색-그룹 + 면 fwd/bwd 그룹 구축.
@@ -1712,6 +1826,81 @@ int rgpPEqnMeshUpload
 }
 
 
+int rgpPEqnParArm
+(
+    int nProcPatches, const int* nbrRank, const int* nFaces,
+    const int* faceCells, double globalCells
+)
+{
+    // 재아밍(메시 변화) 대응: 기존 구조 해제 후 재구축
+    if (gPar.fc)    { cudaFree(gPar.fc);    gPar.fc = nullptr; }
+    if (gPar.bC)    { cudaFree(gPar.bC);    gPar.bC = nullptr; }
+    if (gPar.dSend) { cudaFree(gPar.dSend); gPar.dSend = nullptr; }
+    if (gPar.dRecv) { cudaFree(gPar.dRecv); gPar.dRecv = nullptr; }
+    gPar = ParState();
+
+    int mpiOn = 0;
+    MPI_Initialized(&mpiOn);
+    if (!mpiOn)
+    {
+        snprintf(gPErr, sizeof(gPErr), "par: MPI not initialised");
+        return -1;
+    }
+
+    if (nProcPatches <= 0)
+    {
+        // 병렬이지만 이 랭크에 processor 패치가 없어도 전역 리덕션은
+        // 참여해야 한다 (collective 불일치 방지)
+        gPar.active = 1;
+        gPar.gnCells = globalCells;
+        return 0;
+    }
+
+    gPar.nP = nProcPatches;
+    gPar.nbr.assign(nbrRank, nbrRank + nProcPatches);
+    gPar.off.resize(nProcPatches + 1);
+    gPar.off[0] = 0;
+    for (int i = 0; i < nProcPatches; i++)
+    {
+        gPar.off[i + 1] = gPar.off[i] + nFaces[i];
+    }
+    gPar.totF = gPar.off[nProcPatches];
+    gPar.hSend.resize(gPar.totF);
+    gPar.hRecv.resize(gPar.totF);
+
+    cudaError_t e;
+    if ((e = cudaMalloc(&gPar.fc, (size_t)gPar.totF*sizeof(int)))
+        != cudaSuccess) return pfail(e, "par/malloc fc");
+    if ((e = cudaMemcpy(gPar.fc, faceCells,
+                        (size_t)gPar.totF*sizeof(int),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "par/H2D fc");
+    if ((e = cudaMalloc(&gPar.bC, (size_t)gPar.totF*sizeof(double)))
+        != cudaSuccess) return pfail(e, "par/malloc bC");
+    if ((e = cudaMalloc(&gPar.dSend, (size_t)gPar.totF*sizeof(double)))
+        != cudaSuccess) return pfail(e, "par/malloc send");
+    if ((e = cudaMalloc(&gPar.dRecv, (size_t)gPar.totF*sizeof(double)))
+        != cudaSuccess) return pfail(e, "par/malloc recv");
+
+    gPar.gnCells = globalCells;
+    gPar.active = 1;
+    return 0;
+}
+
+
+int rgpPEqnParCoeffs(const double* bCoeffs)
+{
+    if (!gPar.active || gPar.totF <= 0) return 0;
+    cudaError_t e = cudaMemcpy
+    (
+        gPar.bC, bCoeffs, (size_t)gPar.totF*sizeof(double),
+        cudaMemcpyHostToDevice
+    );
+    if (e != cudaSuccess) return pfail(e, "par/H2D bC");
+    return 0;
+}
+
+
 int rgpPEqnSetPrecon(int mode)
 {
     gPrecon = (mode == 1) ? 1 : 0;
@@ -1751,15 +1940,20 @@ int rgpPEqnSolve
                         cudaMemcpyHostToDevice)) != cudaSuccess)
         return pfail(e, "peqn/H2D x0");
 
-    // rowSum (normFactor용)
+    // rowSum (normFactor용) — 병렬은 인터페이스 계수 포함 (sumA 규약)
     if ((e = cudaMemcpy(gB.rowSum, gB.diag, (size_t)nc*sizeof(double),
                         cudaMemcpyDeviceToDevice)) != cudaSuccess)
         return pfail(e, "peqn/rowSum D2D");
     rgppeqn::faceRowSum<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
                                         gB.rowSum);
+    if (gPar.active && gPar.totF > 0)
+    {
+        rgppeqn::parRowSum<<<nb(gPar.totF), BS>>>
+            (gPar.totF, gPar.fc, gPar.bC, gB.rowSum);
+    }
 
     // wA = A x0
-    pSpmv(nc, nf, gB.x, gB.wA);
+    if ((rc = pSpmv(nc, nf, gB.x, gB.wA))) return rc;
     rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "peqn/init launch");
@@ -1768,16 +1962,20 @@ int rgpPEqnSolve
     // normFactor = Σ|Ax - rs*xRef| + Σ|b - rs*xRef| + SMALL
     double sumX = 0;
     if ((rc = reduceHost(nc, 0, gB.x, nullptr, 0, nullptr, sumX))) return rc;
-    const double xRef = sumX/nc;
+    greduce(sumX);
+    const double xRef = sumX/(gPar.active ? gPar.gnCells : double(nc));
     double nf1 = 0, nf2 = 0;
     if ((rc = reduceHost(nc, 3, gB.wA, nullptr, xRef, gB.rowSum, nf1)))
         return rc;
     if ((rc = reduceHost(nc, 3, gB.b, nullptr, xRef, gB.rowSum, nf2)))
         return rc;
+    greduce(nf1);
+    greduce(nf2);
     const double normFactor = nf1 + nf2 + 1e-20;
 
     double res = 0;
     if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res))) return rc;
+    greduce(res);
     res /= normFactor;
     *initRes = res;
 
@@ -1813,17 +2011,19 @@ int rgpPEqnSolve
             }
             if ((rc = reduceHost(nc, 2, gB.wA, gB.rA, 0, nullptr, rArD)))
                 return rc;
+            greduce(rArD);
 
             const double beta = (iter > 0) ? rArD/rArDold : 0.0;
             rgppeqn::dirUpdate<<<nb(nc), BS>>>(nc, gB.wA, beta, gB.pA);
 
             // wA = A pA
-            pSpmv(nc, nf, gB.pA, gB.wA);
+            if ((rc = pSpmv(nc, nf, gB.pA, gB.wA))) return rc;
 
             double pAwA = 0;
             if ((rc = reduceHost(nc, 2, gB.pA, gB.wA, 0, nullptr, pAwA)))
                 return rc;
-            if (pAwA == 0) break;   // 특이 — 안전 탈출
+            greduce(pAwA);
+            if (pAwA == 0) break;   // 특이 — 안전 탈출 (전역 일치)
 
             const double alpha = rArD/pAwA;
             rgppeqn::cgUpdate<<<nb(nc), BS>>>(nc, alpha, gB.pA, gB.wA,
@@ -1832,6 +2032,7 @@ int rgpPEqnSolve
             iter++;
             if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res)))
                 return rc;
+            greduce(res);
             res /= normFactor;
             if (converged(res)) break;
         }
@@ -2066,7 +2267,8 @@ int rgpPEqnResidual(double normFactor, double* res)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
 
-    pSpmv(nc, nf, gB.x, gB.wA);
+    int prc;
+    if ((prc = pSpmv(nc, nf, gB.x, gB.wA))) return prc;
     rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
     cudaError_t e;
     if ((e = cudaGetLastError()) != cudaSuccess)

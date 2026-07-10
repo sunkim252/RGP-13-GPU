@@ -55,6 +55,9 @@ Description
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
 #include "fixedFluxPressureFvPatchScalarField.H"
+#include "processorFvPatchFields.H"
+#include "processorFvPatch.H"
+#include "PstreamReduceOps.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -116,9 +119,21 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
     {
         if (p_.boundaryField()[patchi].coupled())
         {
-            FatalErrorInFunction
-                << "gpuPEqn/gpuZC (v1) do not support coupled patches"
-                << exit(FatalError);
+            // processor 패치는 병렬 pEqn이 halo 교환으로 지원 —
+            // 그 외 커플드(cyclic/AMI)는 v1 미지원
+            if
+            (
+                !isA<processorFvPatchScalarField>
+                (
+                    p_.boundaryField()[patchi]
+                )
+            )
+            {
+                FatalErrorInFunction
+                    << "gpuPEqn/gpuZC (v1) support processor coupling "
+                    << "only (no cyclic/AMI)"
+                    << exit(FatalError);
+            }
         }
         nbf += p_.boundaryField()[patchi].size();
     }
@@ -165,6 +180,42 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                 << exit(FatalError);
         }
         gpuPEqnNnz_ = nnz;
+    }
+
+    // ── 병렬: processor 패치 구조 아밍 (halo 교환 + 전역 리덕션) ──
+    if (Pstream::parRun())
+    {
+        DynamicList<int> pNbr, pNF;
+        DynamicList<int> pFc;
+        forAll(p_.boundaryField(), patchi)
+        {
+            if (!p_.boundaryField()[patchi].coupled()) continue;
+            const processorFvPatch& pp =
+                refCast<const processorFvPatch>
+                (
+                    mesh.boundary()[patchi]
+                );
+            pNbr.append(pp.neighbProcNo());
+            pNF.append(pp.size());
+            const labelUList& fc = pp.faceCells();
+            forAll(fc, k) { pFc.append(fc[k]); }
+        }
+
+        const double gnCells = returnReduce(nc, sumOp<label>());
+        if (rgpPEqnParArm
+            (
+                pNbr.size(),
+                pNbr.size() ? pNbr.begin() : nullptr,
+                pNbr.size() ? pNF.begin() : nullptr,
+                pNbr.size() ? pFc.begin() : nullptr,
+                gnCells
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnParArm: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+        gpuPEqnParB_.setSize(max(pFc.size(), label(1)));
     }
 
     gpuPEqnArmed_ = true;
@@ -662,13 +713,36 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         label nbf = 0;
         forAll(p.boundaryField(), patchi)
         {
-            if (p.boundaryField()[patchi].coupled())
+            if
+            (
+                p.boundaryField()[patchi].coupled()
+             && !isA<processorFvPatchScalarField>
+                (
+                    p.boundaryField()[patchi]
+                )
+            )
             {
                 FatalErrorInFunction
-                    << "gpuPEqn (v1) does not support coupled patches"
+                    << "gpuPEqn (v1) supports processor coupling only"
                     << exit(FatalError);
             }
             nbf += p.boundaryField()[patchi].size();
+        }
+
+        if (Pstream::parRun())
+        {
+            if (gpuPEqnSolver_ != "pcg")
+            {
+                FatalErrorInFunction
+                    << "parallel gpuPEqn supports the pcg solver only"
+                    << exit(FatalError);
+            }
+            if (gpuPEqnCheck_)
+            {
+                FatalErrorInFunction
+                    << "gpuPEqnCheck is serial-only"
+                    << exit(FatalError);
+            }
         }
 
         // ── 1회 아밍: 정적 메시 (owner/neigh, magSf*deltaCoeffs, V) ──
@@ -682,6 +756,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         double* phiBA  = bSrcA + nbf;
         {
             label off = 0;
+            label offPar = 0;
             forAll(p.boundaryField(), patchi)
             {
                 const fvPatchScalarField& pp = p.boundaryField()[patchi];
@@ -699,8 +774,24 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     )
                    *mesh.magSf().boundaryField()[patchi]
                 );
-                const scalarField gic(pp.gradientInternalCoeffs());
-                const scalarField gbc(pp.gradientBoundaryCoeffs());
+                // coupled 패치는 무인자 gradient*Coeffs()가 미구현 —
+                // 패치 deltaCoeffs 오버로드 사용 (직교 스킴 1:1)
+                const scalarField pdc
+                (
+                    mesh.deltaCoeffs().boundaryField()[patchi]
+                );
+                const scalarField gic
+                (
+                    pp.coupled()
+                  ? pp.gradientInternalCoeffs(pdc)
+                  : pp.gradientInternalCoeffs()
+                );
+                const scalarField gbc
+                (
+                    pp.coupled()
+                  ? pp.gradientBoundaryCoeffs(pdc)
+                  : pp.gradientBoundaryCoeffs()
+                );
                 const scalarField phb
                 (
                     devChain
@@ -712,17 +803,44 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                   : scalarField(tphiHbyAv().boundaryField()[patchi])
                 );
 
-                for (label k = 0; k < np; k++)
+                if (pp.coupled())
                 {
-                    bDiagA[off + k] = -pGamma[k]*gic[k];
-                    bSrcA[off + k]  =  pGamma[k]*gbc[k];
-                    phiBA[off + k]  =  phb[k];
+                    // processor 패치: iC는 diag로(동일 공식), 커플링
+                    // 계수 bC(=+pGamma*gbc)는 인터페이스 SpMV로 —
+                    // 소스에 접지 않는다 (OF boundaryCoeffs 규약)
+                    for (label k = 0; k < np; k++)
+                    {
+                        bDiagA[off + k] = -pGamma[k]*gic[k];
+                        bSrcA[off + k]  = 0;
+                        phiBA[off + k]  = phb[k];
+                        gpuPEqnParB_[offPar + k] = pGamma[k]*gbc[k];
+                    }
+                    offPar += np;
+                }
+                else
+                {
+                    for (label k = 0; k < np; k++)
+                    {
+                        bDiagA[off + k] = -pGamma[k]*gic[k];
+                        bSrcA[off + k]  =  pGamma[k]*gbc[k];
+                        phiBA[off + k]  =  phb[k];
+                    }
                 }
                 off += np;
             }
+
+            if (offPar > 0 && rgpPEqnParCoeffs(gpuPEqnParB_.begin()))
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnParCoeffs: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
         }
 
-        const bool needRef = p.needReference();
+        // 병렬: refCell은 소유 랭크에서만 유효(타 랭크 -1) — OF
+        // setReference와 동일하게 소유 랭크만 diag/b를 수정한다
+        const bool needRef =
+            p.needReference() && pressureReference.refCell() >= 0;
         const label refCell = needRef ? pressureReference.refCell() : 0;
         const scalar refValue = needRef ? pressureReference.refValue() : 0;
         const scalar dtInv = LTS ? 1.0 : 1.0/runTime.deltaTValue();
@@ -1037,7 +1155,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
             // 경계: fvMatrix::flux() 규약 — iC*p_internal - bC
             // (devChain: rhof_b = rho_b, phiHbyAv_b = HbyA_b & Sf_b)
+            // processor 패치: bC 기여는 인터페이스 계수 × 이웃 p —
+            // cBC 직후라 pp가 이웃 랭크의 p를 담고 있다
             label off = 0;
+            label offPar = 0;
             forAll(p.boundaryField(), patchi)
             {
                 const fvPatchScalarField& pp = p.boundaryField()[patchi];
@@ -1063,11 +1184,25 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 );
                 scalarField& phibf = phi.boundaryFieldRef()[patchi];
 
-                for (label k = 0; k < np; k++)
+                if (pp.coupled())
                 {
-                    const scalar fluxB =
-                        bDiagA[off + k]*pi[k] - bSrcA[off + k];
-                    phibf[k] = rfb[k]*(phb[k] + fluxB);
+                    for (label k = 0; k < np; k++)
+                    {
+                        const scalar fluxB =
+                            bDiagA[off + k]*pi[k]
+                          - gpuPEqnParB_[offPar + k]*pp[k];
+                        phibf[k] = rfb[k]*(phb[k] + fluxB);
+                    }
+                    offPar += np;
+                }
+                else
+                {
+                    for (label k = 0; k < np; k++)
+                    {
+                        const scalar fluxB =
+                            bDiagA[off + k]*pi[k] - bSrcA[off + k];
+                        phibf[k] = rfb[k]*(phb[k] + fluxB);
+                    }
                 }
                 off += np;
             }
