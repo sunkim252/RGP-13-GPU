@@ -70,6 +70,10 @@ namespace
         double *bDiag3 = nullptr, *bSrc3 = nullptr;   // [3*nbf]
         double *workDiag = nullptr, *workB = nullptr;
         double *H = nullptr;                          // [nc] 성분 작업
+        double *grad9 = nullptr;                      // [9*nc] grad(U)
+        double *src3 = nullptr, *gradP = nullptr;     // [3*nc]
+        double *UB3 = nullptr, *bfx3 = nullptr;       // [3*nbf]
+        double *bg9 = nullptr;                        // [9*nbf]
     } gU;
 
     struct PBuf
@@ -109,7 +113,8 @@ namespace
             &gST.src, &gST.phi, &gST.wLim, &gST.lower, &gST.grad,
             &gST.bPsi, &gST.rA0, &gST.sA, &gST.yz, &gST.AyA, &gST.AzA,
             &gU.diag, &gU.upper, &gU.lower, &gU.b3, &gU.U3,
-            &gU.bDiag3, &gU.bSrc3, &gU.workDiag, &gU.workB, &gU.H
+            &gU.bDiag3, &gU.bSrc3, &gU.workDiag, &gU.workB, &gU.H,
+            &gU.grad9, &gU.src3, &gU.gradP, &gU.UB3, &gU.bfx3, &gU.bg9
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gM.nCells = gM.nIntFaces = gM.nBFaces = 0;
@@ -644,6 +649,205 @@ __global__ void uHBnd
         (avIC - bDiag3[(size_t)cmpt*nbf + k])*U3[(size_t)cmpt*nc + c]
       + bSrc3[(size_t)cmpt*nbf + k]
     );
+}
+
+//- 벡터장 Gauss linear 그래디언트: g9[(3i+j)*nc+c] += Sf_i * Uf_j
+__global__ void uVecGradFace
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin, const double* __restrict__ sf,
+    const double* __restrict__ U3, double* __restrict__ g9
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const int o = own[f], n = nei[f];
+    const double w = wLin[f];
+    for (int j = 0; j < 3; j++)
+    {
+        const double uf =
+            w*U3[(size_t)j*nc + o] + (1.0 - w)*U3[(size_t)j*nc + n];
+        for (int i = 0; i < 3; i++)
+        {
+            const double c = sf[(size_t)i*nf + f]*uf;
+            atomicAdd(&g9[(size_t)(3*i + j)*nc + o],  c);
+            atomicAdd(&g9[(size_t)(3*i + j)*nc + n], -c);
+        }
+    }
+}
+
+__global__ void uVecGradBnd
+(
+    const int nbf, const int nc,
+    const int* __restrict__ bfc, const double* __restrict__ bSf,
+    const double* __restrict__ UB3, double* __restrict__ g9
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nbf) return;
+    for (int j = 0; j < 3; j++)
+    {
+        const double ub = UB3[(size_t)j*nbf + k];
+        for (int i = 0; i < 3; i++)
+        {
+            atomicAdd
+            (
+                &g9[(size_t)(3*i + j)*nc + bfc[k]],
+                bSf[(size_t)i*nbf + k]*ub
+            );
+        }
+    }
+}
+
+__global__ void uGrad9DivV
+(
+    const int nc, const double* __restrict__ V, double* __restrict__ g9
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    for (int m = 0; m < 9; m++) { g9[(size_t)m*nc + i] /= V[i]; }
+}
+
+//- 경계 셀의 gradU 채집 (호스트가 경계 보정/명시항 X_b 계산용)
+__global__ void uGradGather
+(
+    const int nbf, const int nc, const int* __restrict__ bfc,
+    const double* __restrict__ g9, double* __restrict__ bg9
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nbf) return;
+    for (int m = 0; m < 9; m++)
+    {
+        bg9[(size_t)m*nbf + k] = g9[(size_t)m*nc + bfc[k]];
+    }
+}
+
+//- limitedLinearV(k=1) 가중치 (OF NVDVTVDV::r 1:1 — guard 방향 주의)
+__global__ void uLimVWeights
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin, const double* __restrict__ dvec,
+    const double* __restrict__ phi, const double* __restrict__ U3,
+    const double* __restrict__ g9, double* __restrict__ w
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const int o = own[f], n = nei[f];
+
+    double gfv[3];
+    double gradf = 0.0;
+    for (int j = 0; j < 3; j++)
+    {
+        gfv[j] = U3[(size_t)j*nc + n] - U3[(size_t)j*nc + o];
+        gradf += gfv[j]*gfv[j];
+    }
+
+    const int c = (phi[f] > 0.0) ? o : n;
+    double gradcf = 0.0;
+    for (int j = 0; j < 3; j++)
+    {
+        double gcfj = 0.0;
+        for (int i = 0; i < 3; i++)
+        {
+            gcfj += dvec[(size_t)i*nf + f]*g9[(size_t)(3*i + j)*nc + c];
+        }
+        gradcf += gfv[j]*gcfj;
+    }
+
+    double r;
+    if (fabs(gradcf) >= 1000.0*fabs(gradf))
+    {
+        const double sg = (gradcf >= 0.0) ? 1.0 : -1.0;
+        const double sf2 = (gradf >= 0.0) ? 1.0 : -1.0;
+        r = 2.0*1000.0*sg*sf2 - 1.0;
+    }
+    else
+    {
+        r = 2.0*(gradcf/gradf) - 1.0;
+    }
+
+    const double lim = fmax(fmin(2.0*r, 1.0), 0.0);
+    w[f] = lim*wLin[f] + (1.0 - lim)*((phi[f] >= 0.0) ? 1.0 : 0.0);
+}
+
+//- 명시항 div(mu*dev2(T(gradU))) 내부면 플럭스: flux_j = Sf_i Xf_ij,
+//  X_ij = mu*(gradU_ji - (2/3) delta_ij tr(gradU)), Xf = 선형보간
+__global__ void uDevTauFlux
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin, const double* __restrict__ sf,
+    const double* __restrict__ mu, const double* __restrict__ g9,
+    double* __restrict__ src3
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const int o = own[f], n = nei[f];
+    const double w = wLin[f];
+
+    double Xo[9], Xn[9];
+    const double tro =
+        g9[(size_t)0*nc + o] + g9[(size_t)4*nc + o] + g9[(size_t)8*nc + o];
+    const double trn =
+        g9[(size_t)0*nc + n] + g9[(size_t)4*nc + n] + g9[(size_t)8*nc + n];
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = 0; j < 3; j++)
+        {
+            const double to = g9[(size_t)(3*j + i)*nc + o]
+                - ((i == j) ? (2.0/3.0)*tro : 0.0);
+            const double tn = g9[(size_t)(3*j + i)*nc + n]
+                - ((i == j) ? (2.0/3.0)*trn : 0.0);
+            Xo[3*i + j] = mu[o]*to;
+            Xn[3*i + j] = mu[n]*tn;
+        }
+    }
+
+    for (int j = 0; j < 3; j++)
+    {
+        double flux = 0.0;
+        for (int i = 0; i < 3; i++)
+        {
+            flux += sf[(size_t)i*nf + f]
+                   *(w*Xo[3*i + j] + (1.0 - w)*Xn[3*i + j]);
+        }
+        atomicAdd(&src3[(size_t)j*nc + o],  flux);
+        atomicAdd(&src3[(size_t)j*nc + n], -flux);
+    }
+}
+
+//- 명시항 경계 기여 (호스트 계산 [3*nbf]) 산입
+__global__ void uBndSrcAdd
+(
+    const int nbf, const int nc, const int* __restrict__ bfc,
+    const double* __restrict__ bfx3, double* __restrict__ src3
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nbf) return;
+    for (int j = 0; j < 3; j++)
+    {
+        atomicAdd
+        (
+            &src3[(size_t)j*nc + bfc[k]], bfx3[(size_t)j*nbf + k]
+        );
+    }
+}
+
+__global__ void uSrc3DivV
+(
+    const int nc, const double* __restrict__ V, double* __restrict__ s3
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    for (int j = 0; j < 3; j++) { s3[(size_t)j*nc + i] /= V[i]; }
 }
 
 //- 솔브 전용 소스: workB += s*g*V (grad p는 저장 소스가 아니라
@@ -1524,6 +1728,146 @@ int rgpSTEqnDump
 }
 
 
+//- UEqn prep 1/2: grad(U) 디바이스 계산 + 경계셀 gradU 채집(D2H).
+//  UBuf 지연 할당도 여기서 (Solve보다 먼저 불리므로).
+int rgpUEqnGrad
+(
+    const double* U3, const double* UB3, double* bGrad9
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gSTM.wLin)
+    {
+        snprintf(gPErr, sizeof(gPErr), "ueqn: ST mesh not uploaded");
+        return -1;
+    }
+
+    cudaError_t e;
+    {
+        const size_t bc = (size_t)nc*sizeof(double);
+        const size_t bf = (size_t)nf*sizeof(double);
+        const size_t nb1 = (size_t)(nbf > 0 ? nbf : 1);
+        struct { double** d; size_t bytes; } al[] =
+        {
+            {&gU.diag, bc}, {&gU.upper, bf}, {&gU.lower, bf},
+            {&gU.b3, 3*bc}, {&gU.U3, 3*bc},
+            {&gU.bDiag3, 3*nb1*sizeof(double)},
+            {&gU.bSrc3, 3*nb1*sizeof(double)},
+            {&gU.workDiag, bc}, {&gU.workB, bc}, {&gU.H, bc},
+            {&gU.grad9, 9*bc}, {&gU.src3, 3*bc}, {&gU.gradP, 3*bc},
+            {&gU.UB3, 3*nb1*sizeof(double)},
+            {&gU.bfx3, 3*nb1*sizeof(double)},
+            {&gU.bg9, 9*nb1*sizeof(double)}
+        };
+        for (auto& a : al)
+        {
+            if (*a.d) continue;
+            if ((e = cudaMalloc(a.d, a.bytes)) != cudaSuccess)
+                return pfail(e, "ueqn/malloc");
+        }
+    }
+
+    if ((e = cudaMemcpy(gU.U3, U3, (size_t)3*nc*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "ueqnGrad/H2D U");
+    if (nbf > 0)
+    {
+        if ((e = cudaMemcpy(gU.UB3, UB3, (size_t)3*nbf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "ueqnGrad/H2D UB");
+    }
+
+    if ((e = cudaMemset(gU.grad9, 0, (size_t)9*nc*sizeof(double)))
+        != cudaSuccess) return pfail(e, "ueqnGrad/memset");
+    rgppeqn::uVecGradFace<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf, gU.U3, gU.grad9);
+    if (nbf > 0)
+    {
+        rgppeqn::uVecGradBnd<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gSTM.bSf, gU.UB3, gU.grad9);
+    }
+    rgppeqn::uGrad9DivV<<<nb(nc), BS>>>(nc, gM.V, gU.grad9);
+    if (nbf > 0)
+    {
+        rgppeqn::uGradGather<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gU.grad9, gU.bg9);
+    }
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "ueqnGrad/launch");
+
+    if (nbf > 0)
+    {
+        if ((e = cudaMemcpy(bGrad9, gU.bg9,
+                            (size_t)9*nbf*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "ueqnGrad/D2H bg9");
+    }
+    return 0;
+}
+
+
+//- UEqn prep 2/2: limitedLinearV 가중치 + 명시항(div dev2, 경계 기여
+//  bndFlux3 포함, per-volume) + grad(p) — 모두 디바이스 상주.
+int rgpUEqnPrep2
+(
+    const double* pHost, const double* pB,
+    const double* mu, const double* phiInt,
+    const double* bndFlux3
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+
+    cudaError_t e;
+    struct { double* d; const double* s; size_t n; } up[] =
+    {
+        {gB.pOld, pHost, (size_t)nc}, {gST.bPsi, pB, (size_t)nbf},
+        {gST.gamma, mu, (size_t)nc}, {gST.phi, phiInt, (size_t)nf},
+        {gU.bfx3, bndFlux3, (size_t)3*nbf}
+    };
+    for (auto& u : up)
+    {
+        if (u.n == 0 || !u.s) continue;
+        if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "ueqnPrep/H2D");
+    }
+
+    // 가중치 (내부면; 경계 가중치는 BC 계수에서 미사용 — 호스트 참조)
+    rgppeqn::uLimVWeights<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.dvec, gST.phi,
+         gU.U3, gU.grad9, gST.wLim);
+
+    // 명시항: div(mu*dev2(T(gradU))) — 내부 플럭스 + 경계 기여 + /V
+    if ((e = cudaMemset(gU.src3, 0, (size_t)3*nc*sizeof(double)))
+        != cudaSuccess) return pfail(e, "ueqnPrep/memset src");
+    rgppeqn::uDevTauFlux<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf, gST.gamma,
+         gU.grad9, gU.src3);
+    if (nbf > 0 && bndFlux3)
+    {
+        rgppeqn::uBndSrcAdd<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gU.bfx3, gU.src3);
+    }
+    rgppeqn::uSrc3DivV<<<nb(nc), BS>>>(nc, gM.V, gU.src3);
+
+    // grad(p): 스칼라 Gauss linear (경계 값 포함)
+    if ((e = cudaMemset(gU.gradP, 0, (size_t)3*nc*sizeof(double)))
+        != cudaSuccess) return pfail(e, "ueqnPrep/memset gp");
+    rgppeqn::stGradFace<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf, gB.pOld, gU.gradP);
+    if (nbf > 0)
+    {
+        rgppeqn::stGradBFace<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gSTM.bSf, gST.bPsi, gU.gradP);
+    }
+    rgppeqn::stGradDivV<<<nb(nc), BS>>>(nc, gM.V, gU.gradP);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "ueqnPrep/launch");
+
+    return 0;
+}
+
+
 int rgpUEqnSolve
 (
     double dtInv,
@@ -1566,15 +1910,15 @@ int rgpUEqnSolve
         }
     }
 
-    // 입력 업로드 (rho/rhoOld/phi/w/mu는 gST 스테이징 재사용 — 일시적)
+    // 입력 업로드. w/srcExp3/gradP3가 null이면 rgpUEqnGrad/Prep2가
+    // 준비한 디바이스 상주본(gST.wLim/gU.src3/gU.gradP) 사용.
     struct { double* d; const double* s; size_t n; } up[] =
     {
         {gST.rho, rho, (size_t)nc}, {gST.rhoOld, rhoOld, (size_t)nc},
-        {gST.phi, phiInt, (size_t)nf}, {gST.wLim, w, (size_t)nf},
-        {gST.gamma, mu, (size_t)nc},
-        {gU.U3, U3, (size_t)3*nc},
-        {gST.psiOld, nullptr, 0},   // placeholder
-        {gU.b3, nullptr, 0},        // placeholder
+        {gST.phi, phiInt, phiInt ? (size_t)nf : 0},
+        {gST.wLim, w, w ? (size_t)nf : 0},
+        {gST.gamma, mu, mu ? (size_t)nc : 0},
+        {gU.U3, U3, U3 ? (size_t)3*nc : 0},
         {gU.bDiag3, bDiag3, (size_t)3*nbf},
         {gU.bSrc3, bSrc3, (size_t)3*nbf}
     };
@@ -1585,16 +1929,23 @@ int rgpUEqnSolve
                             cudaMemcpyHostToDevice)) != cudaSuccess)
             return pfail(e, "ueqn/H2D");
     }
-    // U3old, srcExp3는 셀 커널 입력 — gST.grad(3*nc) 재사용 + gST.src?
-    // 전용 스테이징: gST.grad = U3old, workB 임시 불가(1*nc) →
-    // U3old를 gST.grad에, srcExp3는 gU.b3에 업로드 후 커널이 in-place로
-    // b3를 완성한다 (읽기/쓰기 슬롯 동일하지만 셀별 독립이라 안전).
+    // U3old는 gST.grad 스테이징, srcExp3는 gU.b3(셀 커널이 in-place로
+    // b3 완성 — 셀별 독립이라 안전); null이면 gU.src3 → gU.b3 복사.
     if ((e = cudaMemcpy(gST.grad, U3old, (size_t)3*nc*sizeof(double),
                         cudaMemcpyHostToDevice)) != cudaSuccess)
         return pfail(e, "ueqn/H2D U3old");
-    if ((e = cudaMemcpy(gU.b3, srcExp3, (size_t)3*nc*sizeof(double),
-                        cudaMemcpyHostToDevice)) != cudaSuccess)
-        return pfail(e, "ueqn/H2D src");
+    if (srcExp3)
+    {
+        if ((e = cudaMemcpy(gU.b3, srcExp3, (size_t)3*nc*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "ueqn/H2D src");
+    }
+    else
+    {
+        if ((e = cudaMemcpy(gU.b3, gU.src3, (size_t)3*nc*sizeof(double),
+                            cudaMemcpyDeviceToDevice)) != cudaSuccess)
+            return pfail(e, "ueqn/D2D src");
+    }
 
     // ── 조립 ─────────────────────────────────────────────────────────
     rgppeqn::uCellAssemble<<<nb(nc), BS>>>
@@ -1606,10 +1957,14 @@ int rgpUEqnSolve
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "ueqn/assemble launch");
 
-    // grad p (솔브 전용 소스) — 조립 후 gST.grad 스테이징 재사용
-    if ((e = cudaMemcpy(gST.grad, gradP3, (size_t)3*nc*sizeof(double),
-                        cudaMemcpyHostToDevice)) != cudaSuccess)
-        return pfail(e, "ueqn/H2D gradP");
+    // grad p (솔브 전용 소스) — null이면 Prep2의 디바이스 상주본 사용
+    if (gradP3)
+    {
+        if ((e = cudaMemcpy(gU.gradP, gradP3,
+                            (size_t)3*nc*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "ueqn/H2D gradP");
+    }
 
     // ── 성분별 솔브 ──────────────────────────────────────────────────
     for (int c = 0; c < 3; c++)
@@ -1632,7 +1987,7 @@ int rgpUEqnSolve
                  gU.bSrc3 + (size_t)c*nbf, gU.workDiag, gU.workB);
         }
         rgppeqn::uAddVolSrc<<<nb(nc), BS>>>
-            (nc, -1.0, gST.grad + (size_t)c*nc, gM.V, gU.workB);
+            (nc, -1.0, gU.gradP + (size_t)c*nc, gM.V, gU.workB);
 
         if ((e = cudaMemcpy(gB.x, gU.U3 + (size_t)c*nc,
                             (size_t)nc*sizeof(double),

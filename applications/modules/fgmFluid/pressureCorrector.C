@@ -232,8 +232,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         }
 
         double* U3 = gpuUBuf_.begin();
-        double* rAUh = U3 + 9*nc;               // U3out 슬롯 재사용
-        double* H3 = U3 + 15*nc + 6*nbf;
+        double* rAUh = U3 + 6*nc;               // U3out 슬롯 재사용
+        double* H3 = U3 + 9*nc;
 
         {
             const vectorField& Uc = U.primitiveField();

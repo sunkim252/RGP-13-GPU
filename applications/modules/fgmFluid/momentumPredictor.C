@@ -124,61 +124,123 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             nbf += U.boundaryField()[patchi].size();
         }
 
-        // div(phi,U) 스킴의 실제 가중치 (Gauss 토큰 소비 후 구성)
-        ITstream divIs(mesh.schemes().div("div(phi,U)"));
-        const word gaussWord(divIs);
-        tmp<surfaceScalarField> twU
-        (
-            limitedSurfaceInterpolationScheme<vector>::New
-            (
-                mesh, phi, divIs
-            )().weights(U)
-        );
-        const surfaceScalarField& wU = twU();
-
-        // muEff = (rho*nuEff) — divDevTau/laplacian 계수 (이름 규약 유지:
-        // fvc::div 스킴 조회가 "div(((rho*nuEff)*dev2(T(grad(U)))))"와
-        // 일치해야 함)
+        // muEff = (rho*nuEff) — laplacian 계수 + 명시항/경계 계수용
         const volScalarField muEff(rho*momentumTransport->nuEff());
 
-        // 저장 소스: divDevTau의 fvc 항만. −grad p는 solve() 전용 임시
-        // 소스라 행렬 소스(H()에 반영되는)에 넣으면 안 된다 —
-        // OF의 solve(UEqn == -fvc::grad(p)) 의미론 그대로.
-        const volVectorField srcExp
-        (
-            fvc::div(muEff*dev2(T(fvc::grad(U))))
-        );
-        const volVectorField gradP(fvc::grad(p));
-
-        // SoA gather + 경계 계수
-        gpuUBuf_.setSize(15*nc + 6*nbf + 3*nc);
+        // SoA gather (v2: 물리 필드는 GPU — 호스트는 U/경계값만)
+        gpuUBuf_.setSize(12*nc + 22*nbf);
         double* U3 = gpuUBuf_.begin();          // [3*nc]
         double* U3old = U3 + 3*nc;
-        double* src3 = U3old + 3*nc;
-        double* U3out = src3 + 3*nc;
-        double* gp3 = U3out + 3*nc;             // [3*nc] grad p
-        double* bDiag3 = gp3 + 3*nc;            // [3*nbf]
+        double* U3out = U3old + 3*nc;
+        double* H3 = U3out + 3*nc;              // [3*nc] (pCorr)
+        double* UB3 = H3 + 3*nc;                // [3*nbf]
+        double* pB = UB3 + 3*nbf;               // [nbf]
+        double* bDiag3 = pB + nbf;              // [3*nbf]
         double* bSrc3 = bDiag3 + 3*nbf;
-        double* H3 = bSrc3 + 3*nbf;             // [3*nc] (pCorr에서 사용)
+        double* bFlux3 = bSrc3 + 3*nbf;         // [3*nbf] 명시항 경계
+        double* bGrad9 = bFlux3 + 3*nbf;        // [9*nbf]
         (void)H3;
 
         {
             const vectorField& Uc = U.primitiveField();
             const vectorField& Uo = U.oldTime().primitiveField();
-            const vectorField& sc = srcExp.primitiveField();
-            const vectorField& gp = gradP.primitiveField();
             for (label i = 0; i < nc; i++)
             {
                 for (label k = 0; k < 3; k++)
                 {
                     U3[k*nc + i] = Uc[i][k];
                     U3old[k*nc + i] = Uo[i][k];
-                    src3[k*nc + i] = sc[i][k];
-                    gp3[k*nc + i] = gp[i][k];
                 }
             }
         }
+        {
+            label off = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pp = U.boundaryField()[patchi];
+                const fvPatchScalarField& ppp = p.boundaryField()[patchi];
+                forAll(pp, f)
+                {
+                    for (label k = 0; k < 3; k++)
+                    {
+                        UB3[k*nbf + off + f] = pp[f][k];
+                    }
+                    pB[off + f] = ppp[f];
+                }
+                off += pp.size();
+            }
+        }
 
+        // 1) grad(U) 디바이스 + 경계셀 gradU 채집
+        if (rgpUEqnGrad(U3, UB3, bGrad9))
+        {
+            FatalErrorInFunction
+                << "rgpUEqnGrad: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        // 2) 명시항 경계 기여 (호스트, 패치 크기): gaussGrad 경계 보정
+        //    (gGrad_b = gGradI − n⊗(n·gGradI) + n⊗snGrad(U)) →
+        //    X_b = mu_b*dev2(T(gGrad_b)) → Sf_b & X_b
+        {
+            label off = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pp = U.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+
+                const vectorField nHat(mesh.boundary()[patchi].nf());
+                const vectorField snU(pp.snGrad());
+                const vectorField& Sfb =
+                    mesh.Sf().boundaryField()[patchi];
+                const scalarField& mub =
+                    muEff.boundaryField()[patchi];
+
+                for (label f = 0; f < np; f++)
+                {
+                    tensor g;
+                    for (label i = 0; i < 3; i++)
+                    {
+                        for (label j = 0; j < 3; j++)
+                        {
+                            g[3*i + j] =
+                                bGrad9[(3*i + j)*nbf + off + f];
+                        }
+                    }
+                    const vector n = nHat[f];
+                    // gaussGrad::correctBoundaryConditions
+                    const vector nDotG = n & g;
+                    const tensor gc(g - n*nDotG + n*snU[f]);
+                    const tensor X(mub[f]*dev2(gc.T()));
+                    const vector flux = Sfb[f] & X;
+                    for (label k = 0; k < 3; k++)
+                    {
+                        bFlux3[k*nbf + off + f] = flux[k];
+                    }
+                }
+                off += np;
+            }
+        }
+
+        // 3) 가중치/명시항/grad p 디바이스 준비
+        if
+        (
+            rgpUEqnPrep2
+            (
+                p.primitiveField().begin(), pB,
+                muEff.primitiveField().begin(),
+                phi.primitiveField().begin(), bFlux3
+            )
+        )
+        {
+            FatalErrorInFunction
+                << "rgpUEqnPrep2: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        // 4) 경계 행렬 계수 (BC 가중치: 본 케이스 BC 타입들은 w 미사용
+        //    — CD 가중치 전달)
         {
             label off = 0;
             forAll(U.boundaryField(), patchi)
@@ -188,20 +250,11 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                 if (np == 0) continue;
 
                 const scalarField& phb = phi.boundaryField()[patchi];
-                const vectorField vic
-                (
-                    pp.valueInternalCoeffs
-                    (
-                        wU.boundaryField()[patchi]
-                    )
-                );
-                const vectorField vbc
-                (
-                    pp.valueBoundaryCoeffs
-                    (
-                        wU.boundaryField()[patchi]
-                    )
-                );
+                const scalarField& wb =
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi];
+                const vectorField vic(pp.valueInternalCoeffs(wb));
+                const vectorField vbc(pp.valueBoundaryCoeffs(wb));
                 const scalarField gMsf
                 (
                     muEff.boundaryField()[patchi]
@@ -251,10 +304,10 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             1.0/runTime.deltaTValue(),
             rho.primitiveField().begin(),
             rho.oldTime().primitiveField().begin(),
-            U3old, U3,
-            phi.primitiveField().begin(), wU.primitiveField().begin(),
-            muEff.primitiveField().begin(),
-            src3, gp3, bDiag3, bSrc3, solveCmpt,
+            U3old, nullptr /*U3: 디바이스 상주*/,
+            nullptr /*phi*/, nullptr /*w*/, nullptr /*mu*/,
+            nullptr /*srcExp3*/, nullptr /*gradP3*/,
+            bDiag3, bSrc3, solveCmpt,
             tol, rtol, maxIter,
             U3out, res0, resF, iters
         );

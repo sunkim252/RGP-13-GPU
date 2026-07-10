@@ -116,6 +116,20 @@ int rgpSTWeightsEnd(void);
     Jacobi-BiCGStab 솔브. 행렬은 스텝 내내 디바이스 상주 —
     rgpUEqnAH가 pCorr용 rAU=1/A()와 H(U)를 산출(fvMatrix::D/H 1:1).
     SoA 규약: [3*n], 경계 배열 [3*nbf].                                */
+/*  UEqn prep (v2): 물리 필드도 GPU —
+    Grad: U 업로드 → grad(U) 디바이스 + 경계셀 gradU 채집(D2H, 호스트가
+    경계 보정·명시항 X_b 계산용). Prep2: limitedLinearV 가중치(NVDVTVDV
+    1:1) + div(mu*dev2(T(gradU)))(경계 기여 bndFlux3 산입) + grad(p).
+    이후 rgpUEqnSolve에 w/mu/srcExp3/gradP3/U3/phiInt를 null로 넘기면
+    디바이스 상주본 사용.                                              */
+int rgpUEqnGrad(const double* U3, const double* UB3, double* bGrad9);
+int rgpUEqnPrep2
+(
+    const double* pHost, const double* pB,
+    const double* mu, const double* phiInt,
+    const double* bndFlux3
+);
+
 int rgpUEqnSolve
 (
     double dtInv,
