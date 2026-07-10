@@ -239,6 +239,10 @@ protected:
         //  controlDict libs에 libRGP13amgx.so 필요)
         word gpuPEqnSolver_;
 
+        //- pcg 전처리기: "jacobi"(기본) | "dic"(멀티컬러 DIC —
+        //  그리디 컬러링 색-레벨 병렬 스윕, 반복수 절감 vs 스윕 비용)
+        word gpuPEqnPrecon_;
+
         //- pEqnGPU CSR nnz (amgx 경로, 아밍 시 설정)
         mutable label gpuPEqnNnz_;
 

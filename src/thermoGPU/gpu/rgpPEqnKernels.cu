@@ -103,6 +103,23 @@ namespace
         double *rdt = nullptr;   // LTS rDeltaT [nc] (없으면 균일 dtInv)
     } gB;
 
+    //- 멀티컬러 DIC 전처리기 (gpuPEqnPrecon dic) — 그리디 셀 컬러링으로
+    //  OF DICPreconditioner의 순차 스윕을 색-레벨 병렬로 변환.
+    //  면은 fwd(상위색 기준)/bwd(하위색 기준) 그룹으로 1회씩만 읽힌다.
+    //  구조는 메시 종속(지연 아밍), rD는 솔브마다 재계산.
+    struct DICBuf
+    {
+        int nColors = 0;
+        int *colorOf = nullptr;    // [nc] 디바이스
+        int *colCells = nullptr;   // [nc] 색 순서로 그룹된 셀 (디바이스)
+        int *fwdFace = nullptr;    // [nf] 상위색 기준 그룹 (디바이스)
+        int *bwdFace = nullptr;    // [nf] 하위색 기준 그룹 (디바이스)
+        std::vector<int> hColStart, hFwdStart, hBwdStart;   // [nCol+1]
+        double *rD = nullptr, *acc = nullptr;               // [nc]
+    } gDIC;
+
+    int gPrecon = 0;   // 0=Jacobi, 1=multicolour DIC
+
     void pFreeAll()
     {
         int* ip[] = {gM.own, gM.nei, gM.bfc,
@@ -135,6 +152,17 @@ namespace
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
+
+        int* dic_i[] = {gDIC.colorOf, gDIC.colCells,
+                        gDIC.fwdFace, gDIC.bwdFace};
+        for (auto p : dic_i) { if (p) cudaFree(p); }
+        gDIC.colorOf = gDIC.colCells = gDIC.fwdFace = gDIC.bwdFace = nullptr;
+        if (gDIC.rD)  { cudaFree(gDIC.rD);  gDIC.rD = nullptr; }
+        if (gDIC.acc) { cudaFree(gDIC.acc); gDIC.acc = nullptr; }
+        gDIC.hColStart.clear(); gDIC.hFwdStart.clear();
+        gDIC.hBwdStart.clear();
+        gDIC.nColors = 0;
+
         gU.assembled = false;
         gM.nCells = gM.nIntFaces = gM.nBFaces = 0;
     }
@@ -311,6 +339,121 @@ __global__ void cgUpdate
     if (i >= n) return;
     x[i] += alpha*pA[i];
     r[i] -= alpha*wA[i];
+}
+
+//- 방향 갱신: pA = z + beta*pA (beta=0이면 초기화) — 전처리기 공용
+__global__ void dirUpdate
+(
+    const int n, const double* __restrict__ z, const double beta,
+    double* __restrict__ pA
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    pA[i] = (beta == 0.0) ? z[i] : z[i] + beta*pA[i];
+}
+
+//- DIC rD 셋업 면 패스 (fwd 그룹 색 c): acc[hi] += upper^2 * rD[lo]
+//  (하위색 rD는 이전 색 패스에서 확정 — OF rD 재귀의 색-순서 등가)
+__global__ void dicSetupFace
+(
+    const int n, const int* __restrict__ fList,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const int* __restrict__ colorOf,
+    const double* __restrict__ upper,
+    const double* __restrict__ rD, double* __restrict__ acc
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int f = fList[k];
+    const int io = own[f], in = nei[f];
+    const bool ownHi = colorOf[io] > colorOf[in];
+    const int hi = ownHi ? io : in;
+    const int lo = ownHi ? in : io;
+    atomicAdd(&acc[hi], upper[f]*upper[f]*rD[lo]);
+}
+
+//- DIC rD 셋업 셀 패스 (색 c 셀): rD = 1/(diag - acc)
+__global__ void dicSetupCell
+(
+    const int n, const int* __restrict__ cList,
+    const double* __restrict__ diag, const double* __restrict__ acc,
+    double* __restrict__ rD
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int i = cList[k];
+    rD[i] = 1.0/(diag[i] - acc[i]);
+}
+
+//- DIC forward 면 패스 (fwd 그룹 색 c): acc[hi] += upper * z[lo]
+__global__ void dicFwdFace
+(
+    const int n, const int* __restrict__ fList,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const int* __restrict__ colorOf,
+    const double* __restrict__ upper,
+    const double* __restrict__ z, double* __restrict__ acc
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int f = fList[k];
+    const int io = own[f], in = nei[f];
+    const bool ownHi = colorOf[io] > colorOf[in];
+    const int hi = ownHi ? io : in;
+    const int lo = ownHi ? in : io;
+    atomicAdd(&acc[hi], upper[f]*z[lo]);
+}
+
+//- DIC forward 셀 패스: z = rD*(r - acc)
+__global__ void dicFwdCell
+(
+    const int n, const int* __restrict__ cList,
+    const double* __restrict__ rD, const double* __restrict__ r,
+    const double* __restrict__ acc, double* __restrict__ z
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int i = cList[k];
+    z[i] = rD[i]*(r[i] - acc[i]);
+}
+
+//- DIC backward 면 패스 (bwd 그룹 색 c): acc[lo] += upper * z[hi]
+__global__ void dicBwdFace
+(
+    const int n, const int* __restrict__ fList,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const int* __restrict__ colorOf,
+    const double* __restrict__ upper,
+    const double* __restrict__ z, double* __restrict__ acc
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int f = fList[k];
+    const int io = own[f], in = nei[f];
+    const bool ownHi = colorOf[io] > colorOf[in];
+    const int hi = ownHi ? io : in;
+    const int lo = ownHi ? in : io;
+    atomicAdd(&acc[lo], upper[f]*z[hi]);
+}
+
+//- DIC backward 셀 패스: z -= rD*acc
+__global__ void dicBwdCell
+(
+    const int n, const int* __restrict__ cList,
+    const double* __restrict__ rD, const double* __restrict__ acc,
+    double* __restrict__ z
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int i = cList[k];
+    z[i] -= rD[i]*acc[i];
 }
 
 //- LDU → CSR 값 산포 (구조는 정적, 슬롯맵으로 O(1) 기록)
@@ -1149,6 +1292,224 @@ namespace
                 (nf, gM.own, gM.nei, gB.upper, x, y);
         }
     }
+    //- 멀티컬러 DIC 아밍(지연, 메시 종속): own/nei를 D2H로 회수해
+    //  그리디 first-fit 컬러링 → 셀 색-그룹 + 면 fwd/bwd 그룹 구축.
+    //  구조 배열은 pFreeAll이 해제(메시 재아밍 시 자동 재구축).
+    int dicArm()
+    {
+        if (gDIC.rD) return 0;   // armed
+
+        const int nc = gM.nCells, nf = gM.nIntFaces;
+        cudaError_t e;
+
+        // own/nei 호스트 회수 (CSR 경로가 hOwn/hNei를 이미 보관했으면 재사용)
+        std::vector<int> hOwn, hNei;
+        const std::vector<int>* pOwn = &gM.hOwn;
+        const std::vector<int>* pNei = &gM.hNei;
+        if ((int)gM.hOwn.size() != nf)
+        {
+            hOwn.resize(nf); hNei.resize(nf);
+            if ((e = cudaMemcpy(hOwn.data(), gM.own, (size_t)nf*sizeof(int),
+                                cudaMemcpyDeviceToHost)) != cudaSuccess)
+                return pfail(e, "dic/D2H own");
+            if ((e = cudaMemcpy(hNei.data(), gM.nei, (size_t)nf*sizeof(int),
+                                cudaMemcpyDeviceToHost)) != cudaSuccess)
+                return pfail(e, "dic/D2H nei");
+            pOwn = &hOwn; pNei = &hNei;
+        }
+        const std::vector<int>& own = *pOwn;
+        const std::vector<int>& nei = *pNei;
+
+        // 셀 인접 CSR (컬러링용)
+        std::vector<int> adjStart(nc + 1, 0), adj(2*(size_t)nf);
+        for (int f = 0; f < nf; f++)
+        {
+            adjStart[own[f] + 1]++;
+            adjStart[nei[f] + 1]++;
+        }
+        for (int i = 0; i < nc; i++) adjStart[i + 1] += adjStart[i];
+        {
+            std::vector<int> cur(adjStart.begin(), adjStart.end() - 1);
+            for (int f = 0; f < nf; f++)
+            {
+                adj[cur[own[f]]++] = nei[f];
+                adj[cur[nei[f]]++] = own[f];
+            }
+        }
+
+        // 그리디 first-fit 컬러링 (구조격자 자연순서 → 체커보드 2색,
+        // 일반 비정렬 hex는 차수+1 이하)
+        std::vector<int> color(nc, -1), mark(64, -1);
+        int nCol = 0;
+        for (int i = 0; i < nc; i++)
+        {
+            for (int k = adjStart[i]; k < adjStart[i + 1]; k++)
+            {
+                const int cj = color[adj[k]];
+                if (cj >= 0 && cj < (int)mark.size()) mark[cj] = i;
+            }
+            int c = 0;
+            while (c < (int)mark.size() && mark[c] == i) c++;
+            if (c >= (int)mark.size())
+            {
+                snprintf(gPErr, sizeof(gPErr), "dic: >64 colours");
+                return -1;
+            }
+            color[i] = c;
+            if (c + 1 > nCol) nCol = c + 1;
+        }
+
+        // 셀 색-그룹
+        gDIC.hColStart.assign(nCol + 1, 0);
+        for (int i = 0; i < nc; i++) gDIC.hColStart[color[i] + 1]++;
+        for (int c = 0; c < nCol; c++)
+        {
+            gDIC.hColStart[c + 1] += gDIC.hColStart[c];
+        }
+        std::vector<int> colCells(nc);
+        {
+            std::vector<int> cur(gDIC.hColStart.begin(),
+                                 gDIC.hColStart.end() - 1);
+            for (int i = 0; i < nc; i++) colCells[cur[color[i]]++] = i;
+        }
+
+        // 면 그룹: fwd = 상위색 기준, bwd = 하위색 기준 (면당 정확히 1회)
+        gDIC.hFwdStart.assign(nCol + 1, 0);
+        gDIC.hBwdStart.assign(nCol + 1, 0);
+        for (int f = 0; f < nf; f++)
+        {
+            const int co = color[own[f]], cn = color[nei[f]];
+            gDIC.hFwdStart[(co > cn ? co : cn) + 1]++;
+            gDIC.hBwdStart[(co < cn ? co : cn) + 1]++;
+        }
+        for (int c = 0; c < nCol; c++)
+        {
+            gDIC.hFwdStart[c + 1] += gDIC.hFwdStart[c];
+            gDIC.hBwdStart[c + 1] += gDIC.hBwdStart[c];
+        }
+        std::vector<int> fwdFace(nf), bwdFace(nf);
+        {
+            std::vector<int> curF(gDIC.hFwdStart.begin(),
+                                  gDIC.hFwdStart.end() - 1);
+            std::vector<int> curB(gDIC.hBwdStart.begin(),
+                                  gDIC.hBwdStart.end() - 1);
+            for (int f = 0; f < nf; f++)
+            {
+                const int co = color[own[f]], cn = color[nei[f]];
+                fwdFace[curF[co > cn ? co : cn]++] = f;
+                bwdFace[curB[co < cn ? co : cn]++] = f;
+            }
+        }
+
+        // 디바이스 업로드
+        struct { int** d; const int* s; size_t n; } it[] =
+        {
+            {&gDIC.colorOf, color.data(), (size_t)nc},
+            {&gDIC.colCells, colCells.data(), (size_t)nc},
+            {&gDIC.fwdFace, fwdFace.data(), (size_t)nf},
+            {&gDIC.bwdFace, bwdFace.data(), (size_t)nf}
+        };
+        for (auto& a : it)
+        {
+            if ((e = cudaMalloc(a.d, a.n*sizeof(int))) != cudaSuccess)
+                return pfail(e, "dic/malloc");
+            if ((e = cudaMemcpy(*a.d, a.s, a.n*sizeof(int),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "dic/H2D");
+        }
+        if ((e = cudaMalloc(&gDIC.rD, (size_t)nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "dic/malloc rD");
+        if ((e = cudaMalloc(&gDIC.acc, (size_t)nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "dic/malloc acc");
+
+        gDIC.nColors = nCol;
+        return 0;
+    }
+
+    //- DIC rD 재계산 (솔브마다 — 계수 변화 반영). 색 오름차순.
+    int dicSetup()
+    {
+        int rc = dicArm();
+        if (rc) return rc;
+
+        const int nc = gM.nCells;
+        cudaError_t e;
+        if ((e = cudaMemset(gDIC.acc, 0, (size_t)nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "dic/setup memset");
+
+        for (int c = 0; c < gDIC.nColors; c++)
+        {
+            const int nF = gDIC.hFwdStart[c + 1] - gDIC.hFwdStart[c];
+            if (nF > 0)
+            {
+                rgppeqn::dicSetupFace<<<nb(nF), BS>>>
+                    (nF, gDIC.fwdFace + gDIC.hFwdStart[c],
+                     gM.own, gM.nei, gDIC.colorOf,
+                     gB.upper, gDIC.rD, gDIC.acc);
+            }
+            const int nC = gDIC.hColStart[c + 1] - gDIC.hColStart[c];
+            if (nC > 0)
+            {
+                rgppeqn::dicSetupCell<<<nb(nC), BS>>>
+                    (nC, gDIC.colCells + gDIC.hColStart[c],
+                     gB.diag, gDIC.acc, gDIC.rD);
+            }
+        }
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return pfail(e, "dic/setup launch");
+        return 0;
+    }
+
+    //- z = M^-1 r  (forward 색 오름차순 → backward 색 내림차순)
+    int dicApply(const double* r, double* z)
+    {
+        const int nc = gM.nCells;
+        cudaError_t e;
+
+        if ((e = cudaMemset(gDIC.acc, 0, (size_t)nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "dic/fwd memset");
+        for (int c = 0; c < gDIC.nColors; c++)
+        {
+            const int nF = gDIC.hFwdStart[c + 1] - gDIC.hFwdStart[c];
+            if (nF > 0)
+            {
+                rgppeqn::dicFwdFace<<<nb(nF), BS>>>
+                    (nF, gDIC.fwdFace + gDIC.hFwdStart[c],
+                     gM.own, gM.nei, gDIC.colorOf, gB.upper, z, gDIC.acc);
+            }
+            const int nC = gDIC.hColStart[c + 1] - gDIC.hColStart[c];
+            if (nC > 0)
+            {
+                rgppeqn::dicFwdCell<<<nb(nC), BS>>>
+                    (nC, gDIC.colCells + gDIC.hColStart[c],
+                     gDIC.rD, r, gDIC.acc, z);
+            }
+        }
+
+        if ((e = cudaMemset(gDIC.acc, 0, (size_t)nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "dic/bwd memset");
+        for (int c = gDIC.nColors - 1; c >= 0; c--)
+        {
+            const int nF = gDIC.hBwdStart[c + 1] - gDIC.hBwdStart[c];
+            if (nF > 0)
+            {
+                rgppeqn::dicBwdFace<<<nb(nF), BS>>>
+                    (nF, gDIC.bwdFace + gDIC.hBwdStart[c],
+                     gM.own, gM.nei, gDIC.colorOf, gB.upper, z, gDIC.acc);
+            }
+            const int nC = gDIC.hColStart[c + 1] - gDIC.hColStart[c];
+            if (nC > 0)
+            {
+                rgppeqn::dicBwdCell<<<nb(nC), BS>>>
+                    (nC, gDIC.colCells + gDIC.hColStart[c],
+                     gDIC.rD, gDIC.acc, z);
+            }
+        }
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return pfail(e, "dic/apply launch");
+        return 0;
+    }
+
     //- Jacobi-BiCGStab (OF PBiCGStab 구조/잔차 규약) — 임의 디바이스
     //  포인터의 (diag, upper, lower, b, x)에 대해. 스크래치는 gB/gST 공유.
     int bicgSolve
@@ -1351,6 +1712,19 @@ int rgpPEqnMeshUpload
 }
 
 
+int rgpPEqnSetPrecon(int mode)
+{
+    gPrecon = (mode == 1) ? 1 : 0;
+    return 0;
+}
+
+
+int rgpPEqnPreconColors(void)
+{
+    return gDIC.nColors;
+}
+
+
 int rgpPEqnSolve
 (
     double dtInv, const double* rdtCell,
@@ -1407,6 +1781,12 @@ int rgpPEqnSolve
     res /= normFactor;
     *initRes = res;
 
+    // DIC 전처리: 솔브마다 rD 재계산 (계수 변화 반영)
+    if (gPrecon == 1)
+    {
+        if ((rc = dicSetup())) return rc;
+    }
+
     int iter = 0;
     double rArD = 0, rArDold = 0;
 
@@ -1421,24 +1801,21 @@ int rgpPEqnSolve
         {
             rArDold = rArD;
 
-            // 전처리 방향: pA = rA/diag + beta*pA
-            double beta = 0.0;
-            if (iter > 0)
+            // z = M^-1 rA — 별도 z 버퍼 대신 wA를 z로 재사용
+            if (gPrecon == 1)
             {
-                // rArD(new)는 아래에서 계산 — 표준 PCG 순서 유지 위해
-                // 먼저 z=r/D와 r·z를 구한 뒤 방향 갱신
+                if ((rc = dicApply(gB.rA, gB.wA))) return rc;
             }
-
-            // z·r (z = rA/diag)를 위해: reduce mode 2 with b = rA/diag —
-            // 별도 z 버퍼 대신 wA를 z로 재사용
-            rgppeqn::precondDir<<<nb(nc), BS>>>(nc, gB.rA, gB.diag, 0.0,
-                                                gB.wA);   // wA = z
+            else
+            {
+                rgppeqn::precondDir<<<nb(nc), BS>>>(nc, gB.rA, gB.diag,
+                                                    0.0, gB.wA);
+            }
             if ((rc = reduceHost(nc, 2, gB.wA, gB.rA, 0, nullptr, rArD)))
                 return rc;
 
-            beta = (iter > 0) ? rArD/rArDold : 0.0;
-            rgppeqn::precondDir<<<nb(nc), BS>>>(nc, gB.rA, gB.diag, beta,
-                                                gB.pA);   // pA = z + beta*pA
+            const double beta = (iter > 0) ? rArD/rArDold : 0.0;
+            rgppeqn::dirUpdate<<<nb(nc), BS>>>(nc, gB.wA, beta, gB.pA);
 
             // wA = A pA
             pSpmv(nc, nf, gB.pA, gB.wA);

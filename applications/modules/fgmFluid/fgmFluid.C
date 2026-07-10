@@ -124,6 +124,10 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuPEqn_(fgmTable_.lookupOrDefault<Switch>("gpuPEqn", false)),
     gpuPEqnCheck_(fgmTable_.lookupOrDefault<Switch>("gpuPEqnCheck", false)),
     gpuPEqnSolver_(fgmTable_.lookupOrDefault<word>("gpuPEqnSolver", "pcg")),
+    gpuPEqnPrecon_
+    (
+        fgmTable_.lookupOrDefault<word>("gpuPEqnPrecon", "jacobi")
+    ),
     gpuPEqnNnz_(0),
     gpuZC_(fgmTable_.lookupOrDefault<Switch>("gpuZC", false)),
     gpuZCArmed_(false),

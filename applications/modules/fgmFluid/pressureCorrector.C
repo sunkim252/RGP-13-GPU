@@ -960,6 +960,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         }
         else
         {
+            rgpPEqnSetPrecon(gpuPEqnPrecon_ == "dic" ? 1 : 0);
+
             const int rc = rgpPEqnSolve
             (
                 dtInv, rdtCell, amdSrc,
@@ -982,7 +984,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     << exit(FatalError);
             }
 
-            Info<< "rgpPCG:  Solving for p, Initial residual = " << res0
+            Info<< (gpuPEqnPrecon_ == "dic" ? "rgpDICPCG" : "rgpPCG")
+                << ":  Solving for p, Initial residual = " << res0
                 << ", Final residual = " << resF
                 << ", No Iterations " << nIter << endl;
         }

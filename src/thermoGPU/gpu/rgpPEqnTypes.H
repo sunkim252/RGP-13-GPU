@@ -51,6 +51,13 @@ int rgpPEqnSolve
     double* initRes, double* finalRes, int* nIters
 );
 
+/*  pEqn PCG 전처리기 선택: 0=Jacobi(기본), 1=멀티컬러 DIC.
+    DIC 구조(그리디 셀 컬러링 + 면 fwd/bwd 그룹)는 첫 솔브에서 지연
+    아밍되고 메시 재아밍 시 해제·재구축된다. rD는 솔브마다 재계산.
+    rgpPEqnPreconColors()는 아밍된 컬러 수(미아밍 0)를 반환.           */
+int rgpPEqnSetPrecon(int mode);
+int rgpPEqnPreconColors(void);
+
 /*  검증용: 조립만 수행하고 diag(경계 포함)/upper/b(경계 포함)를 D2H.
     CPU fvMatrix 계수와의 비트-수준 대조에 사용.                       */
 int rgpPEqnAssembleDump
