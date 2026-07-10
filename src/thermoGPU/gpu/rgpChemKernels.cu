@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <vector>
 
 // * * * * * * * * * * * * * * * 디바이스 상태 * * * * * * * * * * * * * * * //
 
@@ -38,16 +39,45 @@ namespace
         double* c = nullptr;
         double* dt = nullptr;
         long long* steps = nullptr;
+
+        // warp 균형: 이전 스텝 substep 수 기준 정렬 레이아웃 (지연 할당)
+        int* perm = nullptr;
+        double *p2 = nullptr, *T2 = nullptr, *c2 = nullptr, *dt2 = nullptr;
+        long long* steps2 = nullptr;
+        int* flag2 = nullptr;
+
+        // retrieve 캐시 (opt-in): 직전 (입력 → 출력) 쌍 (지연 할당)
+        int* flag = nullptr;
+        double *cp = nullptr, *cT = nullptr, *cc = nullptr, *cdt = nullptr;
+        double *coT = nullptr, *coc = nullptr;
     } gBuf;
+
+    // 균형/캐시 상태 (호스트)
+    int gBalanceMode = 1;              // 0=off, 1=auto, 2=force
+    double gCacheTol = 0.0;            // 0=off
+    bool gCacheValid = false;
+    long long gCacheHits = 0;
+    std::vector<long long> gHostSteps; // 직전 호출 substep (perm 생성용)
+    std::vector<int> gHostPerm;
+    int gPermN = -1;                   // gHostPerm이 유효한 nCells
+    bool gPermActive = false;
 
     void freeBuffers()
     {
-        if (gBuf.p) cudaFree(gBuf.p);
-        if (gBuf.T) cudaFree(gBuf.T);
-        if (gBuf.c) cudaFree(gBuf.c);
-        if (gBuf.dt) cudaFree(gBuf.dt);
+        double* dp[] = {gBuf.p, gBuf.T, gBuf.c, gBuf.dt,
+                        gBuf.p2, gBuf.T2, gBuf.c2, gBuf.dt2,
+                        gBuf.cp, gBuf.cT, gBuf.cc, gBuf.cdt,
+                        gBuf.coT, gBuf.coc};
+        for (auto p : dp) { if (p) cudaFree(p); }
         if (gBuf.steps) cudaFree(gBuf.steps);
+        if (gBuf.steps2) cudaFree(gBuf.steps2);
+        if (gBuf.perm) cudaFree(gBuf.perm);
+        if (gBuf.flag) cudaFree(gBuf.flag);
+        if (gBuf.flag2) cudaFree(gBuf.flag2);
         gBuf = Buffers();
+        gCacheValid = false;
+        gPermN = -1;
+        gPermActive = false;
     }
 }
 
@@ -131,6 +161,123 @@ __device__ void luSolve
 }
 
 
+//- retrieve 캐시 체크 (raw 레이아웃): 입력 (p,T,c,dt)가 직전 적분의
+//  입력과 tol 내 동일하면 hit — 저장된 출력을 즉시 기록하고 적분 스킵.
+//  miss면 현재 입력을 캐시에 저장(출력은 적분 후 chemCacheStore가).
+__global__ void chemCacheCheck
+(
+    const int nCells, const int nsp, const double tol, const int valid,
+    const double* __restrict__ pF, double* __restrict__ TF,
+    double* __restrict__ cF, const double* __restrict__ dtF,
+    double* __restrict__ cp, double* __restrict__ cT,
+    double* __restrict__ cc, double* __restrict__ cdt,
+    const double* __restrict__ coT, const double* __restrict__ coc,
+    int* __restrict__ flag
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nCells) return;
+
+    // 순수 상대 비교 (b=0이면 a==0 요구). 절대 플로어를 두면 점화
+    // 유도기의 라디칼 성장(절대값은 미소하나 상대적으론 지수 성장)을
+    // '미변화'로 오판해 점화가 동결된다 — 실측으로 확인된 함정.
+    auto close = [&](double a, double b) -> bool
+    {
+        return fabs(a - b) <= tol*fabs(b);
+    };
+
+    bool hit = (valid != 0)
+        && close(pF[i], cp[i]) && close(TF[i], cT[i])
+        && close(dtF[i], cdt[i]);
+    if (hit)
+    {
+        for (int s = 0; s < nsp && hit; s++)
+        {
+            hit = close(cF[(size_t)i*nsp + s], cc[(size_t)i*nsp + s]);
+        }
+    }
+
+    if (hit)
+    {
+        flag[i] = 1;
+        TF[i] = coT[i];
+        for (int s = 0; s < nsp; s++)
+        {
+            cF[(size_t)i*nsp + s] = coc[(size_t)i*nsp + s];
+        }
+    }
+    else
+    {
+        flag[i] = 0;
+        cp[i] = pF[i]; cT[i] = TF[i]; cdt[i] = dtF[i];
+        for (int s = 0; s < nsp; s++)
+        {
+            cc[(size_t)i*nsp + s] = cF[(size_t)i*nsp + s];
+        }
+    }
+}
+
+//- retrieve 캐시 출력 저장 (적분 후, miss 셀만)
+__global__ void chemCacheStore
+(
+    const int nCells, const int nsp, const int* __restrict__ flag,
+    const double* __restrict__ TF, const double* __restrict__ cF,
+    double* __restrict__ coT, double* __restrict__ coc
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nCells || flag[i]) return;
+    coT[i] = TF[i];
+    for (int s = 0; s < nsp; s++)
+    {
+        coc[(size_t)i*nsp + s] = cF[(size_t)i*nsp + s];
+    }
+}
+
+//- warp 균형: perm 정렬 레이아웃으로 게더 (flag는 null 허용)
+__global__ void chemGather
+(
+    const int nCells, const int nsp, const int* __restrict__ perm,
+    const double* __restrict__ p, const double* __restrict__ T,
+    const double* __restrict__ c, const double* __restrict__ dt,
+    const int* __restrict__ flag,
+    double* __restrict__ p2, double* __restrict__ T2,
+    double* __restrict__ c2, double* __restrict__ dt2,
+    int* __restrict__ flag2
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nCells) return;
+    const int i = perm[k];
+    p2[k] = p[i]; T2[k] = T[i]; dt2[k] = dt[i];
+    flag2[k] = flag ? flag[i] : 0;
+    for (int s = 0; s < nsp; s++)
+    {
+        c2[(size_t)k*nsp + s] = c[(size_t)i*nsp + s];
+    }
+}
+
+//- warp 균형: 결과 스캐터 (raw 레이아웃 복원)
+__global__ void chemScatter
+(
+    const int nCells, const int nsp, const int* __restrict__ perm,
+    const double* __restrict__ T2, const double* __restrict__ c2,
+    const long long* __restrict__ steps2,
+    double* __restrict__ T, double* __restrict__ c,
+    long long* __restrict__ steps
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nCells) return;
+    const int i = perm[k];
+    T[i] = T2[k];
+    steps[i] = steps2[k];
+    for (int s = 0; s < nsp; s++)
+    {
+        c[(size_t)i*nsp + s] = c2[(size_t)k*nsp + s];
+    }
+}
+
 //- 셀 하나 적분: [0, dtTot], 적응 Rosenbrock34
 __global__ void chemIntegrateKernel
 (
@@ -142,11 +289,15 @@ __global__ void chemIntegrateKernel
     const double* __restrict__ pF,
     double* __restrict__ TF,
     double* __restrict__ cF,
-    long long* __restrict__ stepsF
+    long long* __restrict__ stepsF,
+    const int* __restrict__ hitF
 )
 {
     const int celli = blockIdx.x*blockDim.x + threadIdx.x;
     if (celli >= nCells) return;
+
+    // retrieve 캐시 hit — 출력은 chemCacheCheck가 이미 기록
+    if (hitF && hitF[celli]) { stepsF[celli] = 0; return; }
 
     const rgpChemMech& dMech = *mechP;
     const int n = dMech.nSpecies;
@@ -328,50 +479,202 @@ int rgpChemIntegrate
 
     constexpr int blockSize = 64;
     const int gridSize = (nCells + blockSize - 1)/blockSize;
-    rgpchem::chemIntegrateKernel<<<gridSize, blockSize>>>
-    (
-        dMechPtr, nCells, gBuf.dt, relTol, absTol,
-        gBuf.p, gBuf.T, gBuf.c, gBuf.steps
-    );
+
+    // ── retrieve 캐시 (opt-in): 입력 미변화 셀은 저장된 출력으로 스킵 ──
+    gCacheHits = 0;
+    const bool cacheOn = (gCacheTol > 0.0);
+    if (cacheOn)
+    {
+        // 지연 할당은 capCells 기준 (이후 호출이 nCells ≤ capCells로
+        // 커질 수 있음); 셀 수가 바뀌면 셀-매핑이 달라지므로 무효화
+        static int cacheN = -1;
+        if (nCells != cacheN) { gCacheValid = false; cacheN = nCells; }
+
+        if (!gBuf.flag)
+        {
+            const size_t B1 = (size_t)gBuf.capCells*sizeof(double);
+            const size_t BN = (size_t)gBuf.capCells*n*sizeof(double);
+            if ((e = cudaMalloc(&gBuf.flag, gBuf.capCells*sizeof(int)))
+                    != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.cp, B1)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.cT, B1)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.cdt, B1)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.coT, B1)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.cc, BN)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.coc, BN)) != cudaSuccess)
+            {
+                return fail(e, "integrate/cache malloc");
+            }
+            gCacheValid = false;
+        }
+        rgpchem::chemCacheCheck<<<gridSize, blockSize>>>
+        (
+            nCells, n, gCacheTol, gCacheValid ? 1 : 0,
+            gBuf.p, gBuf.T, gBuf.c, gBuf.dt,
+            gBuf.cp, gBuf.cT, gBuf.cc, gBuf.cdt,
+            gBuf.coT, gBuf.coc, gBuf.flag
+        );
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return fail(e, "integrate/cache launch");
+    }
+
+    // ── warp 균형: 직전 호출의 substep 수로 정렬(무거운 셀 우선,
+    //    로그-버킷) — 게더/스캐터는 값 보존이라 결과 비트-동일 ──
+    const bool balance = gPermActive && gPermN == nCells
+                      && (gBalanceMode >= 1);
+    if (balance)
+    {
+        if (!gBuf.perm)
+        {
+            const size_t B1 = (size_t)gBuf.capCells*sizeof(double);
+            const size_t BN = (size_t)gBuf.capCells*n*sizeof(double);
+            if ((e = cudaMalloc(&gBuf.perm, gBuf.capCells*sizeof(int)))
+                    != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.flag2, gBuf.capCells*sizeof(int)))
+                    != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.p2, B1)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.T2, B1)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.dt2, B1)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.c2, BN)) != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.steps2,
+                                gBuf.capCells*sizeof(long long)))
+                    != cudaSuccess)
+            {
+                return fail(e, "integrate/perm malloc");
+            }
+        }
+        if ((e = cudaMemcpy(gBuf.perm, gHostPerm.data(),
+                            nCells*sizeof(int), cudaMemcpyHostToDevice))
+            != cudaSuccess) return fail(e, "integrate/H2D perm");
+
+        rgpchem::chemGather<<<gridSize, blockSize>>>
+        (
+            nCells, n, gBuf.perm, gBuf.p, gBuf.T, gBuf.c, gBuf.dt,
+            cacheOn ? gBuf.flag : nullptr,
+            gBuf.p2, gBuf.T2, gBuf.c2, gBuf.dt2, gBuf.flag2
+        );
+        rgpchem::chemIntegrateKernel<<<gridSize, blockSize>>>
+        (
+            dMechPtr, nCells, gBuf.dt2, relTol, absTol,
+            gBuf.p2, gBuf.T2, gBuf.c2, gBuf.steps2,
+            cacheOn ? gBuf.flag2 : nullptr
+        );
+        rgpchem::chemScatter<<<gridSize, blockSize>>>
+        (
+            nCells, n, gBuf.perm, gBuf.T2, gBuf.c2, gBuf.steps2,
+            gBuf.T, gBuf.c, gBuf.steps
+        );
+    }
+    else
+    {
+        rgpchem::chemIntegrateKernel<<<gridSize, blockSize>>>
+        (
+            dMechPtr, nCells, gBuf.dt, relTol, absTol,
+            gBuf.p, gBuf.T, gBuf.c, gBuf.steps,
+            cacheOn ? gBuf.flag : nullptr
+        );
+    }
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "integrate/launch");
+
+    if (cacheOn)
+    {
+        rgpchem::chemCacheStore<<<gridSize, blockSize>>>
+        (
+            nCells, n, gBuf.flag, gBuf.T, gBuf.c, gBuf.coT, gBuf.coc
+        );
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return fail(e, "integrate/cache store");
+        gCacheValid = true;
+    }
 
     if ((e = cudaMemcpy(T, gBuf.T, b1s, cudaMemcpyDeviceToHost))
         != cudaSuccess) return fail(e, "integrate/D2H T");
     if ((e = cudaMemcpy(c, gBuf.c, bns, cudaMemcpyDeviceToHost))
         != cudaSuccess) return fail(e, "integrate/D2H c");
 
+    // ── substep 통계 회수: stats 보고 + 다음 호출의 균형 perm 생성 ──
+    if ((int)gHostSteps.size() < nCells) gHostSteps.resize(nCells);
+    if ((e = cudaMemcpy(gHostSteps.data(), gBuf.steps,
+                        nCells*sizeof(long long), cudaMemcpyDeviceToHost))
+        != cudaSuccess) return fail(e, "integrate/D2H steps");
+
+    long long tot = 0, mx = 0, nHit = 0;
+    for (int i = 0; i < nCells; i++)
+    {
+        const long long si = gHostSteps[i];
+        if (si < 0)
+        {
+            snprintf(gErr, sizeof(gErr),
+                     "integrate: cell %d failed (code %lld)", i, si);
+            return -2;
+        }
+        tot += si;
+        if (si > mx) mx = si;
+        if (si == 0) nHit++;
+    }
+    if (cacheOn) gCacheHits = nHit;
     if (stats)
     {
-        static long long* hostSteps = nullptr;
-        static int hostCap = 0;
-        if (nCells > hostCap)
-        {
-            free(hostSteps);
-            hostSteps = (long long*)malloc(nCells*sizeof(long long));
-            hostCap = nCells;
-        }
-        if ((e = cudaMemcpy(hostSteps, gBuf.steps, nCells*sizeof(long long),
-                            cudaMemcpyDeviceToHost)) != cudaSuccess)
-            return fail(e, "integrate/D2H steps");
-        long long tot = 0, mx = 0;
-        for (int i = 0; i < nCells; i++)
-        {
-            if (hostSteps[i] < 0)
-            {
-                snprintf(gErr, sizeof(gErr),
-                         "integrate: cell %d failed (code %lld)",
-                         i, hostSteps[i]);
-                return -2;
-            }
-            tot += hostSteps[i];
-            if (hostSteps[i] > mx) mx = hostSteps[i];
-        }
         stats[0] = tot;
         stats[1] = mx;
     }
 
+    // 불균형(max > 8×mean)일 때만 다음 호출에서 정렬 발동 (mode 2=항상)
+    gPermActive = false;
+    if (gBalanceMode == 2
+     || (gBalanceMode == 1 && nCells >= 4096
+      && mx*(long long)nCells > 8*tot))
+    {
+        // 로그-버킷 카운팅 정렬 (내림차순) — O(n), 버킷 내 자연순 유지
+        constexpr int NB = 44;
+        int cnt[NB] = {0};
+        auto bucketOf = [](long long s) -> int
+        {
+            int b = 0;
+            while (s > 0 && b < NB - 1) { s >>= 1; b++; }
+            return b;
+        };
+        for (int i = 0; i < nCells; i++)
+        {
+            cnt[bucketOf(gHostSteps[i])]++;
+        }
+        int start[NB];   // 내림차순: 큰 버킷이 앞
+        {
+            int acc = 0;
+            for (int b = NB - 1; b >= 0; b--) { start[b] = acc; acc += cnt[b]; }
+        }
+        if ((int)gHostPerm.size() < nCells) gHostPerm.resize(nCells);
+        for (int i = 0; i < nCells; i++)
+        {
+            gHostPerm[start[bucketOf(gHostSteps[i])]++] = i;
+        }
+        gPermN = nCells;
+        gPermActive = true;
+    }
+
     return 0;
+}
+
+
+int rgpChemSetBalance(int mode)
+{
+    gBalanceMode = (mode < 0) ? 0 : (mode > 2 ? 2 : mode);
+    return 0;
+}
+
+
+int rgpChemSetCacheTol(double relTol)
+{
+    gCacheTol = (relTol > 0.0) ? relTol : 0.0;
+    gCacheValid = false;
+    return 0;
+}
+
+
+long long rgpChemCacheHits(void)
+{
+    return gCacheHits;
 }
 
 

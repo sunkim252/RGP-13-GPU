@@ -71,6 +71,19 @@ int  rgpChemIntegrate
     long long* stats    /* [2]: {총 스텝, 최대 스텝} — NULL 가능 */
 );
 
+/*  warp 균형: 직전 호출의 셀별 substep 수로 셀을 로그-버킷 내림차순
+    정렬해 적분(게더/스캐터는 값 보존 — 결과 비트-동일). 점화 전선의
+    SIMT 최악셀 지배를 완화한다.
+    mode 0=off, 1=auto(기본 — max>8×mean일 때만 발동), 2=항상.        */
+int rgpChemSetBalance(int mode);
+
+/*  retrieve 캐시 (opt-in): 셀 입력 (p,T,c,dt)가 직전 적분의 입력과
+    |Δ| <= tol*(|prev|+1e-6) 이내면 저장된 출력을 재사용(재적분 스킵).
+    tol=0이면 off(기본). 정확도-성능 트레이드 — 검증 후 사용할 것.
+    rgpChemCacheHits()는 직전 호출의 hit 셀 수.                        */
+int rgpChemSetCacheTol(double relTol);
+long long rgpChemCacheHits(void);
+
 void rgpChemFree(void);
 const char* rgpChemLastError(void);
 

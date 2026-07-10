@@ -44,6 +44,9 @@ class gpuChemistryModel
         //- 커널 허용오차 (chemistryProperties gpuCoeffs 서브딕셔너리)
         scalar relTol_, absTol_;
 
+        //- retrieve 캐시 허용오차 (gpuCoeffs retrieveTol, 0=off)
+        scalar retrieveTol_;
+
         //- 메커니즘(디바이스 업로드 원본)과 종 인덱스 맵
         mutable rgpChemMech mech_;
         mutable labelList map_;      // mech 종 m -> thermo 종 인덱스

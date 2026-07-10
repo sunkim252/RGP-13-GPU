@@ -27,6 +27,7 @@ Foam::gpuChemistryModel<ThermoType>::gpuChemistryModel
     chemistryModel<ThermoType>(thermo),
     relTol_(1e-5),
     absTol_(1e-12),
+    retrieveTol_(0),
     armed_(false)
 {
     if (this->found("gpuCoeffs"))
@@ -34,6 +35,24 @@ Foam::gpuChemistryModel<ThermoType>::gpuChemistryModel
         const dictionary& dict = this->subDict("gpuCoeffs");
         relTol_ = dict.lookupOrDefault<scalar>("relTol", 1e-5);
         absTol_ = dict.lookupOrDefault<scalar>("absTol", 1e-12);
+
+        // warp 균형: off/auto/always (기본 auto — 불균형일 때만 발동,
+        // 게더/스캐터는 값 보존이라 결과 비트-동일)
+        const word bal
+        (
+            dict.lookupOrDefault<word>("balance", "auto")
+        );
+        rgpChemSetBalance(bal == "off" ? 0 : bal == "always" ? 2 : 1);
+
+        // retrieve 캐시 (opt-in, 정확도-성능 트레이드): 입력 미변화
+        // 셀의 재적분 스킵. 0 = off.
+        retrieveTol_ = dict.lookupOrDefault<scalar>("retrieveTol", 0);
+        if (retrieveTol_ > 0)
+        {
+            rgpChemSetCacheTol(retrieveTol_);
+            Info<< "gpuChemistry: retrieve cache on, tol = "
+                << retrieveTol_ << endl;
+        }
     }
 }
 
@@ -252,6 +271,12 @@ Foam::scalar Foam::gpuChemistryModel<ThermoType>::solveBatch
     {
         FatalErrorInFunction
             << "rgpChemIntegrate: " << rgpChemLastError() << exit(FatalError);
+    }
+
+    if (retrieveTol_ > 0)
+    {
+        Info<< "gpuChemistry: retrieve hits " << label(rgpChemCacheHits())
+            << " / " << nc << endl;
     }
 
     // RR_i = (c_new - c_0) W_i / deltaT
