@@ -12,8 +12,9 @@
 
 #include <stddef.h>
 
-/* 스레드-로컬 스택 배열 상한 (FPV 케이스: 4-7종, 여유 포함) */
-#define RGP_GPU_MAX_SPECIES 40
+/* 스레드-로컬 스택 배열 상한 (X[] = 8B×MAX/스레드 로컬 메모리).
+   rd0110 케로신 wang2011 서로게이트가 106종 — 40이면 업로드 거부됐음. */
+#define RGP_GPU_MAX_SPECIES 128
 
 #ifdef __cplusplus
 extern "C" {
