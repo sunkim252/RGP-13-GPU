@@ -158,6 +158,29 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
         off += fc.size();
     }
 
+    // 침묵-갭 방지: GPU 조립(laplacian/snGrad)은 직교 공식 전용 —
+    // corrected/limited 스킴의 비직교 보정(면 계수 nonOrthDeltaCoeffs
+    // + 명시 보정)은 미반영이라 비직교 메시에서 CPU와 행렬부터 다르다.
+    // (rd0110 Fluent 격자 실측) 근사 실행은 허용하되 1회 크게 경고.
+    {
+        // snGrad 스킴명으로 판별 (laplacian corrected와 세트로 쓰임)
+        ITstream& sn = mesh.schemes().snGrad("snGrad(p)");
+        sn.rewind();
+        const word snName(sn);
+        if (snName != "orthogonal" && !gpuNonOrthoWarned_)
+        {
+            WarningInFunction
+                << "GPU assembly (pEqn/ZC/UEqn laplacians) uses the "
+                << "ORTHOGONAL formula but snGrad scheme is '"
+                << snName << "' -- the non-orthogonal correction is "
+                << "NOT applied on the GPU paths; on non-orthogonal "
+                << "meshes the GPU matrices approximate the CPU ones. "
+                << "Verify acceptability or run the affected equations "
+                << "on the CPU." << endl;
+            gpuNonOrthoWarned_ = true;
+        }
+    }
+
     const scalarField Vc(mesh.V());
     const int rc = rgpPEqnMeshUpload
     (

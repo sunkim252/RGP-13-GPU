@@ -276,6 +276,9 @@ protected:
 
         //- devChain 강등 래치 (VRAM 부족 시 1회 경고 후 CPU-prep 폴백)
         mutable bool gpuDevChainOff_ = false;
+
+        //- 비직교 스킴 경고 래치 (아밍마다 반복 경고 방지)
+        mutable bool gpuNonOrthoWarned_ = false;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
         mutable List<double> gpuPEqnFlux_;  // 내부면 플럭스 out
         mutable List<double> gpuPEqnParB_;  // processor 인터페이스 계수
