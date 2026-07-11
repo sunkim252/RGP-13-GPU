@@ -2271,6 +2271,20 @@ int rgpPEqnAssembleDump
 }
 
 
+//- CSR 부분 할당 정리 (실패 시 VRAM 회수 — 호출자는 LDU 폴백 가능)
+static void csrFreeAll()
+{
+    int* ip[] = {gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot,
+                 gM.dRowPtr, gM.dColInd};
+    for (auto p : ip) { if (p) cudaFree(p); }
+    gM.dDiagSlot = gM.dUpSlot = gM.dLoSlot = nullptr;
+    gM.dRowPtr = gM.dColInd = nullptr;
+    if (gM.dVals) { cudaFree(gM.dVals); gM.dVals = nullptr; }
+    gM.hRowPtr.clear(); gM.hColInd.clear();
+    gM.nnz = 0;
+    cudaGetLastError();   // OOM sticky 오류 상태 소거
+}
+
 int rgpPEqnCsrPrepare(int* nnzOut)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
@@ -2330,16 +2344,17 @@ int rgpPEqnCsrPrepare(int* nnzOut)
         if (!*i.d)
         {
             if ((e = cudaMalloc(i.d, i.n*sizeof(int))) != cudaSuccess)
-                return pfail(e, "peqn/csr malloc");
+                { int r = pfail(e, "peqn/csr malloc"); csrFreeAll(); return r; }
         }
         if ((e = cudaMemcpy(*i.d, i.s, i.n*sizeof(int),
                             cudaMemcpyHostToDevice)) != cudaSuccess)
-            return pfail(e, "peqn/csr H2D");
+            { int r = pfail(e, "peqn/csr H2D"); csrFreeAll(); return r; }
     }
     if (!gM.dVals)
     {
         if ((e = cudaMalloc(&gM.dVals, (size_t)nnz*sizeof(double)))
-            != cudaSuccess) return pfail(e, "peqn/csr vals malloc");
+            != cudaSuccess)
+            { int r = pfail(e, "peqn/csr vals malloc"); csrFreeAll(); return r; }
     }
     // CSR 구조 디바이스 사본 (무-atomics SpMV용)
     struct { int** d; const int* s; size_t n; } cs[] =
@@ -2352,11 +2367,11 @@ int rgpPEqnCsrPrepare(int* nnzOut)
         if (!*c.d)
         {
             if ((e = cudaMalloc(c.d, c.n*sizeof(int))) != cudaSuccess)
-                return pfail(e, "peqn/csr struct malloc");
+                { int r = pfail(e, "peqn/csr struct malloc"); csrFreeAll(); return r; }
         }
         if ((e = cudaMemcpy(*c.d, c.s, c.n*sizeof(int),
                             cudaMemcpyHostToDevice)) != cudaSuccess)
-            return pfail(e, "peqn/csr struct H2D");
+            { int r = pfail(e, "peqn/csr struct H2D"); csrFreeAll(); return r; }
     }
 
     gM.nnz = nnz;
