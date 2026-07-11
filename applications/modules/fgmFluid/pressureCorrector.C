@@ -310,8 +310,20 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     rho.relax();
 
     // pCorrGPU 디바이스 체인: gpuUEqn(rAU/HbyA 디바이스) + gpuPEqn일 때
-    // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체
-    const bool devChain = gpuUEqn_ && gpuPEqn_;
+    // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체.
+    // 선택 최적화이므로 VRAM 부족(프리플라이트 실패) 시 1회 경고 후
+    // 영구 강등 — 나머지 스택은 그대로 GPU (6GB 카드 풀스택 실측)
+    bool devChain = gpuUEqn_ && gpuPEqn_ && !gpuDevChainOff_;
+    if (devChain && rgpPCorrEnsure())
+    {
+        WarningInFunction
+            << "devChain buffers unavailable ("
+            << rgpPEqnLastError()
+            << ") -- falling back to the host-prep pEqn path"
+            << endl;
+        gpuDevChainOff_ = true;
+        devChain = false;
+    }
 
     tmp<surfaceScalarField> trhof;
     if (!devChain)

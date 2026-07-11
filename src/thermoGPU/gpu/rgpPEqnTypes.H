@@ -200,6 +200,10 @@ int rgpUEqnAH(const double* U3, const double* UNbr3,
     rgpPEqnSolve/AssembleCsr에 rAUfInt/psis/phiInt를 null로 넘기면
     상주본 사용. Finish2 — 플럭스+phi 재구성까지 디바이스.
     U — U = HbyA − rAU∇p(신규 p) 후처리.                                */
+/*  devChain 버퍼 프리플라이트 — 실패 시 부분 할당 회수+오류 소거.
+    호스트는 실패 시 devChain을 강등(CPU-prep 경로)할 수 있다.        */
+int rgpPCorrEnsure(void);
+
 int rgpPCorrPrep
 (
     const double* rho, const double* rhoOld,

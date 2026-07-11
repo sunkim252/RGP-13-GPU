@@ -3392,6 +3392,44 @@ int rgpUEqnAH(const double* U3, const double* UNbr3,
 //- pCorr 준비체인: rhof/rAUf(조화)/phiHbyAv/psis 디바이스 상주 생성.
 //  rAU/HbyA는 직전 rgpUEqnAH의 디바이스 사본 사용. ddtCorr는 OF
 //  EulerDdt fvcDdtPhiCorr(rho,U,phi) 1:1 (경계 기여 0은 호스트 담당).
+//- devChain 버퍼 프리플라이트 (호스트가 devChain 강등 결정에 사용).
+//  실패 시 부분 할당을 회수하고 sticky 오류를 소거 — 호스트는
+//  경고 후 CPU-prep 경로로 폴백할 수 있다 (VRAM 빠듯한 카드).
+int rgpPCorrEnsure(void)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    if (nc <= 0)
+    {
+        snprintf(gPErr, sizeof(gPErr), "pcorr: mesh not uploaded");
+        return -1;
+    }
+    if (gPC.rAUf) return 0;
+
+    cudaError_t e;
+    const size_t bc = (size_t)nc*sizeof(double);
+    const size_t bf = (size_t)nf*sizeof(double);
+    struct { double** d; size_t bytes; } al[] =
+    {
+        {&gPC.rAUf, bf}, {&gPC.phiH, bf}, {&gPC.rhof, bf},
+        {&gPC.psis, bc}, {&gPC.rhoOld, bc}, {&gPC.Uold3, 3*bc},
+        {&gPC.phiOld, bf}
+    };
+    for (auto& a : al)
+    {
+        if ((e = cudaMalloc(a.d, a.bytes)) != cudaSuccess)
+        {
+            for (auto& b : al)
+            {
+                if (*b.d) { cudaFree(*b.d); *b.d = nullptr; }
+            }
+            cudaGetLastError();
+            return pfail(e, "pcorr/malloc");
+        }
+    }
+    return 0;
+}
+
+
 int rgpPCorrPrep
 (
     const double* rho, const double* rhoOld,
@@ -3408,22 +3446,7 @@ int rgpPCorrPrep
     }
 
     cudaError_t e;
-    if (!gPC.rAUf)
-    {
-        const size_t bc = (size_t)nc*sizeof(double);
-        const size_t bf = (size_t)nf*sizeof(double);
-        struct { double** d; size_t bytes; } al[] =
-        {
-            {&gPC.rAUf, bf}, {&gPC.phiH, bf}, {&gPC.rhof, bf},
-            {&gPC.psis, bc}, {&gPC.rhoOld, bc}, {&gPC.Uold3, 3*bc},
-            {&gPC.phiOld, bf}
-        };
-        for (auto& a : al)
-        {
-            if ((e = cudaMalloc(a.d, a.bytes)) != cudaSuccess)
-                return pfail(e, "pcorr/malloc");
-        }
-    }
+    if (rgpPCorrEnsure()) return -1;
 
     struct { double* d; const double* s; size_t n; } up[] =
     {
