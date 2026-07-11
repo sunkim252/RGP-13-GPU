@@ -76,6 +76,13 @@ class gpuMulticomponentFluid
         mutable List<double> gpuPBuf_;
         mutable List<double> gpuPFlux_;
 
+        //- processor 인터페이스 계수 (방정식별 솔브 직전 업로드)
+        mutable List<double> gpuParB_;
+
+        //- proc-면 multivariate limited 가중치 (weights 단계에서 채움,
+        //  solveScalarGpu의 coupled 계수에 사용)
+        mutable List<double> gpuProcW_;
+
 
     // Private Member Functions
 
@@ -96,6 +103,10 @@ class gpuMulticomponentFluid
         //- v1 가드: relax/fvModels/fvConstraints가 GPU-솔브 필드에
         //  작용하면 Fatal (침묵 오차 방지)
         void checkGpuGuards(const volScalarField& f) const;
+
+        //- PISO 보정자 1회분의 GPU 압력 보정 (pressureCorrector의
+        //  while(pimple.correct()) 루프 본체)
+        void correctPressureGpu();
 
 
 public:

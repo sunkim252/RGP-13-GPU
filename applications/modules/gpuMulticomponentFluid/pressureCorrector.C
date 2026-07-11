@@ -24,6 +24,7 @@
 #include "extrapolatedCalculatedFvPatchFields.H"
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
+#include "processorFvPatchFields.H"
 #include "gpu/rgpPEqnTypes.H"
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
@@ -36,6 +37,18 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
         return;
     }
 
+    // stock isothermalFluid::pressureCorrector와 동일한 PISO 보정자
+    // 루프 — pimple.correct()가 보정자 진행과 finalIteration 플래그를
+    // 관리한다 (누락 시 보정자 1회 + 솔버딕이 pFinal로 고정되는 버그)
+    while (pimple.correct())
+    {
+        correctPressureGpu();
+    }
+}
+
+
+void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
+{
     volScalarField& rho(rho_);
     volScalarField& p(p_);
     volVectorField& U(U_);
@@ -83,7 +96,43 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
             }
         }
     }
-    if (rgpUEqnAH(U3, nullptr, rAUh, H3))
+    // 병렬: fvMatrix::H()의 coupled addBoundarySource(H += bC*U_nbr)
+    List<double> UNbr3;
+    if (Pstream::parRun())
+    {
+        label nPar = 0;
+        forAll(U.boundaryField(), patchi)
+        {
+            if (U.boundaryField()[patchi].coupled())
+            {
+                nPar += U.boundaryField()[patchi].size();
+            }
+        }
+        if (nPar > 0)
+        {
+            UNbr3.setSize(3*nPar);
+            label offp = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pp =
+                    U.boundaryField()[patchi];
+                if (!pp.coupled()) continue;
+                forAll(pp, f)
+                {
+                    for (label k = 0; k < 3; k++)
+                    {
+                        UNbr3[k*nPar + offp + f] = pp[f][k];
+                    }
+                }
+                offp += pp.size();
+            }
+        }
+    }
+
+    if (rgpUEqnAH
+        (
+            U3, UNbr3.size() ? UNbr3.begin() : nullptr, rAUh, H3
+        ))
     {
         FatalErrorInFunction
             << "rgpUEqnAH: " << rgpPEqnLastError() << exit(FatalError);
@@ -142,12 +191,6 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
     label nbf = 0;
     forAll(p.boundaryField(), patchi)
     {
-        if (p.boundaryField()[patchi].coupled())
-        {
-            FatalErrorInFunction
-                << "gpuPEqn (v1) does not support coupled patches "
-                << "in this module" << exit(FatalError);
-        }
         nbf += p.boundaryField()[patchi].size();
     }
 
@@ -157,6 +200,7 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
     double* phiBA = bSrcA + nbf;
     {
         label off = 0;
+        label offPar = 0;
         forAll(p.boundaryField(), patchi)
         {
             const fvPatchScalarField& pp = p.boundaryField()[patchi];
@@ -168,17 +212,48 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
                 rhorAUf.boundaryField()[patchi]
                *mesh.magSf().boundaryField()[patchi]
             );
-            const scalarField gic(pp.gradientInternalCoeffs());
-            const scalarField gbc(pp.gradientBoundaryCoeffs());
             const scalarField& phb = phiHbyA.boundaryField()[patchi];
 
-            for (label k = 0; k < np; k++)
+            if (pp.coupled())
             {
-                bDiagA[off + k] = -pGamma[k]*gic[k];
-                bSrcA[off + k] = pGamma[k]*gbc[k];
-                phiBA[off + k] = phb[k];
+                // processor: rhorAUf/phiHbyA coupled boundaryField는
+                // fvc 보간이 이미 면값. iC → diag, bC → 인터페이스.
+                const scalarField pdc
+                (
+                    mesh.deltaCoeffs().boundaryField()[patchi]
+                );
+                const scalarField gic(pp.gradientInternalCoeffs(pdc));
+                const scalarField gbc(pp.gradientBoundaryCoeffs(pdc));
+
+                for (label k = 0; k < np; k++)
+                {
+                    bDiagA[off + k] = -pGamma[k]*gic[k];
+                    bSrcA[off + k] = 0;
+                    phiBA[off + k] = phb[k];
+                    gpuParB_[offPar + k] = pGamma[k]*gbc[k];
+                }
+                offPar += np;
+            }
+            else
+            {
+                const scalarField gic(pp.gradientInternalCoeffs());
+                const scalarField gbc(pp.gradientBoundaryCoeffs());
+
+                for (label k = 0; k < np; k++)
+                {
+                    bDiagA[off + k] = -pGamma[k]*gic[k];
+                    bSrcA[off + k] = pGamma[k]*gbc[k];
+                    phiBA[off + k] = phb[k];
+                }
             }
             off += np;
+        }
+
+        if (offPar > 0 && rgpPEqnParCoeffs(gpuParB_.begin()))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnParCoeffs: " << rgpPEqnLastError()
+                << exit(FatalError);
         }
     }
 
@@ -256,6 +331,7 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
         forAll(phic, f) { phic[f] = ph[f] + gpuPFlux_[f]; }
 
         label off = 0;
+        label offPar = 0;
         forAll(p.boundaryField(), patchi)
         {
             const fvPatchScalarField& pp = p.boundaryField()[patchi];
@@ -266,11 +342,25 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
             const scalarField& phb = phiHbyA.boundaryField()[patchi];
             scalarField& phibf = phi.boundaryFieldRef()[patchi];
 
-            for (label k = 0; k < np; k++)
+            if (pp.coupled())
             {
-                const scalar fluxB =
-                    bDiagA[off + k]*pi[k] - bSrcA[off + k];
-                phibf[k] = phb[k] + fluxB;
+                for (label k = 0; k < np; k++)
+                {
+                    const scalar fluxB =
+                        bDiagA[off + k]*pi[k]
+                      - gpuParB_[offPar + k]*pp[k];
+                    phibf[k] = phb[k] + fluxB;
+                }
+                offPar += np;
+            }
+            else
+            {
+                for (label k = 0; k < np; k++)
+                {
+                    const scalar fluxB =
+                        bDiagA[off + k]*pi[k] - bSrcA[off + k];
+                    phibf[k] = phb[k] + fluxB;
+                }
             }
             off += np;
         }
@@ -307,12 +397,15 @@ void Foam::solvers::gpuMulticomponentFluid::pressureCorrector()
     fvConstraints().constrain(U);
     K = 0.5*magSqr(U);
 
-    if (!mesh.schemes().steady())
+    if (pimple.simpleRho())
     {
-        if (thermo_.dpdt())
-        {
-            dpdt = fvc::ddt(p);
-        }
+        rho = thermo.rho();
+        rho.relax();
+    }
+
+    if (thermo.dpdt())
+    {
+        dpdt = fvc::ddt(p);
     }
 }
 

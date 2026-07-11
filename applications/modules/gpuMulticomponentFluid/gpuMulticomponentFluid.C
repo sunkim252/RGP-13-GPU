@@ -5,6 +5,9 @@
 #include "gpuMulticomponentFluid.H"
 #include "addToRunTimeSelectionTable.H"
 #include "fvConstraint.H"
+#include "processorFvPatchFields.H"
+#include "processorFvPatch.H"
+#include "PstreamReduceOps.H"
 #include "gpu/rgpPEqnTypes.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
@@ -53,16 +56,12 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
         gpuCheck_ = dict.lookupOrDefault<Switch>("gpuCheck", false);
     }
 
-    if (Pstream::parRun() && (gpuYEqn_ || gpuEEqn_ || gpuUEqn_ || gpuPEqn_))
+    // 병렬: fgmFluid와 동일한 processor 인터페이스 halo 인프라
+    // (librgpThermoGPU의 gPar/greduce/parB)를 재사용 — 전 스위치 지원.
+    if (Pstream::parRun() && gpuCheck_)
     {
-        WarningInFunction
-            << "gpuMulticomponentFluid transport is serial-only (v1) -- "
-            << "disabled for this parallel run (GPU chemistry stays "
-            << "active)" << endl;
-        gpuYEqn_ = Switch(false);
-        gpuEEqn_ = Switch(false);
-        gpuUEqn_ = Switch(false);
-        gpuPEqn_ = Switch(false);
+        FatalErrorInFunction
+            << "gpuCheck is serial-only" << exit(FatalError);
     }
     if (gpuUEqn_ != gpuPEqn_)
     {
@@ -142,10 +141,17 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
     label nbf = 0;
     forAll(thermo.T().boundaryField(), patchi)
     {
-        if (thermo.T().boundaryField()[patchi].coupled())
+        if
+        (
+            thermo.T().boundaryField()[patchi].coupled()
+         && !isA<processorFvPatchScalarField>
+            (
+                thermo.T().boundaryField()[patchi]
+            )
+        )
         {
             FatalErrorInFunction
-                << "gpuYEqn (v1) does not support coupled patches"
+                << "GPU transport (v1) supports processor coupling only"
                 << exit(FatalError);
         }
         nbf += thermo.T().boundaryField()[patchi].size();
@@ -219,6 +225,37 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
         FatalErrorInFunction
             << "rgpSTEqnMeshUpload: " << rgpPEqnLastError()
             << exit(FatalError);
+    }
+
+    // 병렬: processor 패치 구조 아밍 (halo 교환 + 전역 리덕션)
+    if (Pstream::parRun())
+    {
+        DynamicList<int> pNbr, pNF, pFc;
+        forAll(mesh.boundary(), patchi)
+        {
+            if (!thermo.T().boundaryField()[patchi].coupled()) continue;
+            const processorFvPatch& pp =
+                refCast<const processorFvPatch>(mesh.boundary()[patchi]);
+            pNbr.append(pp.neighbProcNo());
+            pNF.append(pp.size());
+            const labelUList& fc = pp.faceCells();
+            forAll(fc, k) { pFc.append(fc[k]); }
+        }
+        const double gnCells = returnReduce(nc, sumOp<label>());
+        if (rgpPEqnParArm
+            (
+                pNbr.size(),
+                pNbr.size() ? pNbr.begin() : nullptr,
+                pNbr.size() ? pNF.begin() : nullptr,
+                pNbr.size() ? pFc.begin() : nullptr,
+                gnCells
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnParArm: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+        gpuParB_.setSize(max(pFc.size(), label(1)));
     }
 
     gpuMeshArmed_ = true;
