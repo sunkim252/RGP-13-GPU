@@ -216,6 +216,8 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                 << exit(FatalError);
         }
         gpuPEqnParB_.setSize(max(pFc.size(), label(1)));
+        gpuPEqnParPhb_.setSize(max(pFc.size(), label(1)));
+        gpuPEqnParRhof_.setSize(max(pFc.size(), label(1)));
     }
 
     gpuPEqnArmed_ = true;
@@ -305,10 +307,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
     // pCorrGPU 디바이스 체인: gpuUEqn(rAU/HbyA 디바이스) + gpuPEqn일 때
     // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체
-    // devChain(디바이스 상주 pCorr 체인)은 직렬 전용(v1) — 병렬은
-    // rgpUEqnAH 호스트 회수 + CPU fvc 준비체인 + GPU pEqn 솔브
-    const bool devChain =
-        gpuUEqn_ && gpuPEqn_ && !Pstream::parRun();
+    const bool devChain = gpuUEqn_ && gpuPEqn_;
 
     tmp<surfaceScalarField> trhof;
     if (!devChain)
@@ -847,13 +846,125 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 {
                     // processor 패치: iC는 diag로(동일 공식), 커플링
                     // 계수 bC(=+pGamma*gbc)는 인터페이스 SpMV로 —
-                    // 소스에 접지 않는다 (OF boundaryCoeffs 규약)
+                    // 소스에 접지 않는다 (OF boundaryCoeffs 규약).
+                    // devChain: 비-devChain의 fvc 체인이 coupled 보간을
+                    // 이미 담던 것을 호스트가 필드(cBC 후)로 재현 —
+                    // rAUf=조화, phiHbyAv=flux(HbyA)+rho-일관 ddtCorr
+                    // (fvcDdtPhiCoeff는 coupled 경계를 0으로 만들지
+                    // 않으므로 내부면 공식 그대로), rhof=선형.
+                    scalarField pGammaP(pGamma);
+                    scalarField phbP(phb);
+                    scalarField rhofP(np, 0.0);
+                    if (devChain)
+                    {
+                        const scalarField cdw
+                        (
+                            mesh.surfaceInterpolation::weights()
+                                .boundaryField()[patchi]
+                        );
+                        const scalarField rAUo
+                        (
+                            rAU.boundaryField()[patchi]
+                                .patchInternalField()
+                        );
+                        const scalarField& rAUn =
+                            rAU.boundaryField()[patchi];
+                        const vectorField Ho
+                        (
+                            HbyA.boundaryField()[patchi]
+                                .patchInternalField()
+                        );
+                        const vectorField& Hn =
+                            HbyA.boundaryField()[patchi];
+                        const scalarField rhoo
+                        (
+                            rho.boundaryField()[patchi]
+                                .patchInternalField()
+                        );
+                        const scalarField& rhon =
+                            rho.boundaryField()[patchi];
+                        const scalarField rhoOldo
+                        (
+                            rho.oldTime().boundaryField()[patchi]
+                                .patchInternalField()
+                        );
+                        const scalarField& rhoOldn =
+                            rho.oldTime().boundaryField()[patchi];
+                        const vectorField UOldo
+                        (
+                            U.oldTime().boundaryField()[patchi]
+                                .patchInternalField()
+                        );
+                        const vectorField& UOldn =
+                            U.oldTime().boundaryField()[patchi];
+                        const scalarField& phiOldb =
+                            phi.oldTime().boundaryField()[patchi];
+                        const vectorField& Sfb =
+                            mesh.Sf().boundaryField()[patchi];
+                        const scalarField& msf =
+                            mesh.magSf().boundaryField()[patchi];
+
+                        tmp<scalarField> trdto, trdtn;
+                        if (LTS)
+                        {
+                            const volScalarField& rdt =
+                                fv::localEulerDdt::localRDeltaT(mesh);
+                            trdto = rdt.boundaryField()[patchi]
+                                .patchInternalField();
+                            trdtn = tmp<scalarField>
+                            (
+                                rdt.boundaryField()[patchi]
+                            );
+                        }
+
+                        for (label k = 0; k < np; k++)
+                        {
+                            const scalar w = cdw[k];
+                            pGammaP[k] =
+                                msf[k]
+                               /(w/rAUo[k] + (1.0 - w)/rAUn[k]);
+                            rhofP[k] =
+                                w*rhoo[k] + (1.0 - w)*rhon[k];
+                            const scalar rhorAUf =
+                                w*rhoo[k]*rAUo[k]
+                              + (1.0 - w)*rhon[k]*rAUn[k];
+                            const vector rhoUoldf =
+                                w*rhoOldo[k]*UOldo[k]
+                              + (1.0 - w)*rhoOldn[k]*UOldn[k];
+                            const scalar phiCorr =
+                                phiOldb[k] - (rhoUoldf & Sfb[k]);
+                            const scalar coeff =
+                                1.0
+                              - min
+                                (
+                                    mag(phiCorr)
+                                   /(mag(phiOldb[k]) + SMALL),
+                                    scalar(1)
+                                );
+                            const scalar rdtf =
+                                LTS
+                              ? (
+                                    w*trdto()[k]
+                                  + (1.0 - w)*trdtn()[k]
+                                )
+                              : 1.0/runTime.deltaTValue();
+                            const vector Hf =
+                                w*Ho[k] + (1.0 - w)*Hn[k];
+                            phbP[k] =
+                                (Hf & Sfb[k])
+                              + rcDdtScale*rhorAUf*coeff*rdtf*phiCorr
+                               /rhofP[k];
+                        }
+                    }
+
                     for (label k = 0; k < np; k++)
                     {
-                        bDiagA[off + k] = -pGamma[k]*gic[k];
+                        bDiagA[off + k] = -pGammaP[k]*gic[k];
                         bSrcA[off + k]  = 0;
-                        phiBA[off + k]  = phb[k];
-                        gpuPEqnParB_[offPar + k] = pGamma[k]*gbc[k];
+                        phiBA[off + k]  = phbP[k];
+                        gpuPEqnParB_[offPar + k] = pGammaP[k]*gbc[k];
+                        gpuPEqnParPhb_[offPar + k] = phbP[k];
+                        gpuPEqnParRhof_[offPar + k] = rhofP[k];
                     }
                     offPar += np;
                 }
@@ -1231,7 +1342,19 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                         const scalar fluxB =
                             bDiagA[off + k]*pi[k]
                           - gpuPEqnParB_[offPar + k]*pp[k];
-                        phibf[k] = rfb[k]*(phb[k] + fluxB);
+                        // devChain: concat 때 저장한 proc-면 rhof/phb
+                        // (조화 rAUf·ddtCorr 포함) — 비-devChain은
+                        // fvc 체인 boundaryField가 이미 정확
+                        if (devChain)
+                        {
+                            phibf[k] =
+                                gpuPEqnParRhof_[offPar + k]
+                               *(gpuPEqnParPhb_[offPar + k] + fluxB);
+                        }
+                        else
+                        {
+                            phibf[k] = rfb[k]*(phb[k] + fluxB);
+                        }
                     }
                     offPar += np;
                 }
@@ -1375,7 +1498,25 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             {
                 const fvPatchScalarField& pbf =
                     p.boundaryField()[patchi];
-                forAll(pbf, k) { pB[off + k] = pbf[k]; }
+                if (pbf.coupled())
+                {
+                    // gaussGrad coupled: 면 값 (cBC 직후 이웃 p 보유)
+                    const scalarField w
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField po(pbf.patchInternalField());
+                    forAll(pbf, k)
+                    {
+                        pB[off + k] =
+                            w[k]*po[k] + (1.0 - w[k])*pbf[k];
+                    }
+                }
+                else
+                {
+                    forAll(pbf, k) { pB[off + k] = pbf[k]; }
+                }
                 off += pbf.size();
             }
         }
