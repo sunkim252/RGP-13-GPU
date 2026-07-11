@@ -203,6 +203,13 @@ protected:
         //  arming (the guard only fires while tabRealGasCoeffs_ is true).
         label armedNCells_;
 
+        //- Data pointer of Y_[0]'s internal field at the last arming. A parallel
+        //  redistribution that KEEPS the local cell count reallocates the fields
+        //  at a new address, which a bare nCells guard misses (stale pointers ->
+        //  calcMixture reads freed storage). Re-arm whenever this pointer moves,
+        //  not only when the count changes. nullptr until the first arming.
+        const scalar* armedYData_;
+
         //- Tier-4: optional per-cell differential-diffusion Lewis-number fields
         //  for the control variables Z and C, filled from fgmTable_ each
         //  updateManifold. Null unless the table carries the corresponding
