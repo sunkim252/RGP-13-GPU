@@ -34,6 +34,8 @@ License
 #include "processorFvPatch.H"
 #include "PstreamBuffers.H"
 #include "localEulerDdtScheme.H"
+#include "snGradScheme.H"
+#include "fvcDiv.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -193,6 +195,26 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             tsrcBulk = fvc::grad(betaArt*divU);
         }
 
+        // 비직교 명시 보정: −fvm::laplacian(muLap,U)의 corrected 소스
+        // = +div(ΓmagSf·correction(U)) (gaussLaplacianScheme 1:1) —
+        // 저장 소스(H() 포함)라 LAD-bulk와 같은 srcX3 슬롯에 합산
+        tmp<volVectorField> tCorrU;
+        if (gpuNonOrtho_)
+        {
+            tmp<fv::snGradScheme<vector>> tsnU
+            (
+                fv::snGradScheme<vector>::New
+                (
+                    mesh, mesh.schemes().snGrad(U.name())
+                )
+            );
+            const surfaceScalarField muMagSf
+            (
+                fvc::interpolate(muLap)*mesh.magSf()
+            );
+            tCorrU = fvc::div(muMagSf*tsnU().correction(U));
+        }
+
         // SoA gather (v2: 물리 필드는 GPU — 호스트는 U/경계값만)
         gpuUBuf_.setSize(15*nc + 22*nbf);
         double* U3 = gpuUBuf_.begin();          // [3*nc]
@@ -219,14 +241,35 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                     U3old[k*nc + i] = Uo[i][k];
                 }
             }
-            if (tsrcBulk.valid())
+            if (tsrcBulk.valid() || tCorrU.valid())
             {
-                const vectorField& sb = tsrcBulk().primitiveField();
                 for (label i = 0; i < nc; i++)
                 {
                     for (label k = 0; k < 3; k++)
                     {
-                        srcX3[k*nc + i] = sb[i][k];
+                        srcX3[k*nc + i] = 0.0;
+                    }
+                }
+                if (tsrcBulk.valid())
+                {
+                    const vectorField& sb = tsrcBulk().primitiveField();
+                    for (label i = 0; i < nc; i++)
+                    {
+                        for (label k = 0; k < 3; k++)
+                        {
+                            srcX3[k*nc + i] += sb[i][k];
+                        }
+                    }
+                }
+                if (tCorrU.valid())
+                {
+                    const vectorField& cu = tCorrU().primitiveField();
+                    for (label i = 0; i < nc; i++)
+                    {
+                        for (label k = 0; k < 3; k++)
+                        {
+                            srcX3[k*nc + i] += cu[i][k];
+                        }
                     }
                 }
             }
@@ -514,6 +557,13 @@ void Foam::solvers::fgmFluid::momentumPredictor()
 
         // 4) 경계 행렬 계수 (BC 가중치: 본 케이스 BC 타입들은 w 미사용
         //    — CD 가중치 전달)
+        const surfaceScalarField dcsU
+        (
+            fv::snGradScheme<vector>::New
+            (
+                mesh, mesh.schemes().snGrad(U.name())
+            )().deltaCoeffs(U)
+        );
         List<double> bRelaxA;
         {
             label off = 0;
@@ -542,7 +592,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
 
                     const scalarField pdc
                     (
-                        mesh.deltaCoeffs().boundaryField()[patchi]
+                        dcsU.boundaryField()[patchi]
                     );
                     const vectorField gic
                     (
@@ -706,7 +756,8 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             tmuLap.valid()
           ? muLap.primitiveField().begin() : nullptr /*mu: LAD-U 합산*/,
             nullptr /*srcExp3*/,
-            tsrcBulk.valid() ? srcX3 : nullptr /*LAD-bulk*/,
+            (tsrcBulk.valid() || tCorrU.valid())
+          ? srcX3 : nullptr /*LAD-bulk + 비직교 보정*/,
             nullptr /*gradP3*/,
             bDiag3, bSrc3, solveCmpt,
             relaxAlpha,

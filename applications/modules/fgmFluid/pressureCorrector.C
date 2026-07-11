@@ -55,6 +55,7 @@ Description
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
 #include "fixedFluxPressureFvPatchScalarField.H"
+#include "snGradScheme.H"
 #include "processorFvPatchFields.H"
 #include "processorFvPatch.H"
 #include "PstreamReduceOps.H"
@@ -138,6 +139,28 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
         nbf += p_.boundaryField()[patchi].size();
     }
 
+    // 비직교 스킴 감지: 실제 snGrad 스킴 객체로 판별 — corrected/
+    // limited면 ⓐ 면 계수는 scheme.deltaCoeffs(=nonOrthDeltaCoeffs)
+    // ⓑ 명시 보정 소스는 각 방정식 조립부가 scheme.correction()으로
+    // 호스트 계산해 주입 (gaussLaplacianScheme 1:1).
+    tmp<fv::snGradScheme<scalar>> tsnP
+    (
+        fv::snGradScheme<scalar>::New
+        (
+            mesh, mesh.schemes().snGrad(p_.name())
+        )
+    );
+    gpuNonOrtho_ = tsnP().corrected();
+    if (gpuNonOrtho_ && !gpuNonOrthoWarned_)
+    {
+        Info<< "fgmFluid: corrected snGrad scheme detected -- GPU "
+            << "laplacians use scheme deltaCoeffs + explicit "
+            << "non-orthogonal correction sources (host-computed, "
+            << "1:1 with gaussLaplacianScheme)" << nl << endl;
+        gpuNonOrthoWarned_ = true;
+    }
+    const surfaceScalarField dcsP(tsnP().deltaCoeffs(p_));
+
     List<int> own(nif), nei(nif);
     forAll(mesh.owner(), f)
     {
@@ -146,7 +169,7 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
     }
     List<double> gg(nif);
     const scalarField& magSf = mesh.magSf().primitiveField();
-    const scalarField& dc = mesh.deltaCoeffs().primitiveField();
+    const scalarField& dc = dcsP.primitiveField();
     forAll(gg, f) { gg[f] = magSf[f]*dc[f]; }
 
     List<int> bfc(nbf);
@@ -156,29 +179,6 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
         const labelUList& fc = mesh.boundary()[patchi].faceCells();
         forAll(fc, k) { bfc[off + k] = fc[k]; }
         off += fc.size();
-    }
-
-    // 침묵-갭 방지: GPU 조립(laplacian/snGrad)은 직교 공식 전용 —
-    // corrected/limited 스킴의 비직교 보정(면 계수 nonOrthDeltaCoeffs
-    // + 명시 보정)은 미반영이라 비직교 메시에서 CPU와 행렬부터 다르다.
-    // (rd0110 Fluent 격자 실측) 근사 실행은 허용하되 1회 크게 경고.
-    {
-        // snGrad 스킴명으로 판별 (laplacian corrected와 세트로 쓰임)
-        ITstream& sn = mesh.schemes().snGrad("snGrad(p)");
-        sn.rewind();
-        const word snName(sn);
-        if (snName != "orthogonal" && !gpuNonOrthoWarned_)
-        {
-            WarningInFunction
-                << "GPU assembly (pEqn/ZC/UEqn laplacians) uses the "
-                << "ORTHOGONAL formula but snGrad scheme is '"
-                << snName << "' -- the non-orthogonal correction is "
-                << "NOT applied on the GPU paths; on non-orthogonal "
-                << "meshes the GPU matrices approximate the CPU ones. "
-                << "Verify acceptability or run the affected equations "
-                << "on the CPU." << endl;
-            gpuNonOrthoWarned_ = true;
-        }
     }
 
     const scalarField Vc(mesh.V());
@@ -336,7 +336,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체.
     // 선택 최적화이므로 VRAM 부족(프리플라이트 실패) 시 1회 경고 후
     // 영구 강등 — 나머지 스택은 그대로 GPU (6GB 카드 풀스택 실측)
-    bool devChain = gpuUEqn_ && gpuPEqn_ && !gpuDevChainOff_;
+    // 비직교 보정 활성 시 devChain 제외: 상주 체인은 보정 소스/플럭스
+    // 보정을 모르므로 호스트-prep 경로가 정합 경로다
+    bool devChain =
+        gpuUEqn_ && gpuPEqn_ && !gpuDevChainOff_ && !gpuNonOrtho_;
     if (devChain && rgpPCorrEnsure())
     {
         WarningInFunction
@@ -838,6 +841,13 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         {
             label off = 0;
             label offPar = 0;
+            const surfaceScalarField dcsPEqn
+            (
+                fv::snGradScheme<scalar>::New
+                (
+                    mesh, mesh.schemes().snGrad(p.name())
+                )().deltaCoeffs(p)
+            );
             forAll(p.boundaryField(), patchi)
             {
                 const fvPatchScalarField& pp = p.boundaryField()[patchi];
@@ -856,10 +866,12 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                    *mesh.magSf().boundaryField()[patchi]
                 );
                 // coupled 패치는 무인자 gradient*Coeffs()가 미구현 —
-                // 패치 deltaCoeffs 오버로드 사용 (직교 스킴 1:1)
+                // 스킴 deltaCoeffs 오버로드 사용 (직교=deltaCoeffs,
+                // corrected=nonOrthDeltaCoeffs — fvmLaplacianUncorrected
+                // 의 pDeltaCoeffs 1:1)
                 const scalarField pdc
                 (
-                    mesh.deltaCoeffs().boundaryField()[patchi]
+                    dcsPEqn.boundaryField()[patchi]
                 );
                 const scalarField gic
                 (
@@ -1052,6 +1064,36 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
           ? fv::localEulerDdt::localRDeltaT(mesh).primitiveField().begin()
           : nullptr;
 
+        // 비직교 명시 보정 (gaussLaplacianScheme 1:1): M = pDDt − L 에서
+        // L.source = −V·div(ΓmagSf·corr(p)) → M 소스 += div(·) (per-vol).
+        // fluxRequired(p)라 faceFluxCorrection = ΓmagSf·corr(p)도 보존
+        // (플럭스 재구성에서 −). 보정자 루프가 매 패스 최신 p로 재계산.
+        auto nonOrthoSrc = [&](tmp<surfaceScalarField>& tCorrFaceOut)
+            -> scalarField
+        {
+            tmp<fv::snGradScheme<scalar>> tsn
+            (
+                fv::snGradScheme<scalar>::New
+                (
+                    mesh, mesh.schemes().snGrad(p.name())
+                )
+            );
+            tCorrFaceOut = surfaceScalarField::New
+            (
+                "pFaceFluxCorr",
+                trAUf()*mesh.magSf()*tsn().correction(p)
+            );
+            scalarField r
+            (
+                fvc::div(tCorrFaceOut())().primitiveField()
+            );
+            if (tamdSrc.valid())
+            {
+                r += tamdSrc().primitiveField();
+            }
+            return r;
+        };
+
         // ── 검증 모드: CPU fvMatrix 계수와 대조 (devChain 미지원) ────
         if (gpuPEqnCheck_ && devChain)
         {
@@ -1095,9 +1137,16 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             }
 
             List<double> dG(nc), uG(nif), bG(nc);
+            tmp<surfaceScalarField> tCorrChk;
+            scalarField srcChk;
+            if (gpuNonOrtho_)
+            {
+                srcChk = nonOrthoSrc(tCorrChk);
+            }
             const int rc = rgpPEqnAssembleDump
             (
-                dtInv, rdtCell, amdSrc,
+                dtInv, rdtCell,
+                srcChk.size() ? srcChk.begin() : amdSrc,
                 trAUf().primitiveField().begin(),
                 tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
@@ -1152,6 +1201,20 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         std::chrono::steady_clock::time_point tS;
         if (thermoTimings_) { tS = std::chrono::steady_clock::now(); }
 
+        // ── 비직교 보정자 루프 (CPU while(correctNonOrthogonal()) 1:1):
+        //    매 패스 최신 p로 보정 소스·faceFluxCorrection 재계산 후
+        //    재조립·재솔브. 직교(0회) 케이스는 1회 실행 = 기존과 동일 ──
+        tmp<surfaceScalarField> tPCorrFace;
+        while (pimple.correctNonOrthogonal())
+        {
+        scalarField srcNonOrtho;
+        const double* srcExtraArg = amdSrc;
+        if (gpuNonOrtho_)
+        {
+            srcNonOrtho = nonOrthoSrc(tPCorrFace);
+            srcExtraArg = srcNonOrtho.begin();
+        }
+
         if (gpuPEqnSolver_ == "amgx")
         {
             // ── AmgX 직결: 디바이스 CSR 조립 → AmgX PCG+AMG(계층 동결)
@@ -1182,7 +1245,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             double normFactor = 0;
             int rc = rgpPEqnAssembleCsr
             (
-                dtInv, rdtCell, amdSrc,
+                dtInv, rdtCell, srcExtraArg,
                 devChain ? nullptr : trAUf().primitiveField().begin(),
                 devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
@@ -1275,7 +1338,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
             const int rc = rgpPEqnSolve
             (
-                dtInv, rdtCell, amdSrc,
+                dtInv, rdtCell, srcExtraArg,
                 devChain ? nullptr : trAUf().primitiveField().begin(),
                 devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
@@ -1327,8 +1390,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         }
 
         p.correctBoundaryConditions();
+        }   // while correctNonOrthogonal
 
         // ── 질량 플럭스 재구성: phi = rhof*(phiHbyAv + pEqn.flux()) ──
+        //    비직교: pEqn.flux()에 faceFluxCorrection(−ΓmagSf·corr)이
+        //    포함되므로(fvMatrix::flux 1:1) 내부·경계 모두 차감
         {
             if (devChain)
             {
@@ -1340,9 +1406,22 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 scalarField& phic = phi.primitiveFieldRef();
                 const scalarField& rf = trhof().primitiveField();
                 const scalarField& ph = tphiHbyAv().primitiveField();
-                forAll(phic, f)
+                if (tPCorrFace.valid())
                 {
-                    phic[f] = rf[f]*(ph[f] + gpuPEqnFlux_[f]);
+                    const scalarField& cf =
+                        tPCorrFace().primitiveField();
+                    forAll(phic, f)
+                    {
+                        phic[f] =
+                            rf[f]*(ph[f] + gpuPEqnFlux_[f] - cf[f]);
+                    }
+                }
+                else
+                {
+                    forAll(phic, f)
+                    {
+                        phic[f] = rf[f]*(ph[f] + gpuPEqnFlux_[f]);
+                    }
                 }
             }
 
@@ -1377,13 +1456,21 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 );
                 scalarField& phibf = phi.boundaryFieldRef()[patchi];
 
+                const scalarField corrB
+                (
+                    tPCorrFace.valid()
+                  ? scalarField(tPCorrFace().boundaryField()[patchi])
+                  : scalarField(np, 0.0)
+                );
+
                 if (pp.coupled())
                 {
                     for (label k = 0; k < np; k++)
                     {
                         const scalar fluxB =
                             bDiagA[off + k]*pi[k]
-                          - gpuPEqnParB_[offPar + k]*pp[k];
+                          - gpuPEqnParB_[offPar + k]*pp[k]
+                          - corrB[k];
                         // devChain: concat 때 저장한 proc-면 rhof/phb
                         // (조화 rAUf·ddtCorr 포함) — 비-devChain은
                         // fvc 체인 boundaryField가 이미 정확
@@ -1405,7 +1492,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     for (label k = 0; k < np; k++)
                     {
                         const scalar fluxB =
-                            bDiagA[off + k]*pi[k] - bSrcA[off + k];
+                            bDiagA[off + k]*pi[k] - bSrcA[off + k]
+                          - corrB[k];
                         phibf[k] = rfb[k]*(phb[k] + fluxB);
                     }
                 }

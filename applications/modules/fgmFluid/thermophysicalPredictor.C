@@ -34,6 +34,7 @@ License
 #include "localEulerDdtScheme.H"
 #include "processorFvPatch.H"
 #include "PstreamBuffers.H"
+#include "snGradScheme.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -479,6 +480,30 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         // 의존 BC의 valueFraction 갱신 — 직접 조립 경로 필수)
         psiF.boundaryFieldRef().updateCoeffs();
 
+        // 비직교: 면 계수는 gg(=magSf·scheme.deltaCoeffs, 아밍 시
+        // 업로드)로 이미 반영 — 여기서는 coupled 경계 pdc와
+        // 명시 보정 소스(gaussLaplacianScheme 1:1: −fvm::laplacian이
+        // 방정식에 −로 들어가므로 src += div(ΓmagSf·correction(ψ)))
+        tmp<fv::snGradScheme<scalar>> tsnZC
+        (
+            fv::snGradScheme<scalar>::New
+            (
+                mesh, mesh.schemes().snGrad(psiF.name())
+            )
+        );
+        const surfaceScalarField dcsZC(tsnZC().deltaCoeffs(psiF));
+
+        tmp<volScalarField> tCorrDiv;
+        if (gpuNonOrtho_)
+        {
+            const surfaceScalarField gammaMagSf
+            (
+                fvc::interpolate(gamma)*mesh.magSf()
+            );
+            tCorrDiv =
+                fvc::div(gammaMagSf*tsnZC().correction(psiF));
+        }
+
         label nbf = 0;
         forAll(psiF.boundaryField(), patchi)
         {
@@ -516,7 +541,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
 
                 const scalarField pdc
                 (
-                    mesh.deltaCoeffs().boundaryField()[patchi]
+                    dcsZC.boundaryField()[patchi]
                 );
                 const scalarField gic(pp.gradientInternalCoeffs(pdc));
                 const scalarField gbc(pp.gradientBoundaryCoeffs(pdc));
@@ -597,6 +622,17 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
 
         // fvMatrix::solve(word) 규약과 1:1 — transient 최종 이터레이션이면
         // "YiFinal" 딕셔너리 선택 (CPU 경로 ZEqn.solve("Yi")와 동일)
+        // 명시 소스 결합 (반응 소스 + 비직교 보정)
+        scalarField srcTot;
+        if (tCorrDiv.valid())
+        {
+            srcTot =
+                srcPtr
+              ? scalarField(srcPtr->primitiveField())
+              : scalarField(mesh.nCells(), 0.0);
+            srcTot += tCorrDiv().primitiveField();
+        }
+
         const dictionary& sd = mesh.solution().solverDict
         (
             !mesh.schemes().steady()
@@ -617,7 +653,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
           ? fv::localEulerDdt::localRDeltaT(mesh)
                .primitiveField().begin()
           : nullptr,
-            srcPtr ? 1 : 0,
+            (srcPtr || tCorrDiv.valid()) ? 1 : 0,
             rho.primitiveField().begin(),
             rho.oldTime().primitiveField().begin(),
             psiF.oldTime().primitiveField().begin(),
@@ -626,7 +662,8 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             gamma.primitiveField().begin(),
             nullptr,   // gammaFace (Fickian 추출 경로 미사용)
             sp.primitiveField().begin(),
-            srcPtr ? srcPtr->primitiveField().begin() : nullptr,
+            srcTot.size() ? srcTot.begin()
+          : (srcPtr ? srcPtr->primitiveField().begin() : nullptr),
             bPsiA, bDiagA, bSrcA,
             tol, rtol, maxIter,
             psiF.primitiveFieldRef().begin(),
