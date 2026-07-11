@@ -1,0 +1,4 @@
+gpuMulticomponentFluid.C
+thermophysicalPredictor.C
+
+LIB = $(FOAM_USER_LIBBIN)/libgpuMulticomponentFluid
