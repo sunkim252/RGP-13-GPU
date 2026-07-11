@@ -305,7 +305,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
     // pCorrGPU 디바이스 체인: gpuUEqn(rAU/HbyA 디바이스) + gpuPEqn일 때
     // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체
-    const bool devChain = gpuUEqn_ && gpuPEqn_;
+    // devChain(디바이스 상주 pCorr 체인)은 직렬 전용(v1) — 병렬은
+    // rgpUEqnAH 호스트 회수 + CPU fvc 준비체인 + GPU pEqn 솔브
+    const bool devChain =
+        gpuUEqn_ && gpuPEqn_ && !Pstream::parRun();
 
     tmp<surfaceScalarField> trhof;
     if (!devChain)
@@ -348,7 +351,44 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             }
         }
 
-        const int rc = rgpUEqnAH(U3, rAUh, H3);
+        // 병렬: fvMatrix::H()의 coupled addBoundarySource(H += bC*U_nbr)
+        // 용 이웃 U — momentum cBC 직후라 proc 패치가 이웃 값 보유
+        List<double> UNbr3;
+        if (Pstream::parRun())
+        {
+            label nPar = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                if (U.boundaryField()[patchi].coupled())
+                {
+                    nPar += U.boundaryField()[patchi].size();
+                }
+            }
+            if (nPar > 0)
+            {
+                UNbr3.setSize(3*nPar);
+                label offp = 0;
+                forAll(U.boundaryField(), patchi)
+                {
+                    const fvPatchVectorField& pp =
+                        U.boundaryField()[patchi];
+                    if (!pp.coupled()) continue;
+                    forAll(pp, f)
+                    {
+                        for (label k = 0; k < 3; k++)
+                        {
+                            UNbr3[k*nPar + offp + f] = pp[f][k];
+                        }
+                    }
+                    offp += pp.size();
+                }
+            }
+        }
+
+        const int rc = rgpUEqnAH
+        (
+            U3, UNbr3.size() ? UNbr3.begin() : nullptr, rAUh, H3
+        );
         if (rc)
         {
             FatalErrorInFunction

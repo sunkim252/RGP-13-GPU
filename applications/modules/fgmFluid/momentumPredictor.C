@@ -31,6 +31,8 @@ License
 #include "zeroGradientFvPatchFields.H"
 #include "limitedSurfaceInterpolationScheme.H"
 #include "solutionControl.H"
+#include "processorFvPatch.H"
+#include "PstreamBuffers.H"
 #include "localEulerDdtScheme.H"
 #include "gpu/rgpPEqnTypes.H"
 
@@ -228,13 +230,38 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             {
                 const fvPatchVectorField& pp = U.boundaryField()[patchi];
                 const fvPatchScalarField& ppp = p.boundaryField()[patchi];
-                forAll(pp, f)
+                if (pp.coupled())
                 {
-                    for (label k = 0; k < 3; k++)
+                    // gaussGrad coupled: 경계 기여 = 면 값
+                    // w*own + (1-w)*nei (패치 필드가 이웃 셀 값 보유)
+                    const scalarField w
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const vectorField Uo(pp.patchInternalField());
+                    const scalarField po(ppp.patchInternalField());
+                    forAll(pp, f)
                     {
-                        UB3[k*nbf + off + f] = pp[f][k];
+                        for (label k = 0; k < 3; k++)
+                        {
+                            UB3[k*nbf + off + f] =
+                                w[f]*Uo[f][k] + (1.0 - w[f])*pp[f][k];
+                        }
+                        pB[off + f] =
+                            w[f]*po[f] + (1.0 - w[f])*ppp[f];
                     }
-                    pB[off + f] = ppp[f];
+                }
+                else
+                {
+                    forAll(pp, f)
+                    {
+                        for (label k = 0; k < 3; k++)
+                        {
+                            UB3[k*nbf + off + f] = pp[f][k];
+                        }
+                        pB[off + f] = ppp[f];
+                    }
                 }
                 off += pp.size();
             }
@@ -248,44 +275,214 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                 << exit(FatalError);
         }
 
+        // 1b) 병렬: proc-면 이웃 gradU 교환 → 벡터 리미터(NVDVTVDV
+        //     1:1, uLimVWeights의 호스트 포트) + dev2 명시 플럭스용
+        label nPar = 0;
+        forAll(U.boundaryField(), patchi)
+        {
+            if (U.boundaryField()[patchi].coupled())
+            {
+                nPar += U.boundaryField()[patchi].size();
+            }
+        }
+        List<double> gradN9(9*max(nPar, label(1)), 0.0);
+        List<double> wPar(max(nPar, label(1)), 0.0);
+        if (nPar > 0)
+        {
+            // 자기 쪽 경계셀 gradU(bGrad9)의 proc 슬라이스를 텐서로
+            // 패킹해 이웃 랭크와 교환
+            PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
+            label off = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pp = U.boundaryField()[patchi];
+                const label np = pp.size();
+                if (pp.coupled())
+                {
+                    const processorFvPatch& prp =
+                        refCast<const processorFvPatch>
+                        (
+                            mesh.boundary()[patchi]
+                        );
+                    List<tensor> sv(np);
+                    for (label f = 0; f < np; f++)
+                    {
+                        for (label m = 0; m < 9; m++)
+                        {
+                            sv[f][m] = bGrad9[m*nbf + off + f];
+                        }
+                    }
+                    UOPstream toNbr(prp.neighbProcNo(), pBufs);
+                    toNbr << sv;
+                }
+                off += np;
+            }
+            pBufs.finishedSends();
+            off = 0;
+            label offp = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pp = U.boundaryField()[patchi];
+                const label np = pp.size();
+                if (pp.coupled())
+                {
+                    const processorFvPatch& prp =
+                        refCast<const processorFvPatch>
+                        (
+                            mesh.boundary()[patchi]
+                        );
+                    List<tensor> rv;
+                    UIPstream fromNbr(prp.neighbProcNo(), pBufs);
+                    fromNbr >> rv;
+                    for (label f = 0; f < np; f++)
+                    {
+                        for (label m = 0; m < 9; m++)
+                        {
+                            gradN9[m*nPar + offp + f] = rv[f][m];
+                        }
+                    }
+
+                    // 벡터 리미터 (limitedLinearV k=1) — 내부면 커널과
+                    // 동일 산술, c-측 grad만 own/nei 선택
+                    const scalarField cdw
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField& phb =
+                        phi.boundaryField()[patchi];
+                    const vectorField pd
+                    (
+                        mesh.boundary()[patchi].delta()
+                    );
+                    const vectorField Uo(pp.patchInternalField());
+
+                    for (label f = 0; f < np; f++)
+                    {
+                        const label j = offp + f;
+                        vector gfv;
+                        scalar gradf = 0;
+                        for (label k = 0; k < 3; k++)
+                        {
+                            gfv[k] = pp[f][k] - Uo[f][k];
+                            gradf += gfv[k]*gfv[k];
+                        }
+                        scalar gradcf = 0;
+                        for (label k = 0; k < 3; k++)
+                        {
+                            scalar gcfk = 0;
+                            for (label i = 0; i < 3; i++)
+                            {
+                                const scalar g =
+                                    (phb[f] > 0)
+                                  ? bGrad9[(3*i + k)*nbf + off + f]
+                                  : gradN9[(3*i + k)*nPar + j];
+                                gcfk += pd[f][i]*g;
+                            }
+                            gradcf += gfv[k]*gcfk;
+                        }
+                        scalar r;
+                        if (mag(gradcf) >= 1000.0*mag(gradf))
+                        {
+                            r = 2.0*1000.0*sign(gradcf)*sign(gradf)
+                              - 1.0;
+                        }
+                        else
+                        {
+                            r = 2.0*(gradcf/gradf) - 1.0;
+                        }
+                        const scalar lim =
+                            max(min(2.0*r, scalar(1)), scalar(0));
+                        wPar[j] =
+                            lim*cdw[f]
+                          + (1.0 - lim)*((phb[f] >= 0) ? 1.0 : 0.0);
+                    }
+                    offp += np;
+                }
+                off += np;
+            }
+        }
+
         // 2) 명시항 경계 기여 (호스트, 패치 크기): gaussGrad 경계 보정
         //    (gGrad_b = gGradI − n⊗(n·gGradI) + n⊗snGrad(U)) →
         //    X_b = mu_b*dev2(T(gGrad_b)) → Sf_b & X_b
         {
             label off = 0;
+            label offp = 0;
             forAll(U.boundaryField(), patchi)
             {
                 const fvPatchVectorField& pp = U.boundaryField()[patchi];
                 const label np = pp.size();
                 if (np == 0) continue;
 
-                const vectorField nHat(mesh.boundary()[patchi].nf());
-                const vectorField snU(pp.snGrad());
                 const vectorField& Sfb =
                     mesh.Sf().boundaryField()[patchi];
                 const scalarField& mub =
                     muEff.boundaryField()[patchi];
 
-                for (label f = 0; f < np; f++)
+                if (pp.coupled())
                 {
-                    tensor g;
-                    for (label i = 0; i < 3; i++)
+                    // fvc::div(mu*dev2(T(gradU))) coupled 면: 양측 X를
+                    // 선형 보간 (uDevTauFlux 내부면 산술과 동일) —
+                    // 이웃 gradU는 1b)에서 교환, 이웃 mu는 패치 값
+                    const scalarField cdw
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField muo
+                    (
+                        muEff.boundaryField()[patchi]
+                            .patchInternalField()
+                    );
+                    for (label f = 0; f < np; f++)
                     {
-                        for (label j = 0; j < 3; j++)
+                        tensor go, gn;
+                        for (label m = 0; m < 9; m++)
                         {
-                            g[3*i + j] =
-                                bGrad9[(3*i + j)*nbf + off + f];
+                            go[m] = bGrad9[m*nbf + off + f];
+                            gn[m] = gradN9[m*nPar + offp + f];
+                        }
+                        const tensor Xo(muo[f]*dev2(go.T()));
+                        const tensor Xn(mub[f]*dev2(gn.T()));
+                        const tensor Xf
+                        (
+                            cdw[f]*Xo + (1.0 - cdw[f])*Xn
+                        );
+                        const vector flux = Sfb[f] & Xf;
+                        for (label k = 0; k < 3; k++)
+                        {
+                            bFlux3[k*nbf + off + f] = flux[k];
                         }
                     }
-                    const vector n = nHat[f];
-                    // gaussGrad::correctBoundaryConditions
-                    const vector nDotG = n & g;
-                    const tensor gc(g - n*nDotG + n*snU[f]);
-                    const tensor X(mub[f]*dev2(gc.T()));
-                    const vector flux = Sfb[f] & X;
-                    for (label k = 0; k < 3; k++)
+                    offp += np;
+                }
+                else
+                {
+                    const vectorField nHat(mesh.boundary()[patchi].nf());
+                    const vectorField snU(pp.snGrad());
+
+                    for (label f = 0; f < np; f++)
                     {
-                        bFlux3[k*nbf + off + f] = flux[k];
+                        tensor g;
+                        for (label i = 0; i < 3; i++)
+                        {
+                            for (label j = 0; j < 3; j++)
+                            {
+                                g[3*i + j] =
+                                    bGrad9[(3*i + j)*nbf + off + f];
+                            }
+                        }
+                        const vector n = nHat[f];
+                        // gaussGrad::correctBoundaryConditions
+                        const vector nDotG = n & g;
+                        const tensor gc(g - n*nDotG + n*snU[f]);
+                        const tensor X(mub[f]*dev2(gc.T()));
+                        const vector flux = Sfb[f] & X;
+                        for (label k = 0; k < 3; k++)
+                        {
+                            bFlux3[k*nbf + off + f] = flux[k];
+                        }
                     }
                 }
                 off += np;
@@ -312,6 +509,8 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         //    — CD 가중치 전달)
         {
             label off = 0;
+            label offp = 0;
+            List<double> parB(max(nPar, label(1)), 0.0);
             forAll(U.boundaryField(), patchi)
             {
                 const fvPatchVectorField& pp = U.boundaryField()[patchi];
@@ -319,30 +518,99 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                 if (np == 0) continue;
 
                 const scalarField& phb = phi.boundaryField()[patchi];
-                const scalarField& wb =
-                    mesh.surfaceInterpolation::weights()
-                        .boundaryField()[patchi];
-                const vectorField vic(pp.valueInternalCoeffs(wb));
-                const vectorField vbc(pp.valueBoundaryCoeffs(wb));
-                const scalarField gMsf
-                (
-                    muLap.boundaryField()[patchi]
-                   *mesh.magSf().boundaryField()[patchi]
-                );
-                const vectorField gic(pp.gradientInternalCoeffs());
-                const vectorField gbc(pp.gradientBoundaryCoeffs());
 
-                for (label f = 0; f < np; f++)
+                if (pp.coupled())
                 {
-                    for (label k = 0; k < 3; k++)
+                    // processor: div 가중치 = 1b)의 limited 가중치,
+                    // laplacian은 deltaCoeffs 오버로드; mu는 면 보간.
+                    // iC → diag(bDiag3), bC → 인터페이스(parB, 성분 공유)
+                    scalarField wV(np);
+                    for (label f = 0; f < np; f++)
                     {
-                        bDiag3[k*nbf + off + f] =
-                            phb[f]*vic[f][k] - gMsf[f]*gic[f][k];
-                        bSrc3[k*nbf + off + f] =
-                            -phb[f]*vbc[f][k] + gMsf[f]*gbc[f][k];
+                        wV[f] = wPar[offp + f];
+                    }
+                    const vectorField vic(pp.valueInternalCoeffs(wV));
+                    const vectorField vbc(pp.valueBoundaryCoeffs(wV));
+
+                    const scalarField pdc
+                    (
+                        mesh.deltaCoeffs().boundaryField()[patchi]
+                    );
+                    const vectorField gic
+                    (
+                        pp.gradientInternalCoeffs(pdc)
+                    );
+                    const vectorField gbc
+                    (
+                        pp.gradientBoundaryCoeffs(pdc)
+                    );
+
+                    const scalarField cdw
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField muo
+                    (
+                        muLap.boundaryField()[patchi]
+                            .patchInternalField()
+                    );
+                    const scalarField& mun =
+                        muLap.boundaryField()[patchi];
+                    const scalarField& msf =
+                        mesh.magSf().boundaryField()[patchi];
+
+                    for (label f = 0; f < np; f++)
+                    {
+                        const scalar gMsf =
+                            (cdw[f]*muo[f] + (1.0 - cdw[f])*mun[f])
+                           *msf[f];
+                        for (label k = 0; k < 3; k++)
+                        {
+                            bDiag3[k*nbf + off + f] =
+                                phb[f]*vic[f][k] - gMsf*gic[f][k];
+                            bSrc3[k*nbf + off + f] = 0;
+                        }
+                        // coupled vic/vbc/gic/gbc는 등방(성분 동일)
+                        parB[offp + f] =
+                            -phb[f]*vbc[f][0] + gMsf*gbc[f][0];
+                    }
+                    offp += np;
+                }
+                else
+                {
+                    const scalarField& wb =
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi];
+                    const vectorField vic(pp.valueInternalCoeffs(wb));
+                    const vectorField vbc(pp.valueBoundaryCoeffs(wb));
+                    const scalarField gMsf
+                    (
+                        muLap.boundaryField()[patchi]
+                       *mesh.magSf().boundaryField()[patchi]
+                    );
+                    const vectorField gic(pp.gradientInternalCoeffs());
+                    const vectorField gbc(pp.gradientBoundaryCoeffs());
+
+                    for (label f = 0; f < np; f++)
+                    {
+                        for (label k = 0; k < 3; k++)
+                        {
+                            bDiag3[k*nbf + off + f] =
+                                phb[f]*vic[f][k] - gMsf[f]*gic[f][k];
+                            bSrc3[k*nbf + off + f] =
+                                -phb[f]*vbc[f][k] + gMsf[f]*gbc[f][k];
+                        }
                     }
                 }
                 off += np;
+            }
+
+            if (offp > 0 && rgpUEqnParCoeffs(parB.begin()))
+            {
+                FatalErrorInFunction
+                    << "rgpUEqnParCoeffs: " << rgpPEqnLastError()
+                    << exit(FatalError);
             }
         }
 

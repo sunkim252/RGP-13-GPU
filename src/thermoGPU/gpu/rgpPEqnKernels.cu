@@ -78,6 +78,7 @@ namespace
         double *UB3 = nullptr, *bfx3 = nullptr;       // [3*nbf]
         double *bg9 = nullptr;                        // [9*nbf]
         double *rAU = nullptr, *HbyA3 = nullptr;      // [nc], [3*nc]
+        double *parB = nullptr;   // [totF] 병렬 인터페이스 계수 (성분 공유)
         bool assembled = false;   // rgpUEqnSolve 조립 완료 여부 (AH 가드)
     } gU;
 
@@ -168,7 +169,7 @@ namespace
             &gU.diag, &gU.upper, &gU.lower, &gU.b3, &gU.U3,
             &gU.bDiag3, &gU.bSrc3, &gU.workDiag, &gU.workB, &gU.H,
             &gU.grad9, &gU.src3, &gU.gradP, &gU.UB3, &gU.bfx3, &gU.bg9,
-            &gU.rAU, &gU.HbyA3,
+            &gU.rAU, &gU.HbyA3, &gU.parB,
             &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld
         };
@@ -408,6 +409,19 @@ __global__ void parGather3
     out[k] = g[c];
     out[n + k] = g[(size_t)nc + c];
     out[2*n + k] = g[(size_t)2*nc + c];
+}
+
+//- 병렬: fvMatrix::H()의 coupled addBoundarySource — H[fc] += bC*psi_nbr
+__global__ void uHPar
+(
+    const int n, const int* __restrict__ fc,
+    const double* __restrict__ bC, const double* __restrict__ psiNbr,
+    double* __restrict__ H
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    atomicAdd(&H[fc[k]], bC[k]*psiNbr[k]);
 }
 
 //- 병렬: rowSum(normFactor용)에 인터페이스 계수 반영 (lduMatrix::sumA)
@@ -2900,7 +2914,7 @@ int rgpUEqnSolve
             nc, nf, gU.workDiag, gU.upper, gU.lower, gU.workB, gB.x,
             tol, relTol, maxIter,
             &initRes3[c], &finalRes3[c], &iters3[c],
-            nullptr   // gpuUEqn은 직렬 전용 (병렬 halo는 Stage B)
+            (gU.parB && gPar.active && gPar.totF > 0) ? gU.parB : nullptr
         );
         if (rc) return rc;
 
@@ -2920,7 +2934,27 @@ int rgpUEqnSolve
 }
 
 
-int rgpUEqnAH(const double* U3, double* rAU, double* H3)
+int rgpUEqnParCoeffs(const double* bCoeffs)
+{
+    // UEqn 인터페이스 계수는 별도 버퍼(gU.parB): pEqn/ZC가 gPar.bC를
+    // 이후 덮어써도 pCorr의 rgpUEqnAH가 재사용할 수 있어야 한다
+    if (!gPar.active || gPar.totF <= 0) return 0;
+    cudaError_t e;
+    if (!gU.parB)
+    {
+        if ((e = cudaMalloc(&gU.parB, (size_t)gPar.totF*sizeof(double)))
+            != cudaSuccess) return pfail(e, "ueqnPar/malloc");
+    }
+    if ((e = cudaMemcpy(gU.parB, bCoeffs,
+                        (size_t)gPar.totF*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "ueqnPar/H2D");
+    return 0;
+}
+
+
+int rgpUEqnAH(const double* U3, const double* UNbr3,
+              double* rAU, double* H3)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
     if (!gU.diag || !gU.assembled)
@@ -2972,6 +3006,17 @@ int rgpUEqnAH(const double* U3, double* rAU, double* H3)
         {
             rgppeqn::uHBnd<<<nb(nbf), BS>>>
                 (nbf, nc, c, gM.bfc, gU.bDiag3, gU.bSrc3, gU.U3, gU.H);
+        }
+        if (UNbr3 && gU.parB && gPar.active && gPar.totF > 0)
+        {
+            // 이웃 U를 dRecv에 스테이징 (호스트가 cBC 직후 값 제공)
+            if ((e = cudaMemcpy(gPar.dRecv,
+                                UNbr3 + (size_t)c*gPar.totF,
+                                (size_t)gPar.totF*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "ueqnAH/H2D UNbr");
+            rgppeqn::uHPar<<<nb(gPar.totF), BS>>>
+                (gPar.totF, gPar.fc, gU.parB, gPar.dRecv, gU.H);
         }
         rgppeqn::uDivV<<<nb(nc), BS>>>(nc, gM.V, gU.H);
         rgppeqn::uHbyA<<<nb(nc), BS>>>(nc, c, gU.rAU, gU.H, gU.HbyA3);

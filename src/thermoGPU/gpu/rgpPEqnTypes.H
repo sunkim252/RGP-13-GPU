@@ -177,7 +177,14 @@ int rgpUEqnSolve
     double* U3out, double* initRes3, double* finalRes3, int* iters3
 );
 
-int rgpUEqnAH(const double* U3, double* rAU, double* H3);
+/*  병렬: UEqn 인터페이스 계수 업로드 (성분 공유 스칼라, proc-면 연접,
+    momentumPredictor가 조립 직전 호출 — 별도 디바이스 버퍼라 pEqn/ZC의
+    rgpPEqnParCoeffs와 독립). rgpUEqnAH의 UNbr3는 fvMatrix::H()의
+    coupled addBoundarySource(H += bC*U_nbr)용 이웃 U (SoA [3*totF],
+    직렬이면 NULL).                                                    */
+int rgpUEqnParCoeffs(const double* bCoeffs);
+int rgpUEqnAH(const double* U3, const double* UNbr3,
+              double* rAU, double* H3);
 
 /*  pCorr 준비체인 (gpuUEqn+gpuPEqn 디바이스 체인 전용):
     Prep — rhof/rAUf(조화)/phiHbyAv(flux(HbyA)+Euler ddtCorr)/psis를
