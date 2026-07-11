@@ -128,244 +128,62 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             }
         }
     }
-    List<double> procLim(nPar, 1.0);
     List<double> procW(nPar, 0.0);
-
-    // 3성분 벡터의 proc-패치 교환 (SoA [3*nPar] ↔ 이웃 랭크)
-    auto exchangeParVec3 = [&](const List<double>& s, List<double>& r)
-    {
-        PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
-        label offp = 0;
-        forAll(Z_.boundaryField(), patchi)
-        {
-            if (!Z_.boundaryField()[patchi].coupled()) continue;
-            const processorFvPatch& pp =
-                refCast<const processorFvPatch>(mesh.boundary()[patchi]);
-            const label np = pp.size();
-            List<vector> sv(np);
-            for (label k = 0; k < np; k++)
-            {
-                sv[k] = vector
-                (
-                    s[offp + k], s[nPar + offp + k], s[2*nPar + offp + k]
-                );
-            }
-            UOPstream toNbr(pp.neighbProcNo(), pBufs);
-            toNbr << sv;
-            offp += np;
-        }
-        pBufs.finishedSends();
-        offp = 0;
-        forAll(Z_.boundaryField(), patchi)
-        {
-            if (!Z_.boundaryField()[patchi].coupled()) continue;
-            const processorFvPatch& pp =
-                refCast<const processorFvPatch>(mesh.boundary()[patchi]);
-            const label np = pp.size();
-            List<vector> rv;
-            UIPstream fromNbr(pp.neighbProcNo(), pBufs);
-            fromNbr >> rv;
-            for (label k = 0; k < np; k++)
-            {
-                r[offp + k] = rv[k].x();
-                r[nPar + offp + k] = rv[k].y();
-                r[2*nPar + offp + k] = rv[k].z();
-            }
-            offp += np;
-        }
-    };
 
     if (gpuZC_)
     {
         // ZCGPU: multivariate limitedLinear 가중치를 mvConvection 생성
-        // 시점(= manifold 갱신 전 필드 값)에 GPU에서 준비. limiter =
+        // 시점(= manifold 갱신 전 필드 값)에 **CPU 스킴 자체로** 계산해
+        // 업로드. 디바이스 자체 계산은 컴파일러 FMA 축약(gcc
+        // -ffp-contract=fast vs nvcc -fmad=false)의 ULP 차이로 평탄
+        // 필드(h ~1e6에 1 ULP 요동)에서 limiter의 이산 결정이 뒤집혀
+        // 2차 외부보정부터 K-스케일 오차로 증폭된다 — module에서 실측·
+        // 확정한 문제와 동일(rgpSTWeightsSet 도입 배경). limiter =
         // fields 테이블(he, Z, C[, h, W]) 각 필드 limiter의 min.
         armGpuSTMesh();
 
-        if (rgpSTWeightsBegin(phi.primitiveField().begin()))
         {
-            FatalErrorInFunction
-                << "rgpSTWeightsBegin: " << rgpPEqnLastError()
-                << exit(FatalError);
-        }
+            ITstream& is = mesh.schemes().div("div(phi,Yi_h)");
+            is.rewind();
+            const word gaussName(is);   // "Gauss" 소비
 
-        label nbfW = 0;
-        forAll(Z_.boundaryField(), patchi)
-        {
-            nbfW += Z_.boundaryField()[patchi].size();
-        }
-        gpuZCBuf_.setSize(3*nbfW);
+            tmp<multivariateSurfaceInterpolationScheme<scalar>> tmvs
+            (
+                multivariateSurfaceInterpolationScheme<scalar>::New
+                (
+                    mesh, fields, phi, is
+                )
+            );
+            const surfaceScalarField wMv
+            (
+                tmvs()(Z_)().weights(Z_)
+            );
 
-        auto addWeightField = [&](const volScalarField& f)
-        {
-            double* bPsiA = gpuZCBuf_.begin();
-            label off = 0;
-            forAll(f.boundaryField(), patchi)
-            {
-                const fvPatchScalarField& pf = f.boundaryField()[patchi];
-                if (pf.coupled())
-                {
-                    // gaussGrad coupled 규약: 경계 기여는 면 값
-                    // w*psi_own + (1-w)*psi_nei (pf가 이웃 셀 값 보유)
-                    const scalarField w
-                    (
-                        mesh.surfaceInterpolation::weights()
-                            .boundaryField()[patchi]
-                    );
-                    const scalarField own(pf.patchInternalField());
-                    forAll(pf, fi)
-                    {
-                        bPsiA[off + fi] =
-                            w[fi]*own[fi] + (1.0 - w[fi])*pf[fi];
-                    }
-                }
-                else
-                {
-                    forAll(pf, fi) { bPsiA[off + fi] = pf[fi]; }
-                }
-                off += pf.size();
-            }
-            if (rgpSTWeightsField(f.primitiveField().begin(), bPsiA))
+            const scalarField& wi = wMv.primitiveField();
+            gpuZCBuf_.setSize(wi.size());
+            forAll(wi, f) { gpuZCBuf_[f] = wi[f]; }
+            if (rgpSTWeightsSet(gpuZCBuf_.begin()))
             {
                 FatalErrorInFunction
-                    << "rgpSTWeightsField(" << f.name() << "): "
-                    << rgpPEqnLastError()
+                    << "rgpSTWeightsSet: " << rgpPEqnLastError()
                     << exit(FatalError);
             }
 
-            // 병렬: 이 필드의 proc-면 limiter를 min-누적
-            // (LimitedScheme.C coupled 분기 1:1 — NVDTVD::r + limitedLinear)
+            // 병렬: proc-면 가중치는 스킴이 함께 산출한 boundaryField
             if (nPar > 0)
             {
-                List<double> gradP(3*nPar), gradN(3*nPar);
-                if (rgpSTGradAtPar(gradP.begin()))
-                {
-                    FatalErrorInFunction
-                        << "rgpSTGradAtPar: " << rgpPEqnLastError()
-                        << exit(FatalError);
-                }
-                exchangeParVec3(gradP, gradN);
-
                 label offp = 0;
-                forAll(f.boundaryField(), patchi)
+                forAll(Z_.boundaryField(), patchi)
                 {
-                    const fvPatchScalarField& pf =
-                        f.boundaryField()[patchi];
-                    if (!pf.coupled()) continue;
-                    const label np = pf.size();
-
-                    const scalarField phiP(pf.patchInternalField());
-                    const scalarField& phb = phi.boundaryField()[patchi];
-                    const vectorField pd(mesh.boundary()[patchi].delta());
-
-                    for (label k = 0; k < np; k++)
+                    if (!Z_.boundaryField()[patchi].coupled())
                     {
-                        const label j = offp + k;
-                        const vector gP
-                        (
-                            gradP[j], gradP[nPar + j], gradP[2*nPar + j]
-                        );
-                        const vector gN
-                        (
-                            gradN[j], gradN[nPar + j], gradN[2*nPar + j]
-                        );
-                        const scalar gradf = pf[k] - phiP[k];
-                        const scalar gradcf =
-                            pd[k] & (phb[k] > 0 ? gP : gN);
-
-                        scalar r;
-                        if (mag(gradcf) >= 1000.0*mag(gradf))
-                        {
-                            r = 2.0*1000.0*sign(gradcf)*sign(gradf) - 1.0;
-                        }
-                        else
-                        {
-                            r = 2.0*(gradcf/gradf) - 1.0;
-                        }
-                        procLim[j] = min
-                        (
-                            procLim[j],
-                            max(min(2.0*r, scalar(1)), scalar(0))
-                        );
+                        continue;
                     }
-                    offp += np;
+                    const scalarField& wb =
+                        wMv.boundaryField()[patchi];
+                    forAll(wb, k) { procW[offp + k] = wb[k]; }
+                    offp += wb.size();
                 }
-            }
-        };
-        // 수송 스칼라 목록: Z, C [+ h(비단열) + W(희석)] — h/W는 Z와
-        // 동일한 이류-확산 기계(소스 없음, gamma만 상이)라 같은 배치로
-        DynamicList<word> zcNames;
-        zcNames.append(Z_.name());
-        zcNames.append(C_.name());
-        if (hPtr_.valid()) { zcNames.append(hPtr_().name()); }
-        if (WPtr_.valid()) { zcNames.append(WPtr_().name()); }
-
-        forAll(zcNames, zi)
-        {
-            const word& nm = zcNames[zi];
-            if
-            (
-                mesh.solution().relaxEquation(nm)
-             && mesh.solution().equationRelaxationFactor(nm) != 1
-            )
-            {
-                FatalErrorInFunction
-                    << "gpuZC (v1) does not support equation relaxation "
-                    << "on " << nm << exit(FatalError);
-            }
-            if (fvModels().addsSupToField(nm))
-            {
-                FatalErrorInFunction
-                    << "gpuZC (v1) does not support fvModels sources on "
-                    << nm << exit(FatalError);
-            }
-            // 행렬-레벨 fvConstraint 차단 (CPU 경로는 constrain(Eqn)을
-            // 적용 — GPU 조립은 미반영이므로 켜져 있으면 침묵 발산)
-            checkGpuConstraints(nm, "gpuZC");
-        }
-        if (Pstream::parRun() && gpuPEqnCheck_)
-        {
-            FatalErrorInFunction
-                << "gpuPEqnCheck is serial-only"
-                << exit(FatalError);
-        }
-
-        addWeightField(thermo.he());
-        addWeightField(Z_);
-        addWeightField(C_);
-        if (hPtr_.valid()) { addWeightField(hPtr_()); }
-        if (WPtr_.valid()) { addWeightField(WPtr_()); }
-
-        if (rgpSTWeightsEnd())
-        {
-            FatalErrorInFunction
-                << "rgpSTWeightsEnd: " << rgpPEqnLastError()
-                << exit(FatalError);
-        }
-
-        // 병렬: proc-면 최종 가중치 (multivariateScheme 규약 1:1 —
-        // w = lim*CD + (1-lim)*upwind)
-        if (nPar > 0)
-        {
-            label offp = 0;
-            forAll(Z_.boundaryField(), patchi)
-            {
-                if (!Z_.boundaryField()[patchi].coupled()) continue;
-                const label np = Z_.boundaryField()[patchi].size();
-                const scalarField cdw
-                (
-                    mesh.surfaceInterpolation::weights()
-                        .boundaryField()[patchi]
-                );
-                const scalarField& phb = phi.boundaryField()[patchi];
-                for (label k = 0; k < np; k++)
-                {
-                    const double lim = procLim[offp + k];
-                    procW[offp + k] =
-                        lim*cdw[k]
-                      + (1.0 - lim)*((phb[k] >= 0.0) ? 1.0 : 0.0);
-                }
-                offp += np;
             }
         }
     }
