@@ -623,6 +623,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             psiF.primitiveField().begin(),
             phi.primitiveField().begin(),
             gamma.primitiveField().begin(),
+            nullptr,   // gammaFace (Fickian 추출 경로 미사용)
             sp.primitiveField().begin(),
             srcPtr ? srcPtr->primitiveField().begin() : nullptr,
             bPsiA, bDiagA, bSrcA,

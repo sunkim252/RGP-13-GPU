@@ -18,12 +18,17 @@ Description
         gpuEEqn  on;    // energy equation on GPU (requires gpuYEqn)
         gpuCheck off;   // coefficient cross-check vs CPU fvMatrix
 
-    v1 constraints (loud Fatal/fallback, no silent divergence):
-    serial-only (auto-disable + warning in parallel), Euler/LTS ddt,
-    'Gauss linear orthogonal' laplacian, unityLewis- or Fourier-type
-    thermophysical transport (divj/divq are pure laplacians), he == h,
-    no fvModels sources / matrix-level fvConstraints / relaxation on
-    the GPU-solved fields, no buoyancy with gpuEEqn.
+    Diffusion: unityLewis-type transport uses the fast device path
+    (cell alphaEff, face-interpolated on the GPU); any other model
+    (Fickian/FickianFourier/FickianEddyDiffusivity -- non-unity Lewis,
+    per-specie DEff, Soret) is handled generically by extracting the
+    face/boundary coefficients and explicit sources from the model's
+    own divj/divq matrices and injecting them into the device assembly.
+
+    v1 constraints (loud Fatal, no silent divergence): Euler/LTS ddt,
+    he == h, no fvModels sources / fvConstraints / relaxation on the
+    GPU-solved fields, no buoyancy/MRF/transonic/consistent, static
+    mesh. Serial and MPI-parallel (processor coupling) supported.
 
 SourceFiles
     gpuMulticomponentFluid.C
@@ -59,6 +64,11 @@ class gpuMulticomponentFluid
         Switch gpuUEqn_;
         Switch gpuPEqn_;
         Switch gpuCheck_;
+
+        //- Fickian류(비-unity Lewis) 확산: 모델이 조립한 divj/divq
+        //  행렬에서 면 계수·경계 계수·명시 소스를 추출해 GPU 조립에
+        //  주입 (unityLewis*는 셀-gamma 고속 경로)
+        bool gpuDiffExtract_;
 
         //- 메시 아밍 상태 (토폴로지/이동 감지 재아밍 — fgmFluid와 동일)
         mutable bool gpuMeshArmed_;
@@ -97,7 +107,8 @@ class gpuMulticomponentFluid
             const volScalarField& gamma,
             const scalarField& sp,
             const scalarField& src,
-            const word& dictBase
+            const word& dictBase,
+            fvScalarMatrix* diffOp = nullptr
         );
 
         //- v1 가드: relax/fvModels/fvConstraints가 GPU-솔브 필드에

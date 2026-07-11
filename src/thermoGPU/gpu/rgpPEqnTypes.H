@@ -214,7 +214,11 @@ int rgpSTEqnSolve
     double dtInv, const double* rdtCell, int hasSrc,
     const double* rho, const double* rhoOld, const double* psiOld,
     const double* p0,
-    const double* phiInt, const double* gammaCell, const double* spCell,
+    const double* phiInt, const double* gammaCell,
+    const double* gammaFace,   /* [nf] Fickian류: CPU-추출 면 계수
+                                  Γ_f(=-divj.upper) 직접 주입; null이면
+                                  gammaCell 셀 필드의 선형 면 보간 */
+    const double* spCell,
     const double* srcCell, const double* bPsi,
     const double* bDiag, const double* bSrc,
     double tol, double relTol, int maxIter,

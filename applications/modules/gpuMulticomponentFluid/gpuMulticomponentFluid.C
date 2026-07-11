@@ -32,6 +32,7 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
     gpuUEqn_(false),
     gpuPEqn_(false),
     gpuCheck_(false),
+    gpuDiffExtract_(false),
     gpuMeshArmed_(false),
     gpuMeshCells_(-1),
     gpuMeshFaces_(-1),
@@ -81,20 +82,19 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
 
     if (gpuYEqn_)
     {
-        // v1: divj/divq가 순수 laplacian인 수송 모델만 (Fickian류의
-        // 추가 명시 보정항은 미반영 — 침묵 오차 방지)
+        // 확산 처리 모드: unityLewis*는 gamma=alphaEff 셀 필드의
+        // 디바이스 면 보간(고속 경로); 그 외(Fickian/FickianFourier/
+        // FickianEddyDiffusivity 등 비-unity Lewis)는 모델이 조립한
+        // divj/divq 행렬에서 계수·명시항을 추출해 주입(일반 경로 —
+        // 종별 DEff·Soret(DT)·비직교 소스 자동 포섭)
         const word ttType(thermophysicalTransport->type());
-        if
-        (
-            ttType.find("unityLewis") == std::string::npos
-         && ttType.find("Fourier") == std::string::npos
-        )
+        gpuDiffExtract_ =
+            ttType.find("unityLewis") == std::string::npos;
+        if (gpuDiffExtract_)
         {
-            FatalErrorInFunction
-                << "gpuYEqn (v1) supports unityLewis*/Fourier "
-                << "thermophysical transport only (divj must be a pure "
-                << "laplacian); active model: " << ttType
-                << exit(FatalError);
+            Info<< "gpuMulticomponentFluid: non-unity-Lewis transport ("
+                << ttType << ") -- diffusion operators extracted from "
+                << "the model's divj/divq matrices" << nl << endl;
         }
         if (thermo.he().name() != "h" && gpuEEqn_)
         {

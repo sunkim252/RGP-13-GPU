@@ -23,9 +23,28 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
     const volScalarField& gamma,
     const scalarField& sp,
     const scalarField& src,
-    const word& dictBase
+    const word& dictBase,
+    fvScalarMatrix* diffOp
 )
 {
+    // Fickian류 추출 경로: 모델이 조립한 확산 연산자(divj/divq)에서
+    // 면 계수 Γ_f = -upper, 경계 iC/bC를 그대로 주입 — 종별 DEff·
+    // 명시 보정항(DT 등)·비직교 소스가 자동 포섭된다. 명시 source는
+    // 호출자가 src에 합산.
+    List<double> Gface;
+    if (diffOp)
+    {
+        if (diffOp->hasLower())
+        {
+            FatalErrorInFunction
+                << "asymmetric diffusion operator is not supported"
+                << exit(FatalError);
+        }
+        const scalarField& up = diffOp->upper();
+        Gface.setSize(up.size());
+        forAll(up, f) { Gface[f] = -up[f]; }
+    }
+
     label nbf = 0;
     forAll(psiF.boundaryField(), patchi)
     {
@@ -49,8 +68,7 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
         if (pp.coupled())
         {
             // processor: div 가중치 = multivariate limited(gpuProcW_),
-            // laplacian은 deltaCoeffs 오버로드; gamma는 면 보간.
-            // iC → diag, bC → 인터페이스 계수 (fgmFluid gpuZC 1:1)
+            // 확산 iC/bC는 추출(diffOp) 또는 deltaCoeffs 공식.
             scalarField wP(np);
             for (label k = 0; k < np; k++)
             {
@@ -59,34 +77,55 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
             const scalarField vic(pp.valueInternalCoeffs(wP));
             const scalarField vbc(pp.valueBoundaryCoeffs(wP));
 
-            const scalarField pdc
-            (
-                mesh.deltaCoeffs().boundaryField()[patchi]
-            );
-            const scalarField gic(pp.gradientInternalCoeffs(pdc));
-            const scalarField gbc(pp.gradientBoundaryCoeffs(pdc));
-
-            const scalarField cdw
-            (
-                mesh.surfaceInterpolation::weights()
-                    .boundaryField()[patchi]
-            );
-            const scalarField gOwn
-            (
-                gamma.boundaryField()[patchi].patchInternalField()
-            );
-            const scalarField& gNei = gamma.boundaryField()[patchi];
-            const scalarField& msf =
-                mesh.magSf().boundaryField()[patchi];
-
-            for (label k = 0; k < np; k++)
+            if (diffOp)
             {
-                const scalar gMsf =
-                    (cdw[k]*gOwn[k] + (1.0 - cdw[k])*gNei[k])*msf[k];
-                bDiagA[off + k] = phb[k]*vic[k] - gMsf*gic[k];
-                bSrcA[off + k] = 0;
-                bPsiA[off + k] = pp[k];
-                gpuParB_[offPar + k] = -phb[k]*vbc[k] + gMsf*gbc[k];
+                const scalarField& oiC =
+                    diffOp->internalCoeffs()[patchi];
+                const scalarField& obC =
+                    diffOp->boundaryCoeffs()[patchi];
+                for (label k = 0; k < np; k++)
+                {
+                    bDiagA[off + k] = phb[k]*vic[k] + oiC[k];
+                    bSrcA[off + k] = 0;
+                    bPsiA[off + k] = pp[k];
+                    gpuParB_[offPar + k] =
+                        -phb[k]*vbc[k] + obC[k];
+                }
+            }
+            else
+            {
+                const scalarField pdc
+                (
+                    mesh.deltaCoeffs().boundaryField()[patchi]
+                );
+                const scalarField gic(pp.gradientInternalCoeffs(pdc));
+                const scalarField gbc(pp.gradientBoundaryCoeffs(pdc));
+
+                const scalarField cdw
+                (
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi]
+                );
+                const scalarField gOwn
+                (
+                    gamma.boundaryField()[patchi].patchInternalField()
+                );
+                const scalarField& gNei =
+                    gamma.boundaryField()[patchi];
+                const scalarField& msf =
+                    mesh.magSf().boundaryField()[patchi];
+
+                for (label k = 0; k < np; k++)
+                {
+                    const scalar gMsf =
+                        (cdw[k]*gOwn[k] + (1.0 - cdw[k])*gNei[k])
+                       *msf[k];
+                    bDiagA[off + k] = phb[k]*vic[k] - gMsf*gic[k];
+                    bSrcA[off + k] = 0;
+                    bPsiA[off + k] = pp[k];
+                    gpuParB_[offPar + k] =
+                        -phb[k]*vbc[k] + gMsf*gbc[k];
+                }
             }
             offPar += np;
         }
@@ -110,20 +149,37 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
                 )
             );
 
-            // -laplacian: iC = -gammaMagSf*gic, bC = +gammaMagSf*gbc
-            const scalarField gMsf
-            (
-                gamma.boundaryField()[patchi]
-               *mesh.magSf().boundaryField()[patchi]
-            );
-            const scalarField gic(pp.gradientInternalCoeffs());
-            const scalarField gbc(pp.gradientBoundaryCoeffs());
-
-            for (label k = 0; k < np; k++)
+            if (diffOp)
             {
-                bDiagA[off + k] = phb[k]*vic[k] - gMsf[k]*gic[k];
-                bSrcA[off + k] = -phb[k]*vbc[k] + gMsf[k]*gbc[k];
-                bPsiA[off + k] = pp[k];
+                const scalarField& oiC =
+                    diffOp->internalCoeffs()[patchi];
+                const scalarField& obC =
+                    diffOp->boundaryCoeffs()[patchi];
+                for (label k = 0; k < np; k++)
+                {
+                    bDiagA[off + k] = phb[k]*vic[k] + oiC[k];
+                    bSrcA[off + k] = -phb[k]*vbc[k] + obC[k];
+                    bPsiA[off + k] = pp[k];
+                }
+            }
+            else
+            {
+                // -laplacian: iC = -gammaMagSf*gic, bC = +gMsf*gbc
+                const scalarField gMsf
+                (
+                    gamma.boundaryField()[patchi]
+                   *mesh.magSf().boundaryField()[patchi]
+                );
+                const scalarField gic(pp.gradientInternalCoeffs());
+                const scalarField gbc(pp.gradientBoundaryCoeffs());
+
+                for (label k = 0; k < np; k++)
+                {
+                    bDiagA[off + k] = phb[k]*vic[k] - gMsf[k]*gic[k];
+                    bSrcA[off + k] =
+                        -phb[k]*vbc[k] + gMsf[k]*gbc[k];
+                    bPsiA[off + k] = pp[k];
+                }
             }
         }
         off += np;
@@ -164,7 +220,8 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
             psiF.oldTime().primitiveField().begin(),
             psiF.primitiveField().begin(),
             phi.primitiveField().begin(),
-            gamma.primitiveField().begin(),
+            diffOp ? nullptr : gamma.primitiveField().begin(),
+            diffOp ? Gface.begin() : nullptr,
             sp.begin(),
             src.begin(),
             bPsiA, bDiagA, bSrcA,
@@ -438,6 +495,29 @@ void Foam::solvers::gpuMulticomponentFluid::thermophysicalPredictor()
         // 비-const diag(): 순수 명시 R(diag 미할당)이면 0으로 지연 할당
         scalarField sp(tR.ref().diag());
         scalarField src(-tR().source());
+
+        // Fickian류: divj(Yi) 추출 — 명시 소스는 src로, diag 기여는
+        // sp로 (negSum 외 diag: 통상 0), 면/경계 계수는 diffOp로
+        tmp<fvScalarMatrix> tDiffOp;
+        if (gpuDiffExtract_)
+        {
+            tDiffOp = thermophysicalTransport->divj(Yi);
+            src += tDiffOp().source();
+            if (tDiffOp().hasDiag())
+            {
+                // 행렬 diag = negSum(upper) + 여분 — 디바이스 조립이
+                // negSum을 재구성하므로 여분만 sp로
+                const scalarField& od = tDiffOp().diag();
+                const scalarField& ou = tDiffOp().upper();
+                scalarField negSum(od.size(), 0.0);
+                forAll(mesh.owner(), f)
+                {
+                    negSum[mesh.owner()[f]] -= ou[f];
+                    negSum[mesh.neighbour()[f]] -= ou[f];
+                }
+                forAll(sp, c) { sp[c] -= (od[c] - negSum[c]); }
+            }
+        }
         forAll(sp, c) { sp[c] /= V[c]; src[c] /= V[c]; }
 
         // unityLewis*: divj(Yi) = -laplacian(alpha*DEff(Yi), Yi);
@@ -457,7 +537,11 @@ void Foam::solvers::gpuMulticomponentFluid::thermophysicalPredictor()
             );
         }
 
-        solveScalarGpu(Yi, gammaHe, sp, src, word("Yi"));
+        solveScalarGpu
+        (
+            Yi, gammaHe, sp, src, word("Yi"),
+            tDiffOp.valid() ? &tDiffOp.ref() : nullptr
+        );
 
         // 계수 대조 (경계 iC/bC를 diag/source로 접은 뒤 GPU 덤프와 비교)
         if (gpuCheck_)
@@ -530,8 +614,22 @@ void Foam::solvers::gpuMulticomponentFluid::thermophysicalPredictor()
         src += dpdt;
         src -= expl.primitiveField();
 
-        const scalarField sp(mesh.nCells(), 0.0);
-        solveScalarGpu(he, gammaHe, sp, src, he.name());
+        scalarField sp(mesh.nCells(), 0.0);
+
+        // Fickian류: divq(he) 추출 (종 엔탈피 확산 플럭스 보정 포함)
+        tmp<fvScalarMatrix> tDivq;
+        if (gpuDiffExtract_)
+        {
+            tDivq = thermophysicalTransport->divq(he);
+            const scalarField& V = mesh.V();
+            forAll(src, c) { src[c] += tDivq().source()[c]/V[c]; }
+        }
+
+        solveScalarGpu
+        (
+            he, gammaHe, sp, src, he.name(),
+            tDivq.valid() ? &tDivq.ref() : nullptr
+        );
         fvConstraints().constrain(he);
     }
     else

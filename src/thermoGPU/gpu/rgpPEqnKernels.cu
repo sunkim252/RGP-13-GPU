@@ -737,13 +737,16 @@ __global__ void stCellAssemble
     b[i] = rhoOld[i]*V[i]*r*psiOld[i] + (hasSrc ? src[i]*V[i] : 0.0);
 }
 
-//- 면 항: fvm::div(phi,ψ)[limited w] − fvm::laplacian(γ,ψ) + negSumDiag
+//- 면 항: fvm::div(phi,ψ)[limited w] − fvm::laplacian(γ,ψ) + negSumDiag.
+//  Gface가 non-null이면 면 계수 Γ_f = Gface[f]를 직접 사용 —
+//  Fickian류(종별 DEff·비순수 laplacian)의 CPU-추출 계수 주입 경로.
 __global__ void stFaceAssemble
 (
     const int nf,
     const int* __restrict__ own, const int* __restrict__ nei,
     const double* __restrict__ phi, const double* __restrict__ w,
     const double* __restrict__ wLin, const double* __restrict__ gamma,
+    const double* __restrict__ Gface,
     const double* __restrict__ gg,
     double* __restrict__ diag, double* __restrict__ upper,
     double* __restrict__ lower
@@ -752,7 +755,10 @@ __global__ void stFaceAssemble
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nf) return;
     const int o = own[f], n = nei[f];
-    const double G = (wLin[f]*gamma[o] + (1.0 - wLin[f])*gamma[n])*gg[f];
+    const double G =
+        Gface
+      ? Gface[f]
+      : (wLin[f]*gamma[o] + (1.0 - wLin[f])*gamma[n])*gg[f];
     const double lo = -w[f]*phi[f] - G;
     const double up = (1.0 - w[f])*phi[f] - G;
     lower[f] = lo;
@@ -2519,7 +2525,8 @@ int rgpSTEqnSolve
     double dtInv, const double* rdtCell, int hasSrc,
     const double* rho, const double* rhoOld, const double* psiOld,
     const double* p0,
-    const double* phiInt, const double* gammaCell, const double* spCell,
+    const double* phiInt, const double* gammaCell,
+    const double* gammaFace, const double* spCell,
     const double* srcCell, const double* bPsi,
     const double* bDiag, const double* bSrc,
     double tol, double relTol, int maxIter,
@@ -2539,7 +2546,11 @@ int rgpSTEqnSolve
     {
         {gST.rho, rho, (size_t)nc}, {gST.rhoOld, rhoOld, (size_t)nc},
         {gST.psiOld, psiOld, (size_t)nc}, {gB.x, p0, (size_t)nc},
-        {gST.phi, phiInt, (size_t)nf}, {gST.gamma, gammaCell, (size_t)nc},
+        {gST.phi, phiInt, (size_t)nf},
+        {gST.gamma, gammaFace ? nullptr : gammaCell, (size_t)nc},
+        // Fickian류: CPU-추출 면 계수 Γ_f (gB.rAUf 스테이징 재사용 —
+        // pEqn은 자기 솔브 때 재업로드하므로 충돌 없음)
+        {gB.rAUf, gammaFace, (size_t)nf},
         {gST.sp, spCell, (size_t)nc},
         {gST.src, hasSrc ? srcCell : nullptr, (size_t)nc},
         {gST.bPsi, bPsi, (size_t)nbf},
@@ -2563,6 +2574,7 @@ int rgpSTEqnSolve
          gST.sp, gST.src, gM.V, gB.diag, gB.b);
     rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
+         gammaFace ? gB.rAUf : nullptr,
          gM.gg, gB.diag, gB.upper, gST.lower);
     if (nbf > 0)
     {
@@ -2867,7 +2879,7 @@ int rgpUEqnSolve
     }
     rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
-         gM.gg, gU.diag, gU.upper, gU.lower);
+         nullptr, gM.gg, gU.diag, gU.upper, gU.lower);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "ueqn/assemble launch");
     gU.assembled = true;
