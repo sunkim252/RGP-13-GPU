@@ -65,7 +65,11 @@ inline Foam::chungTransport<Thermo>::chungTransport
     sigmd_(sigmd),
     cacheP_(0), cacheT_(-1), cacheTstar_(0), cacheMur_(0),
     cacheEta0_(0), cacheY_(0), cacheG1_(0), sumXmd_(0)
-{}
+{
+    // Maintain the invariant sumXmd_ == Sum(Xmd_) at construction so mu()/kappa()
+    // are correct even if called before updateTRANS (they read the cached sum).
+    forAll(Xmd_, i) { sumXmd_ += Xmd_[i]; }
+}
 
 
 template<class Thermo>
@@ -92,7 +96,10 @@ inline Foam::chungTransport<Thermo>::chungTransport
     sigmd_(ch.sigmd_),
     cacheP_(0), cacheT_(-1), cacheTstar_(0), cacheMur_(0),
     cacheEta0_(0), cacheY_(0), cacheG1_(0), sumXmd_(0)
-{}
+{
+    // Maintain sumXmd_ == Sum(Xmd_) (see the component constructor).
+    forAll(Xmd_, i) { sumXmd_ += Xmd_[i]; }
+}
 
 
 template<class Thermo>
