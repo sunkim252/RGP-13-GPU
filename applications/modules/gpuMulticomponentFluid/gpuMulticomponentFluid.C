@@ -26,6 +26,8 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
     multicomponentFluid(mesh),
     gpuYEqn_(false),
     gpuEEqn_(false),
+    gpuUEqn_(false),
+    gpuPEqn_(false),
     gpuCheck_(false),
     gpuMeshArmed_(false),
     gpuMeshCells_(-1),
@@ -46,16 +48,30 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
         );
         gpuYEqn_ = dict.lookupOrDefault<Switch>("gpuYEqn", false);
         gpuEEqn_ = dict.lookupOrDefault<Switch>("gpuEEqn", false);
+        gpuUEqn_ = dict.lookupOrDefault<Switch>("gpuUEqn", false);
+        gpuPEqn_ = dict.lookupOrDefault<Switch>("gpuPEqn", false);
         gpuCheck_ = dict.lookupOrDefault<Switch>("gpuCheck", false);
     }
 
-    if (Pstream::parRun() && (gpuYEqn_ || gpuEEqn_))
+    if (Pstream::parRun() && (gpuYEqn_ || gpuEEqn_ || gpuUEqn_ || gpuPEqn_))
     {
         WarningInFunction
-            << "gpuYEqn/gpuEEqn are serial-only (v1) -- disabled for "
-            << "this parallel run (GPU chemistry stays active)" << endl;
+            << "gpuMulticomponentFluid transport is serial-only (v1) -- "
+            << "disabled for this parallel run (GPU chemistry stays "
+            << "active)" << endl;
         gpuYEqn_ = Switch(false);
         gpuEEqn_ = Switch(false);
+        gpuUEqn_ = Switch(false);
+        gpuPEqn_ = Switch(false);
+    }
+    if (gpuUEqn_ != gpuPEqn_)
+    {
+        FatalErrorInFunction
+            << "gpuUEqn and gpuPEqn must be enabled together (v1): the "
+            << "GPU pressure corrector consumes the device-assembled "
+            << "UEqn's rAU/H, and the stock corrector needs the CPU "
+            << "fvMatrix that the GPU momentum predictor bypasses"
+            << exit(FatalError);
     }
     if (gpuEEqn_ && !gpuYEqn_)
     {

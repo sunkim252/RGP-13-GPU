@@ -56,6 +56,8 @@ class gpuMulticomponentFluid
         //- GPU 스위치 (constant/gpuProperties, READ_IF_PRESENT)
         Switch gpuYEqn_;
         Switch gpuEEqn_;
+        Switch gpuUEqn_;
+        Switch gpuPEqn_;
         Switch gpuCheck_;
 
         //- 메시 아밍 상태 (토폴로지/이동 감지 재아밍 — fgmFluid와 동일)
@@ -66,6 +68,13 @@ class gpuMulticomponentFluid
 
         //- 경계 연접 작업 버퍼 (bDiag, bSrc, bPsi)
         mutable List<double> gpuBuf_;
+
+        //- UEqn SoA/경계 스테이징 (fgmFluid 레이아웃과 동일)
+        mutable List<double> gpuUBuf_;
+
+        //- pEqn 경계 연접 + 내부면 플럭스
+        mutable List<double> gpuPBuf_;
+        mutable List<double> gpuPFlux_;
 
 
     // Private Member Functions
@@ -113,6 +122,14 @@ public:
         //- Construct and solve the Y/energy equations on the GPU,
         //  convert to temperature and update properties
         virtual void thermophysicalPredictor();
+
+        //- GPU momentum predictor (stock UEqn, limitedLinearV +
+        //  linear-viscous-stress divDevTau — fgmFluid gpuUEqn 이식)
+        virtual void momentumPredictor();
+
+        //- GPU pressure corrector (stock non-transonic correctPressure
+        //  형태를 rgpPEqnSolve로 — psi/rhorAUf/phiHbyA 매핑)
+        virtual void pressureCorrector();
 
 
     // Member Operators
