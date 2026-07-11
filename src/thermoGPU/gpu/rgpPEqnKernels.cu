@@ -394,6 +394,22 @@ __global__ void parApply
     atomicAdd(&y[fc[k]], -bC[k]*recvB[k]);
 }
 
+//- 병렬: 디바이스 상주 grad(SoA [3*nc])를 processor 면 셀에서 게더
+//  (호스트가 이웃 랭크와 교환해 경계 리미터를 계산)
+__global__ void parGather3
+(
+    const int n, const int* __restrict__ fc, const int nc,
+    const double* __restrict__ g, double* __restrict__ out
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const int c = fc[k];
+    out[k] = g[c];
+    out[n + k] = g[(size_t)nc + c];
+    out[2*n + k] = g[(size_t)2*nc + c];
+}
+
 //- 병렬: rowSum(normFactor용)에 인터페이스 계수 반영 (lduMatrix::sumA)
 __global__ void parRowSum
 (
@@ -1626,13 +1642,36 @@ namespace
 
     //- Jacobi-BiCGStab (OF PBiCGStab 구조/잔차 규약) — 임의 디바이스
     //  포인터의 (diag, upper, lower, b, x)에 대해. 스크래치는 gB/gST 공유.
+    //- 비대칭 A·x (diag + LDU 면 + 병렬 인터페이스). parB가 null이 아니고
+    //  병렬 아밍 상태면 halo 교환 후 y[fc] -= parB*x_nbr.
+    int stSpmv
+    (
+        const int nc, const int nf,
+        const double* diag, const double* upper, const double* lower,
+        const double* x, double* y, const double* parB
+    )
+    {
+        rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, diag, x, y);
+        rgppeqn::stFaceSpmv<<<nb(nf), BS>>>
+            (nf, gM.own, gM.nei, upper, lower, x, y);
+        if (parB && gPar.active && gPar.totF > 0)
+        {
+            int rc = haloExchange(x);
+            if (rc) return rc;
+            rgppeqn::parApply<<<nb(gPar.totF), BS>>>
+                (gPar.totF, gPar.fc, parB, gPar.dRecv, y);
+        }
+        return 0;
+    }
+
     int bicgSolve
     (
         const int nc, const int nf,
         const double* diag, const double* upper, const double* lower,
         const double* b, double* x,
         const double tol, const double relTol, const int maxIter,
-        double* initRes, double* finalRes, int* nIters
+        double* initRes, double* finalRes, int* nIters,
+        const double* parB
     )
     {
         cudaError_t e;
@@ -1643,10 +1682,14 @@ namespace
             return pfail(e, "bicg/rowSum D2D");
         rgppeqn::stFaceRowSum<<<nb(nf), BS>>>
             (nf, gM.own, gM.nei, upper, lower, gB.rowSum);
+        if (parB && gPar.active && gPar.totF > 0)
+        {
+            rgppeqn::parRowSum<<<nb(gPar.totF), BS>>>
+                (gPar.totF, gPar.fc, parB, gB.rowSum);
+        }
 
-        rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, diag, x, gB.wA);
-        rgppeqn::stFaceSpmv<<<nb(nf), BS>>>
-            (nf, gM.own, gM.nei, upper, lower, x, gB.wA);
+        if ((rc = stSpmv(nc, nf, diag, upper, lower, x, gB.wA, parB)))
+            return rc;
         rgppeqn::residualInit<<<nb(nc), BS>>>(nc, b, gB.wA, gB.rA);
         if ((e = cudaGetLastError()) != cudaSuccess)
             return pfail(e, "bicg/init launch");
@@ -1654,17 +1697,22 @@ namespace
         double sumX = 0;
         if ((rc = reduceHost(nc, 0, x, nullptr, 0, nullptr, sumX)))
             return rc;
-        const double xRef = sumX/nc;
+        greduce(sumX);
+        const double xRef =
+            sumX/(gPar.active ? gPar.gnCells : double(nc));
         double nf1 = 0, nf2 = 0;
         if ((rc = reduceHost(nc, 3, gB.wA, nullptr, xRef, gB.rowSum, nf1)))
             return rc;
         if ((rc = reduceHost(nc, 3, b, nullptr, xRef, gB.rowSum, nf2)))
             return rc;
+        greduce(nf1);
+        greduce(nf2);
         const double normFactor = nf1 + nf2 + 1e-20;
 
         double res = 0;
         if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res)))
             return rc;
+        greduce(res);
         res /= normFactor;
         *initRes = res;
 
@@ -1687,6 +1735,7 @@ namespace
                 const double rA0rAold = rA0rA;
                 if ((rc = reduceHost(nc, 2, gST.rA0, gB.rA, 0, nullptr,
                                      rA0rA))) return rc;
+                greduce(rA0rA);
 
                 if (iter == 0)
                 {
@@ -1705,14 +1754,13 @@ namespace
 
                 rgppeqn::precondDir<<<nb(nc), BS>>>
                     (nc, gB.pA, diag, 0.0, gST.yz);
-                rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, diag, gST.yz,
-                                                  gST.AyA);
-                rgppeqn::stFaceSpmv<<<nb(nf), BS>>>
-                    (nf, gM.own, gM.nei, upper, lower, gST.yz, gST.AyA);
+                if ((rc = stSpmv(nc, nf, diag, upper, lower, gST.yz,
+                                 gST.AyA, parB))) return rc;
 
                 double rA0AyA = 0;
                 if ((rc = reduceHost(nc, 2, gST.rA0, gST.AyA, 0, nullptr,
                                      rA0AyA))) return rc;
+                greduce(rA0AyA);
                 if (rA0AyA == 0) break;
                 alpha = rA0rA/rA0AyA;
 
@@ -1722,6 +1770,7 @@ namespace
                 double resS = 0;
                 if ((rc = reduceHost(nc, 1, gST.sA, nullptr, 0, nullptr,
                                      resS))) return rc;
+                greduce(resS);
                 resS /= normFactor;
                 if (converged(resS))
                 {
@@ -1734,16 +1783,16 @@ namespace
 
                 rgppeqn::precondDir<<<nb(nc), BS>>>
                     (nc, gST.sA, diag, 0.0, gB.wA);
-                rgppeqn::diagSpmv<<<nb(nc), BS>>>(nc, diag, gB.wA,
-                                                  gST.AzA);
-                rgppeqn::stFaceSpmv<<<nb(nf), BS>>>
-                    (nf, gM.own, gM.nei, upper, lower, gB.wA, gST.AzA);
+                if ((rc = stSpmv(nc, nf, diag, upper, lower, gB.wA,
+                                 gST.AzA, parB))) return rc;
 
                 double tS = 0, tT = 0;
                 if ((rc = reduceHost(nc, 2, gST.AzA, gST.sA, 0, nullptr,
                                      tS))) return rc;
                 if ((rc = reduceHost(nc, 2, gST.AzA, gST.AzA, 0, nullptr,
                                      tT))) return rc;
+                greduce(tS);
+                greduce(tT);
                 if (tT == 0) break;
                 omega = tS/tT;
 
@@ -1755,6 +1804,7 @@ namespace
                 iter++;
                 if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr,
                                      res))) return rc;
+                greduce(res);
                 res /= normFactor;
                 if (converged(res)) break;
             }
@@ -1877,9 +1927,11 @@ int rgpPEqnParArm
         return pfail(e, "par/H2D fc");
     if ((e = cudaMalloc(&gPar.bC, (size_t)gPar.totF*sizeof(double)))
         != cudaSuccess) return pfail(e, "par/malloc bC");
-    if ((e = cudaMalloc(&gPar.dSend, (size_t)gPar.totF*sizeof(double)))
+    // 3*totF: 스칼라 halo(x 교환)는 totF만 쓰고, rgpSTGradAtPar의
+    // 3성분 grad 게더가 dSend를 [3*totF]로 재사용한다
+    if ((e = cudaMalloc(&gPar.dSend, (size_t)3*gPar.totF*sizeof(double)))
         != cudaSuccess) return pfail(e, "par/malloc send");
-    if ((e = cudaMalloc(&gPar.dRecv, (size_t)gPar.totF*sizeof(double)))
+    if ((e = cudaMalloc(&gPar.dRecv, (size_t)3*gPar.totF*sizeof(double)))
         != cudaSuccess) return pfail(e, "par/malloc recv");
 
     gPar.gnCells = globalCells;
@@ -2414,6 +2466,28 @@ int rgpSTWeightsField(const double* psi, const double* bPsi)
 }
 
 
+int rgpSTGradAtPar(double* out3)
+{
+    // 직전 rgpSTWeightsField가 만든 셀 grad(gST.grad)를 processor 면
+    // 셀에서 게더 → 호스트 (이웃 랭크 교환 후 경계 리미터 계산용).
+    // 레이아웃: out3[3*totF] SoA (x, y, z 성분 순).
+    if (!gPar.active || gPar.totF <= 0) return 0;
+
+    const int nc = gM.nCells;
+    cudaError_t e;
+    rgppeqn::parGather3<<<nb(gPar.totF), BS>>>
+        (gPar.totF, gPar.fc, nc, gST.grad, gPar.dSend);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "stw/parGather launch");
+
+    if ((e = cudaMemcpy(out3, gPar.dSend,
+                        (size_t)3*gPar.totF*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "stw/parGather D2H");
+    return 0;
+}
+
+
 int rgpSTWeightsEnd(void)
 {
     const int nf = gM.nIntFaces;
@@ -2484,10 +2558,13 @@ int rgpSTEqnSolve
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "steqn/assemble launch");
 
+    // 병렬: 호스트가 rgpPEqnParCoeffs로 이 방정식의 인터페이스 계수를
+    // 직전에 업로드한다 (proc 패치 없는 랭크는 리덕션만 참여)
     int rc2 = bicgSolve
     (
         nc, nf, gB.diag, gB.upper, gST.lower, gB.b, gB.x,
-        tol, relTol, maxIter, initRes, finalRes, nIters
+        tol, relTol, maxIter, initRes, finalRes, nIters,
+        (gPar.active && gPar.totF > 0) ? gPar.bC : nullptr
     );
     if (rc2) return rc2;
 
@@ -2822,7 +2899,8 @@ int rgpUEqnSolve
         (
             nc, nf, gU.workDiag, gU.upper, gU.lower, gU.workB, gB.x,
             tol, relTol, maxIter,
-            &initRes3[c], &finalRes3[c], &iters3[c]
+            &initRes3[c], &finalRes3[c], &iters3[c],
+            nullptr   // gpuUEqn은 직렬 전용 (병렬 halo는 Stage B)
         );
         if (rc) return rc;
 

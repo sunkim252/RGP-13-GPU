@@ -32,6 +32,8 @@ License
 #include "zeroGradientFvPatchFields.H"
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
+#include "processorFvPatch.H"
+#include "PstreamBuffers.H"
 #include "gpu/rgpPEqnTypes.H"
 
 #include <chrono>
@@ -111,6 +113,67 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                 mesh.schemes().div("div(phi,Yi_h)")
             );
     }
+
+    // ── 병렬 gpuZC: processor 면의 multivariate 경계 리미터/가중치 ──
+    // (LimitedScheme.C coupled 분기 1:1 — 이웃 grad는 랭크 간 교환)
+    label nPar = 0;
+    if (gpuZC_ && Pstream::parRun())
+    {
+        forAll(Z_.boundaryField(), patchi)
+        {
+            if (Z_.boundaryField()[patchi].coupled())
+            {
+                nPar += Z_.boundaryField()[patchi].size();
+            }
+        }
+    }
+    List<double> procLim(nPar, 1.0);
+    List<double> procW(nPar, 0.0);
+
+    // 3성분 벡터의 proc-패치 교환 (SoA [3*nPar] ↔ 이웃 랭크)
+    auto exchangeParVec3 = [&](const List<double>& s, List<double>& r)
+    {
+        PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
+        label offp = 0;
+        forAll(Z_.boundaryField(), patchi)
+        {
+            if (!Z_.boundaryField()[patchi].coupled()) continue;
+            const processorFvPatch& pp =
+                refCast<const processorFvPatch>(mesh.boundary()[patchi]);
+            const label np = pp.size();
+            List<vector> sv(np);
+            for (label k = 0; k < np; k++)
+            {
+                sv[k] = vector
+                (
+                    s[offp + k], s[nPar + offp + k], s[2*nPar + offp + k]
+                );
+            }
+            UOPstream toNbr(pp.neighbProcNo(), pBufs);
+            toNbr << sv;
+            offp += np;
+        }
+        pBufs.finishedSends();
+        offp = 0;
+        forAll(Z_.boundaryField(), patchi)
+        {
+            if (!Z_.boundaryField()[patchi].coupled()) continue;
+            const processorFvPatch& pp =
+                refCast<const processorFvPatch>(mesh.boundary()[patchi]);
+            const label np = pp.size();
+            List<vector> rv;
+            UIPstream fromNbr(pp.neighbProcNo(), pBufs);
+            fromNbr >> rv;
+            for (label k = 0; k < np; k++)
+            {
+                r[offp + k] = rv[k].x();
+                r[nPar + offp + k] = rv[k].y();
+                r[2*nPar + offp + k] = rv[k].z();
+            }
+            offp += np;
+        }
+    };
+
     if (gpuZC_)
     {
         // ZCGPU: multivariate limitedLinear 가중치를 mvConvection 생성
@@ -139,7 +202,26 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             forAll(f.boundaryField(), patchi)
             {
                 const fvPatchScalarField& pf = f.boundaryField()[patchi];
-                forAll(pf, fi) { bPsiA[off + fi] = pf[fi]; }
+                if (pf.coupled())
+                {
+                    // gaussGrad coupled 규약: 경계 기여는 면 값
+                    // w*psi_own + (1-w)*psi_nei (pf가 이웃 셀 값 보유)
+                    const scalarField w
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField own(pf.patchInternalField());
+                    forAll(pf, fi)
+                    {
+                        bPsiA[off + fi] =
+                            w[fi]*own[fi] + (1.0 - w[fi])*pf[fi];
+                    }
+                }
+                else
+                {
+                    forAll(pf, fi) { bPsiA[off + fi] = pf[fi]; }
+                }
                 off += pf.size();
             }
             if (rgpSTWeightsField(f.primitiveField().begin(), bPsiA))
@@ -148,6 +230,65 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                     << "rgpSTWeightsField(" << f.name() << "): "
                     << rgpPEqnLastError()
                     << exit(FatalError);
+            }
+
+            // 병렬: 이 필드의 proc-면 limiter를 min-누적
+            // (LimitedScheme.C coupled 분기 1:1 — NVDTVD::r + limitedLinear)
+            if (nPar > 0)
+            {
+                List<double> gradP(3*nPar), gradN(3*nPar);
+                if (rgpSTGradAtPar(gradP.begin()))
+                {
+                    FatalErrorInFunction
+                        << "rgpSTGradAtPar: " << rgpPEqnLastError()
+                        << exit(FatalError);
+                }
+                exchangeParVec3(gradP, gradN);
+
+                label offp = 0;
+                forAll(f.boundaryField(), patchi)
+                {
+                    const fvPatchScalarField& pf =
+                        f.boundaryField()[patchi];
+                    if (!pf.coupled()) continue;
+                    const label np = pf.size();
+
+                    const scalarField phiP(pf.patchInternalField());
+                    const scalarField& phb = phi.boundaryField()[patchi];
+                    const vectorField pd(mesh.boundary()[patchi].delta());
+
+                    for (label k = 0; k < np; k++)
+                    {
+                        const label j = offp + k;
+                        const vector gP
+                        (
+                            gradP[j], gradP[nPar + j], gradP[2*nPar + j]
+                        );
+                        const vector gN
+                        (
+                            gradN[j], gradN[nPar + j], gradN[2*nPar + j]
+                        );
+                        const scalar gradf = pf[k] - phiP[k];
+                        const scalar gradcf =
+                            pd[k] & (phb[k] > 0 ? gP : gN);
+
+                        scalar r;
+                        if (mag(gradcf) >= 1000.0*mag(gradf))
+                        {
+                            r = 2.0*1000.0*sign(gradcf)*sign(gradf) - 1.0;
+                        }
+                        else
+                        {
+                            r = 2.0*(gradcf/gradf) - 1.0;
+                        }
+                        procLim[j] = min
+                        (
+                            procLim[j],
+                            max(min(2.0*r, scalar(1)), scalar(0))
+                        );
+                    }
+                    offp += np;
+                }
             }
         };
         if (hPtr_.valid() || WPtr_.valid())
@@ -186,6 +327,13 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         // 적용 — GPU 조립은 미반영이므로 켜져 있으면 침묵 발산)
         checkGpuConstraints(Z_.name(), "gpuZC");
         checkGpuConstraints(C_.name(), "gpuZC");
+        if (Pstream::parRun() && gpuPEqnCheck_)
+        {
+            FatalErrorInFunction
+                << "gpuPEqnCheck is serial-only"
+                << exit(FatalError);
+        }
+
         addWeightField(thermo.he());
         addWeightField(Z_);
         addWeightField(C_);
@@ -195,6 +343,32 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             FatalErrorInFunction
                 << "rgpSTWeightsEnd: " << rgpPEqnLastError()
                 << exit(FatalError);
+        }
+
+        // 병렬: proc-면 최종 가중치 (multivariateScheme 규약 1:1 —
+        // w = lim*CD + (1-lim)*upwind)
+        if (nPar > 0)
+        {
+            label offp = 0;
+            forAll(Z_.boundaryField(), patchi)
+            {
+                if (!Z_.boundaryField()[patchi].coupled()) continue;
+                const label np = Z_.boundaryField()[patchi].size();
+                const scalarField cdw
+                (
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi]
+                );
+                const scalarField& phb = phi.boundaryField()[patchi];
+                for (label k = 0; k < np; k++)
+                {
+                    const double lim = procLim[offp + k];
+                    procW[offp + k] =
+                        lim*cdw[k]
+                      + (1.0 - lim)*((phb[k] >= 0.0) ? 1.0 : 0.0);
+                }
+                offp += np;
+            }
         }
     }
 
@@ -315,6 +489,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         double* bPsiA = bSrcA + nbf;
 
         label off = 0;
+        label offPar = 0;
         forAll(psiF.boundaryField(), patchi)
         {
             const fvPatchScalarField& pp = psiF.boundaryField()[patchi];
@@ -323,40 +498,100 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
 
             const scalarField& phb = phi.boundaryField()[patchi];
 
-            // div: iC = +phi_b*vIC, bC(source) = -phi_b*vBC
-            const scalarField vic
-            (
-                pp.valueInternalCoeffs
-                (
-                    mesh.surfaceInterpolation::weights()
-                        .boundaryField()[patchi]
-                )
-            );
-            const scalarField vbc
-            (
-                pp.valueBoundaryCoeffs
-                (
-                    mesh.surfaceInterpolation::weights()
-                        .boundaryField()[patchi]
-                )
-            );
-
-            // -laplacian: iC = -gammaMagSf*gic, bC = +gammaMagSf*gbc
-            const scalarField gMsf
-            (
-                gamma.boundaryField()[patchi]
-               *mesh.magSf().boundaryField()[patchi]
-            );
-            const scalarField gic(pp.gradientInternalCoeffs());
-            const scalarField gbc(pp.gradientBoundaryCoeffs());
-
-            for (label k = 0; k < np; k++)
+            if (pp.coupled())
             {
-                bDiagA[off + k] = phb[k]*vic[k] - gMsf[k]*gic[k];
-                bSrcA[off + k] = -phb[k]*vbc[k] + gMsf[k]*gbc[k];
-                bPsiA[off + k] = pp[k];
+                // processor 패치: div의 가중치는 multivariate limited
+                // 가중치(procW — CPU mvConvection과 동일), laplacian은
+                // deltaCoeffs 오버로드. iC는 diag로, bC(= -phb*vbc +
+                // gMsf*gbc — uncoupled의 소스 공식과 동일한 양)는
+                // 인터페이스 계수로 (소스에 접지 않음).
+                scalarField wP(np);
+                for (label k = 0; k < np; k++)
+                {
+                    wP[k] = procW[offPar + k];
+                }
+                const scalarField vic(pp.valueInternalCoeffs(wP));
+                const scalarField vbc(pp.valueBoundaryCoeffs(wP));
+
+                const scalarField pdc
+                (
+                    mesh.deltaCoeffs().boundaryField()[patchi]
+                );
+                const scalarField gic(pp.gradientInternalCoeffs(pdc));
+                const scalarField gbc(pp.gradientBoundaryCoeffs(pdc));
+
+                // CPU interpolate(gamma) coupled = w*own + (1-w)*nei
+                const scalarField cdw
+                (
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi]
+                );
+                const scalarField gOwn
+                (
+                    gamma.boundaryField()[patchi].patchInternalField()
+                );
+                const scalarField& gNei = gamma.boundaryField()[patchi];
+                const scalarField& msf =
+                    mesh.magSf().boundaryField()[patchi];
+
+                for (label k = 0; k < np; k++)
+                {
+                    const scalar gMsf =
+                        (cdw[k]*gOwn[k] + (1.0 - cdw[k])*gNei[k])*msf[k];
+                    bDiagA[off + k] = phb[k]*vic[k] - gMsf*gic[k];
+                    bSrcA[off + k] = 0;
+                    bPsiA[off + k] = pp[k];
+                    gpuPEqnParB_[offPar + k] =
+                        -phb[k]*vbc[k] + gMsf*gbc[k];
+                }
+                offPar += np;
+            }
+            else
+            {
+                // div: iC = +phi_b*vIC, bC(source) = -phi_b*vBC
+                const scalarField vic
+                (
+                    pp.valueInternalCoeffs
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    )
+                );
+                const scalarField vbc
+                (
+                    pp.valueBoundaryCoeffs
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    )
+                );
+
+                // -laplacian: iC = -gammaMagSf*gic, bC = +gammaMagSf*gbc
+                const scalarField gMsf
+                (
+                    gamma.boundaryField()[patchi]
+                   *mesh.magSf().boundaryField()[patchi]
+                );
+                const scalarField gic(pp.gradientInternalCoeffs());
+                const scalarField gbc(pp.gradientBoundaryCoeffs());
+
+                for (label k = 0; k < np; k++)
+                {
+                    bDiagA[off + k] = phb[k]*vic[k] - gMsf[k]*gic[k];
+                    bSrcA[off + k] = -phb[k]*vbc[k] + gMsf[k]*gbc[k];
+                    bPsiA[off + k] = pp[k];
+                }
             }
             off += np;
+        }
+
+        // 병렬: 이 방정식의 인터페이스 계수 업로드 (gamma가 방정식마다
+        // 달라 솔브 직전 갱신 — pEqn과 gPar.bC 버퍼 공유)
+        if (offPar > 0 && rgpPEqnParCoeffs(gpuPEqnParB_.begin()))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnParCoeffs: " << rgpPEqnLastError()
+                << exit(FatalError);
         }
 
         // fvMatrix::solve(word) 규약과 1:1 — transient 최종 이터레이션이면

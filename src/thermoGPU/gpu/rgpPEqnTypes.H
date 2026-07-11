@@ -136,6 +136,13 @@ int rgpSTWeightsBegin(const double* phiInt);
 int rgpSTWeightsField(const double* psi, const double* bPsi);
 int rgpSTWeightsEnd(void);
 
+/*  병렬: 직전 rgpSTWeightsField의 셀 grad를 processor 면 셀에서 게더해
+    D2H (out3[3*totF] SoA). 호스트가 이웃 랭크와 교환해 coupled 경계
+    리미터(LimitedScheme.C의 coupled 분기 1:1)를 계산하는 데 쓴다.
+    병렬 미아밍/proc 면 0이면 no-op. ZC 솔브의 인터페이스 계수는
+    rgpPEqnParCoeffs로 (방정식마다 gamma가 달라 솔브 직전 갱신).       */
+int rgpSTGradAtPar(double* out3);
+
 /*  UEqn(벡터, 성분 공유 LDU): ddt(rho,U) + div(phi,U;w) − laplacian(mu,U)
     를 디바이스 조립(가중치 w·mu·명시소스 srcExp3=(divDevTau 명시항−grad p)
     는 호스트가 OF 스킴으로 정확 계산해 업로드), 유효 성분별

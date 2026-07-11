@@ -188,17 +188,16 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
         }
     }
 
-    // 병렬(v1): Z/C·UEqn 조립 GPU 경로는 프로세서-커플드 halo(리미터
-    // 가중치·grad 이웃값)가 아직 없어 자동 비활성. gpuPEqn(pcg)은
-    // processor 인터페이스 halo 교환 + 전역 리덕션으로 병렬 지원 —
-    // 셀-로컬인 gpuThermo/gpuManifold도 병렬 유지.
-    if (Pstream::parRun() && (gpuZC_ || gpuUEqn_))
+    // 병렬(v1): UEqn 조립 GPU 경로는 프로세서-커플드 halo(벡터 리미터
+    // 가중치·grad(U) 이웃값·dev2 경계 플럭스)가 아직 없어 자동 비활성.
+    // gpuPEqn(pcg)·gpuZC는 processor 인터페이스 halo 교환 + 전역
+    // 리덕션으로 병렬 지원 — 셀-로컬 gpuThermo/gpuManifold도 병렬 유지.
+    if (Pstream::parRun() && gpuUEqn_)
     {
         WarningInFunction
-            << "gpuZC/gpuUEqn are serial-only (v1) -- disabled for "
-            << "this parallel run (gpuThermo/gpuManifold/gpuPEqn stay "
+            << "gpuUEqn is serial-only (v1) -- disabled for this "
+            << "parallel run (gpuThermo/gpuManifold/gpuPEqn/gpuZC stay "
             << "active)" << endl;
-        gpuZC_ = Switch(false);
         gpuUEqn_ = Switch(false);
     }
     if (Pstream::parRun() && gpuPEqn_ && gpuPEqnSolver_ != "pcg")
