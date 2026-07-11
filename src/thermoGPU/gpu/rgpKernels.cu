@@ -53,10 +53,11 @@ namespace
 
     struct DeviceBuffers
     {
-        int     capCells = 0;
+        int     capOut = 0;       // p + rho..psi 용량 [cells]
+        int     capStage = 0;     // T + Y 스테이징 용량 [cells]
         double* p = nullptr;
         double* T = nullptr;
-        double* Y = nullptr;      // capCells * nSpecies
+        double* Y = nullptr;      // capStage * nSpecies
         double* rho = nullptr;
         double* mu = nullptr;
         double* kappa = nullptr;
@@ -102,8 +103,76 @@ namespace
         };
         for (auto pp : ptrs) { if (*pp) { cudaFree(*pp); *pp = nullptr; } }
         if (gBuf.yMap) { cudaFree(gBuf.yMap); gBuf.yMap = nullptr; }
-        gBuf.capCells = 0;
+        gBuf.capOut = 0;
+        gBuf.capStage = 0;
         gBuf.yHCap = 0;
+    }
+
+    //- p + 출력 6개 (grow-only). 체인은 전체 셀, 플레인은 블록 크기.
+    int ensureOut(int cells)
+    {
+        if (cells <= gBuf.capOut) return 0;
+        double** ps[] =
+        {
+            &gBuf.p, &gBuf.rho, &gBuf.mu, &gBuf.kappa,
+            &gBuf.Cp, &gBuf.Cv, &gBuf.psi
+        };
+        for (auto pp : ps) { if (*pp) { cudaFree(*pp); *pp = nullptr; } }
+        gBuf.capOut = 0;
+        const size_t b1 = (size_t)cells*sizeof(double);
+        for (auto pp : ps)
+        {
+            cudaError_t e = cudaMalloc(pp, b1);
+            if (e != cudaSuccess)
+            {
+                for (auto q : ps) { if (*q) { cudaFree(*q); *q = nullptr; } }
+                cudaGetLastError();
+                return fail(e, "ensureOut/malloc");
+            }
+        }
+        gBuf.capOut = cells;
+        return 0;
+    }
+
+    //- T + Y 스테이징 (grow-only) — 플레인(copy/mapped-폴백) 경로 전용.
+    //  체인 경로는 fgm SoA를 직접 소비하므로 이 버퍼가 필요 없다
+    //  (구 설계는 여기에 nc×n AoS 사본을 만들어 106종 2.6M에서
+    //  2.2GB를 낭비했다 — VRAM 절약의 핵심 지점).
+    int ensureStage(int cells)
+    {
+        if (cells <= gBuf.capStage) return 0;
+        const int n = gTab.nSpecies;
+        if (gBuf.T) { cudaFree(gBuf.T); gBuf.T = nullptr; }
+        if (gBuf.Y) { cudaFree(gBuf.Y); gBuf.Y = nullptr; }
+        gBuf.capStage = 0;
+        cudaError_t e;
+        if ((e = cudaMalloc(&gBuf.T, (size_t)cells*sizeof(double)))
+            != cudaSuccess ||
+            (e = cudaMalloc(&gBuf.Y, (size_t)cells*n*sizeof(double)))
+            != cudaSuccess)
+        {
+            if (gBuf.T) { cudaFree(gBuf.T); gBuf.T = nullptr; }
+            if (gBuf.Y) { cudaFree(gBuf.Y); gBuf.Y = nullptr; }
+            cudaGetLastError();
+            return fail(e, "ensureStage/malloc");
+        }
+        gBuf.capStage = cells;
+        return 0;
+    }
+
+    //- 플레인 경로 스테이징 블록 크기 [cells]: 스테이징 총량을
+    //  RGP_GPU_STAGE_MB(기본 512MB)로 캡 — 대격자×다종에서 VRAM 상한
+    //  보장 (셀별 독립 커널이라 블록 분할은 비트-동일).
+    int stageBlockCells(int nCells)
+    {
+        if (gRgpUnified == 2) return nCells;   // native: 스테이징 없음
+        const char* env = getenv("RGP_GPU_STAGE_MB");
+        size_t mb = env ? (size_t)atoll(env) : 512;
+        if (mb < 64) mb = 64;
+        const size_t perCell = (size_t)(gTab.nSpecies + 9)*sizeof(double);
+        size_t b = (mb << 20)/perCell;
+        if (b < 65536) b = 65536;
+        return (b < (size_t)nCells) ? (int)b : nCells;
     }
 }
 
@@ -285,31 +354,31 @@ __device__ double srkPsi
 }
 
 
-//- fgm 디바이스 SoA 출력(field 1 = T, field 2+k = 테이블 종 Y_k)을
-//  (T, 셀-우선 AoS Y)로 변환 — he 재시드/물성 refresh 체인의 입력 준비.
-//  yMap[s] >= 0: fgm 필드 인덱스, < 0: 호스트 업로드 SoA의 (-1-yMap[s])행
-__global__ void fgmToPTY
+//- Y 조성 뷰: 커널이 두 레이아웃을 동일 산술로 소비 —
+//  ⓐ aos != null: 셀-우선 AoS [nCells*n] (플레인 스테이징 경로)
+//  ⓑ aos == null: fgm SoA 직접 소비 (체인 경로 — AoS 사본을 만들지
+//     않아 nc×n×8B(106종 2.6M에서 2.2GB)를 절약; 필드-우선이라
+//     이웃 스레드=이웃 셀 읽기가 코얼레스드).
+//  map[s] >= 0: fgm 필드 인덱스, < 0: yh SoA의 (-1-map[s])행.
+struct YView
+{
+    const double* aos;
+    const double* soa;
+    const int*    map;
+    const double* yh;
+    size_t        stride;   // soa/yh 행 스트라이드 (= 체인 nCells)
+};
+
+__device__ inline double rgpYAt
 (
-    const int nCells, const int n,
-    const double* __restrict__ fgmOut,
-    const int* __restrict__ yMap,
-    const double* __restrict__ yHost,
-    double* __restrict__ T,
-    double* __restrict__ Y
+    const YView& v, const int n, const int cell, const int s
 )
 {
-    const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= nCells) return;
-
-    T[i] = fgmOut[(size_t)nCells + i];
-    for (int s = 0; s < n; s++)
-    {
-        const int m = yMap[s];
-        Y[(size_t)i*n + s] =
-            (m >= 0)
-          ? fgmOut[(size_t)m*nCells + i]
-          : yHost[(size_t)(-1 - m)*nCells + i];
-    }
+    if (v.aos) { return v.aos[(size_t)cell*n + s]; }
+    const int m = v.map[s];
+    return (m >= 0)
+      ? v.soa[(size_t)m*v.stride + cell]
+      : v.yh[(size_t)(-1 - m)*v.stride + cell];
 }
 
 
@@ -322,7 +391,7 @@ __global__ void rgpHaKernel
     const int      nCells,
     const double* __restrict__ pF,
     const double* __restrict__ TF,
-    const double* __restrict__ YF,
+    const YView    yv,
     double* __restrict__ haF
 )
 {
@@ -331,7 +400,10 @@ __global__ void rgpHaKernel
 
     const int n = kp.n;
     const double RR = kp.RR;
-    const double* Yc = YF + (size_t)celli*n;
+
+    // Y를 한 번만 글로벌에서 읽어 로컬로 (레이아웃 무관, 값 동일)
+    double Yc[RGP_GPU_MAX_SPECIES];
+    for (int i = 0; i < n; i++) { Yc[i] = rgpYAt(yv, n, celli, i); }
 
     double X[RGP_GPU_MAX_SPECIES];
 
@@ -433,7 +505,7 @@ __global__ void rgpEvaluateKernel
     const int      nCells,
     const double* __restrict__ pF,
     const double* __restrict__ TF,
-    const double* __restrict__ YF,
+    const YView    yv,
     double* __restrict__ rhoF,
     double* __restrict__ muF,
     double* __restrict__ kappaF,
@@ -447,7 +519,9 @@ __global__ void rgpEvaluateKernel
 
     const int n = kp.n;
     const double RR = kp.RR;
-    const double* Yc = YF + (size_t)celli*n;
+
+    double Yc[RGP_GPU_MAX_SPECIES];
+    for (int i = 0; i < n; i++) { Yc[i] = rgpYAt(yv, n, celli, i); }
 
     double X[RGP_GPU_MAX_SPECIES];
 
@@ -703,6 +777,14 @@ __global__ void rgpEvaluateKernel
 extern "C"
 {
 
+static void fillKParams(rgp::KParams& kp);
+static int chainPrepare
+(
+    int nCells, const double* p,
+    const int* yMap, int nYHost, const double* yHost,
+    const double** dTOut, rgp::YView* yvOut
+);
+
 int rgpGpuInit(int deviceId)
 {
     const int dev = deviceId < 0 ? 0 : deviceId;
@@ -759,6 +841,9 @@ int rgpGpuUpload(const rgpGpuTables* t)
     }
 
     freeTables();
+    // 종수 변경 재업로드 대비: Y 스테이징(capStage×구 n)이 새 n보다
+    // 작게 남아 오버플로하는 잠복 결함 차단 — 버퍼도 함께 리셋
+    freeBuffers();
 
     const int n = t->nSpecies;
     gTab.nSpecies   = n;
@@ -822,90 +907,78 @@ int rgpGpuEvaluate
 
     const int n = gTab.nSpecies;
 
-    if (nCells > gBuf.capCells)
+    // 스테이징 블록 캡 (native는 nCells 그대로 — 스테이징 자체가 없음)
+    const int B = stageBlockCells(nCells);
+    if (gRgpUnified != 2)
     {
-        freeBuffers();
-        const size_t b1 = (size_t)nCells*sizeof(double);
-        const size_t bn = (size_t)nCells*n*sizeof(double);
-        cudaError_t e;
-        if ((e = cudaMalloc(&gBuf.p,     b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.T,     b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Y,     bn)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.rho,   b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.mu,    b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.kappa, b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Cp,    b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Cv,    b1)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.psi,   b1)) != cudaSuccess)
-        {
-            freeBuffers();
-            return fail(e, "evaluate/malloc");
-        }
-        gBuf.capCells = nCells;
+        if (ensureOut(B)) return -1;
+        if (ensureStage(B)) return -1;
     }
 
-    cudaError_t e;
-    const double* dP = rgpInPtr(p, gBuf.p, (size_t)nCells, &e);
-    if (e != cudaSuccess) return fail(e, "evaluate/in p");
-    const double* dT = rgpInPtr(T, gBuf.T, (size_t)nCells, &e);
-    if (e != cudaSuccess) return fail(e, "evaluate/in T");
-    const double* dY = rgpInPtr(Y, gBuf.Y, (size_t)nCells*n, &e);
-    if (e != cudaSuccess) return fail(e, "evaluate/in Y");
-
-    double* oRho = rgpOutPtr(rho, gBuf.rho);
-    double* oMu = rgpOutPtr(mu, gBuf.mu);
-    double* oKappa = rgpOutPtr(kappa, gBuf.kappa);
-    double* oCp = rgpOutPtr(Cp, gBuf.Cp);
-    double* oCv = rgpOutPtr(Cv, gBuf.Cv);
-    double* oPsi = rgpOutPtr(psi, gBuf.psi);
-
     rgp::KParams kp;
-    kp.n = n;
-    kp.stableRoot = gTab.stableRoot;
-    kp.RR = gTab.RR;
-    kp.TlowJ = gTab.TlowJ;
-    kp.ThighJ = gTab.ThighJ;
-    kp.Tcommon = gTab.Tcommon;
-    kp.W = gTab.W;  kp.BM = gTab.BM;  kp.CM = gTab.CM;
-    kp.jH = gTab.janafHigh;  kp.jL = gTab.janafLow;
-    kp.C1 = gTab.COEF1;  kp.C2 = gTab.COEF2;  kp.C3 = gTab.COEF3;
-    kp.S3 = gTab.SIGMA3M;  kp.EK0 = gTab.EPSILONKM0;
-    kp.OM0 = gTab.OMEGAM0;  kp.MM0 = gTab.MM0;
-    kp.MI0 = gTab.MIUIM0;  kp.KA = gTab.KAPPAIM;
+    fillKParams(kp);
 
     constexpr int blockSize = 128;
-    const int gridSize = (nCells + blockSize - 1)/blockSize;
 
-    rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
-    (
-        kp, nCells, dP, dT, dY,
-        oRho, oMu, oKappa, oCp, oCv, oPsi
-    );
-    if ((e = cudaGetLastError()) != cudaSuccess)
-        return fail(e, "evaluate/launch");
+    for (int off = 0; off < nCells; off += B)
+    {
+        const int count =
+            (nCells - off < B) ? (nCells - off) : B;
 
-    struct { double* h; double* o; double* d; } outs[] =
-    {
-        {rho, oRho, gBuf.rho}, {mu, oMu, gBuf.mu},
-        {kappa, oKappa, gBuf.kappa}, {Cp, oCp, gBuf.Cp},
-        {Cv, oCv, gBuf.Cv}, {psi, oPsi, gBuf.psi}
-    };
-    for (auto& o : outs)
-    {
-        if ((e = rgpOutFinish(o.h, o.o, o.d, (size_t)nCells))
-            != cudaSuccess) return fail(e, "evaluate/out");
+        cudaError_t e;
+        const double* dP = rgpInPtr(p + off, gBuf.p, (size_t)count, &e);
+        if (e != cudaSuccess) return fail(e, "evaluate/in p");
+        const double* dT = rgpInPtr(T + off, gBuf.T, (size_t)count, &e);
+        if (e != cudaSuccess) return fail(e, "evaluate/in T");
+        const double* dY = rgpInPtr
+        (
+            Y + (size_t)off*n, gBuf.Y, (size_t)count*n, &e
+        );
+        if (e != cudaSuccess) return fail(e, "evaluate/in Y");
+
+        double* oRho = rgpOutPtr(rho + off, gBuf.rho);
+        double* oMu = rgpOutPtr(mu + off, gBuf.mu);
+        double* oKappa = rgpOutPtr(kappa + off, gBuf.kappa);
+        double* oCp = rgpOutPtr(Cp + off, gBuf.Cp);
+        double* oCv = rgpOutPtr(Cv + off, gBuf.Cv);
+        double* oPsi = rgpOutPtr(psi + off, gBuf.psi);
+
+        const rgp::YView yv{dY, nullptr, nullptr, nullptr, 0};
+
+        const int gridSize = (count + blockSize - 1)/blockSize;
+        rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
+        (
+            kp, count, dP, dT, yv,
+            oRho, oMu, oKappa, oCp, oCv, oPsi
+        );
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return fail(e, "evaluate/launch");
+
+        struct { double* h; double* o; double* d; } outs[] =
+        {
+            {rho + off, oRho, gBuf.rho}, {mu + off, oMu, gBuf.mu},
+            {kappa + off, oKappa, gBuf.kappa}, {Cp + off, oCp, gBuf.Cp},
+            {Cv + off, oCv, gBuf.Cv}, {psi + off, oPsi, gBuf.psi}
+        };
+        for (auto& o : outs)
+        {
+            if ((e = rgpOutFinish(o.h, o.o, o.d, (size_t)count))
+                != cudaSuccess) return fail(e, "evaluate/out");
+        }
     }
 
     return 0;
 }
 
 
-//- fgm 디바이스 체인 공통부: 용량 확보 + p/yMap/yHost 업로드 +
-//  fgm SoA 출력 → (gBuf.T, gBuf.Y AoS) 변환. 0=성공.
+//- fgm 디바이스 체인 공통부: p/yMap/yHost 업로드 + 출력 용량 확보.
+//  T는 fgm SoA의 field 1을 포인터로 직접, Y는 YView(SoA 모드)로
+//  커널이 직접 소비 — AoS 사본(nc×n×8B)을 만들지 않는다. 0=성공.
 static int chainPrepare
 (
     int nCells, const double* p,
-    const int* yMap, int nYHost, const double* yHost
+    const int* yMap, int nYHost, const double* yHost,
+    const double** dTOut, rgp::YView* yvOut
 )
 {
     const int n = gTab.nSpecies;
@@ -919,27 +992,7 @@ static int chainPrepare
         return -1;
     }
 
-    if (nCells > gBuf.capCells)
-    {
-        freeBuffers();
-        const size_t b1c = (size_t)nCells*sizeof(double);
-        const size_t bnc = (size_t)nCells*n*sizeof(double);
-        cudaError_t e;
-        if ((e = cudaMalloc(&gBuf.p,     b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.T,     b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Y,     bnc)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.rho,   b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.mu,    b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.kappa, b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Cp,    b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Cv,    b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.psi,   b1c)) != cudaSuccess)
-        {
-            freeBuffers();
-            return fail(e, "chain/malloc");
-        }
-        gBuf.capCells = nCells;
-    }
+    if (ensureOut(nCells)) return -1;
 
     cudaError_t e;
     if (!gBuf.yMap)
@@ -971,13 +1024,12 @@ static int chainPrepare
             != cudaSuccess) return fail(e, "chain/H2D yH");
     }
 
-    constexpr int bs = 128;
-    rgp::fgmToPTY<<<(nCells + bs - 1)/bs, bs>>>
-    (
-        nCells, n, fgmOut, gBuf.yMap, gBuf.yH, gBuf.T, gBuf.Y
-    );
-    if ((e = cudaGetLastError()) != cudaSuccess)
-        return fail(e, "chain/launch cvt");
+    *dTOut = fgmOut + (size_t)nCells;   // field 1 = T
+    yvOut->aos = nullptr;
+    yvOut->soa = fgmOut;
+    yvOut->map = gBuf.yMap;
+    yvOut->yh = gBuf.yH;
+    yvOut->stride = (size_t)nCells;
 
     return 0;
 }
@@ -1023,7 +1075,9 @@ int rgpGpuEvaluateFromFgm
         return -1;
     }
 
-    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost);
+    const double* dT = nullptr;
+    rgp::YView yv{};
+    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost, &dT, &yv);
     if (rc) return rc;
 
     rgp::KParams kp;
@@ -1034,7 +1088,7 @@ int rgpGpuEvaluateFromFgm
 
     rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, gBuf.T, gBuf.Y,
+        kp, nCells, gBuf.p, dT, yv,
         gBuf.rho, gBuf.mu, gBuf.kappa, gBuf.Cp, gBuf.Cv, gBuf.psi
     );
     cudaError_t e;
@@ -1076,7 +1130,9 @@ int rgpGpuEvaluateHaFromFgm
         return -1;
     }
 
-    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost);
+    const double* dT = nullptr;
+    rgp::YView yv{};
+    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost, &dT, &yv);
     if (rc) return rc;
 
     rgp::KParams kp;
@@ -1089,7 +1145,7 @@ int rgpGpuEvaluateHaFromFgm
     // 있으므로 피한다 — ha 전용 호출 뒤 항상 D2H로 회수됨)
     rgp::rgpHaKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, gBuf.T, gBuf.Y, gBuf.rho
+        kp, nCells, gBuf.p, dT, yv, gBuf.rho
     );
     cudaError_t e;
     if ((e = cudaGetLastError()) != cudaSuccess)
@@ -1121,64 +1177,49 @@ int rgpGpuEvaluateHa
 
     const int n = gTab.nSpecies;
 
-    if (nCells > gBuf.capCells)
+    const int B = stageBlockCells(nCells);
+    if (gRgpUnified != 2)
     {
-        freeBuffers();
-        const size_t b1c = (size_t)nCells*sizeof(double);
-        const size_t bnc = (size_t)nCells*n*sizeof(double);
-        cudaError_t e;
-        if ((e = cudaMalloc(&gBuf.p,     b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.T,     b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Y,     bnc)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.rho,   b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.mu,    b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.kappa, b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Cp,    b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.Cv,    b1c)) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.psi,   b1c)) != cudaSuccess)
-        {
-            freeBuffers();
-            return fail(e, "evaluateHa/malloc");
-        }
-        gBuf.capCells = nCells;
+        if (ensureOut(B)) return -1;
+        if (ensureStage(B)) return -1;
     }
 
-    cudaError_t e;
-    const double* dP = rgpInPtr(p, gBuf.p, (size_t)nCells, &e);
-    if (e != cudaSuccess) return fail(e, "evaluateHa/in p");
-    const double* dT = rgpInPtr(T, gBuf.T, (size_t)nCells, &e);
-    if (e != cudaSuccess) return fail(e, "evaluateHa/in T");
-    const double* dY = rgpInPtr(Y, gBuf.Y, (size_t)nCells*n, &e);
-    if (e != cudaSuccess) return fail(e, "evaluateHa/in Y");
-    double* oHa = rgpOutPtr(ha, gBuf.Cp);
-
     rgp::KParams kp;
-    kp.n = n;
-    kp.stableRoot = gTab.stableRoot;
-    kp.RR = gTab.RR;
-    kp.TlowJ = gTab.TlowJ;
-    kp.ThighJ = gTab.ThighJ;
-    kp.Tcommon = gTab.Tcommon;
-    kp.W = gTab.W;  kp.BM = gTab.BM;  kp.CM = gTab.CM;
-    kp.jH = gTab.janafHigh;  kp.jL = gTab.janafLow;
-    kp.C1 = gTab.COEF1;  kp.C2 = gTab.COEF2;  kp.C3 = gTab.COEF3;
-    kp.S3 = gTab.SIGMA3M;  kp.EK0 = gTab.EPSILONKM0;
-    kp.OM0 = gTab.OMEGAM0;  kp.MM0 = gTab.MM0;
-    kp.MI0 = gTab.MIUIM0;  kp.KA = gTab.KAPPAIM;
+    fillKParams(kp);
 
     constexpr int blockSize = 128;
-    const int gridSize = (nCells + blockSize - 1)/blockSize;
 
-    // 출력은 Cp 디바이스 버퍼 재사용 (ha 전용 호출이라 충돌 없음)
-    rgp::rgpHaKernel<<<gridSize, blockSize>>>
-    (
-        kp, nCells, dP, dT, dY, oHa
-    );
-    if ((e = cudaGetLastError()) != cudaSuccess)
-        return fail(e, "evaluateHa/launch");
+    for (int off = 0; off < nCells; off += B)
+    {
+        const int count =
+            (nCells - off < B) ? (nCells - off) : B;
 
-    if ((e = rgpOutFinish(ha, oHa, gBuf.Cp, (size_t)nCells))
-        != cudaSuccess) return fail(e, "evaluateHa/out");
+        cudaError_t e;
+        const double* dP = rgpInPtr(p + off, gBuf.p, (size_t)count, &e);
+        if (e != cudaSuccess) return fail(e, "evaluateHa/in p");
+        const double* dT = rgpInPtr(T + off, gBuf.T, (size_t)count, &e);
+        if (e != cudaSuccess) return fail(e, "evaluateHa/in T");
+        const double* dY = rgpInPtr
+        (
+            Y + (size_t)off*n, gBuf.Y, (size_t)count*n, &e
+        );
+        if (e != cudaSuccess) return fail(e, "evaluateHa/in Y");
+        // 출력은 Cp 디바이스 버퍼 재사용 (ha 전용 호출이라 충돌 없음)
+        double* oHa = rgpOutPtr(ha + off, gBuf.Cp);
+
+        const rgp::YView yv{dY, nullptr, nullptr, nullptr, 0};
+
+        const int gridSize = (count + blockSize - 1)/blockSize;
+        rgp::rgpHaKernel<<<gridSize, blockSize>>>
+        (
+            kp, count, dP, dT, yv, oHa
+        );
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return fail(e, "evaluateHa/launch");
+
+        if ((e = rgpOutFinish(ha + off, oHa, gBuf.Cp, (size_t)count))
+            != cudaSuccess) return fail(e, "evaluateHa/out");
+    }
 
     return 0;
 }
