@@ -3,9 +3,9 @@
   치환; fgmFluid gpuUEqn 이식, LAD 제외):
       fvm::ddt(rho,U) + fvm::div(phi,U)[limitedLinearV]
     + divDevTau(= -laplacian(muEff,U) - div(muEff*dev2(T(grad U))))
-    == -grad(p) [솔브-전용 소스]
-  v1: MRF/buoyancy/fvModels/fvConstraints/relax/consistent 미지원(Fatal),
-  직렬 전용(생성자에서 병렬 자동 비활성), 정적 메시.
+    [+ MRF.DDt(rho,U) — srcExtra3 저장 소스]
+    == -grad(p) | netForce() [부력] (솔브-전용 소스)
+  v1: fvModels/fvConstraints/relax/consistent 미지원(Fatal), 정적 메시.
 \*---------------------------------------------------------------------------*/
 
 #include "gpuMulticomponentFluid.H"
@@ -31,12 +31,6 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
 
     volVectorField& U(U_);
 
-    if (MRF.size() > 0 || buoyancy.valid())
-    {
-        FatalErrorInFunction
-            << "gpuUEqn (v1) does not support MRF/buoyancy"
-            << exit(FatalError);
-    }
     if
     (
         mesh.solution().relaxEquation(U.name())
@@ -117,7 +111,11 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
     double* bSrc3 = bDiag3 + 3*nbf;
     double* bFlux3 = bSrc3 + 3*nbf;
     double* bGrad9 = bFlux3 + 3*nbf;        // [9*nbf]
-    (void)srcX3;
+    double* nF3 = U3 + 9*nc;                // 부력 netForce (솔브 전용)
+
+    // CPU 규약: fvMatrix 생성자의 BC updateCoeffs() 상응 (phi 의존
+    // BC의 valueFraction 갱신 — 직접 조립 경로 필수)
+    U.boundaryFieldRef().updateCoeffs();
 
     const volScalarField muEff(rho*momentumTransport->nuEff());
 
@@ -504,6 +502,35 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
 
     const bool LTS = fv::localEulerDdt::enabled(mesh);
 
+    // MRF: +MRF.DDt(rho,U) — 명시 저장 소스 (H()에 포함, CPU fvMatrix
+    // 소스와 동일 위상) → srcExtra3 = -DDt (LHS→RHS 이항)
+    if (MRF.size())
+    {
+        const volVectorField::Internal DDtU(MRF.DDt(rho, U));
+        for (label i = 0; i < nc; i++)
+        {
+            for (label k = 0; k < 3; k++)
+            {
+                srcX3[k*nc + i] = -DDtU[i][k];
+            }
+        }
+    }
+
+    // 부력: solve(UEqn == netForce()) — 솔브 전용 소스 (H() 제외).
+    // 커널이 workB -= gradP*V 이므로 부호 반전해 gradP3 슬롯에 주입
+    // (Prep2의 디바이스 -grad p 를 대체)
+    if (buoyancy.valid())
+    {
+        const vectorField& nF = netForce().primitiveField();
+        for (label i = 0; i < nc; i++)
+        {
+            for (label k = 0; k < 3; k++)
+            {
+                nF3[k*nc + i] = -nF[i][k];
+            }
+        }
+    }
+
     double res0[3], resF[3];
     int iters[3];
     if (rgpUEqnSolve
@@ -516,7 +543,9 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
             rho.primitiveField().begin(),
             rho.oldTime().primitiveField().begin(),
             U3old, nullptr, nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr,
+            nullptr,
+            MRF.size() ? srcX3 : nullptr,
+            buoyancy.valid() ? nF3 : nullptr,
             bDiag3, bSrc3, solveCmpt,
             tol, rtol, maxIter,
             U3out, res0, resF, iters

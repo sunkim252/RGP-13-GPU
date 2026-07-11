@@ -142,6 +142,8 @@ int rgpSTWeightsEnd(void);
     병렬 미아밍/proc 면 0이면 no-op. ZC 솔브의 인터페이스 계수는
     rgpPEqnParCoeffs로 (방정식마다 gamma가 달라 솔브 직전 갱신).       */
 int rgpSTGradAtPar(double* out3);
+int rgpSTGradDump(double* out3);   /* 진단: 셀 grad [3*nc] D2H */
+int rgpSTWeightsSet(const double* w);   /* 호스트 가중치 직업로드 [nf] */
 
 /*  UEqn(벡터, 성분 공유 LDU): ddt(rho,U) + div(phi,U;w) − laplacian(mu,U)
     를 디바이스 조립(가중치 w·mu·명시소스 srcExp3=(divDevTau 명시항−grad p)
@@ -201,6 +203,17 @@ int rgpPCorrPrep
 );
 int rgpPEqnFinish2(double* pOut, double* phiOut);
 int rgpPCorrU(const double* pNew, const double* pB, double* U3out);
+
+/*  fvc::div(phi, q) — 직전 rgpSTWeights*가 준비한 multivariate
+    가중치로 내부면·경계면 flux-div, 결과는 per-volume [nc] (D2H).
+    mvConvection->fvcDiv(phi, q)와 1:1 (결합 min-리미터는 임의 필드에
+    적용됨 — EEqn he==e의 pressureWork용). coupled(proc) 면은 bQ/bPhi
+    슬롯을 0으로 두고 호스트가 procW로 직접 가산할 것.               */
+int rgpSTFluxDiv
+(
+    const double* q, const double* bQ, const double* phiInt,
+    const double* bPhi, double* divOut
+);
 
 /*  검증용: 마지막 rgpSTEqnSolve의 조립 계수/가중치 D2H (null 허용) */
 int rgpSTEqnDump

@@ -793,6 +793,9 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         double* bDiagA = gpuPEqnBuf_.begin();
         double* bSrcA  = bDiagA + nbf;
         double* phiBA  = bSrcA + nbf;
+
+        // CPU 규약: fvMatrix 생성자의 BC updateCoeffs() 상응
+        p.boundaryFieldRef().updateCoeffs();
         {
             label off = 0;
             label offPar = 0;

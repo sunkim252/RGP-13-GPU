@@ -478,6 +478,10 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         const volScalarField* srcPtr
     )
     {
+        // CPU 규약: fvMatrix 생성자의 BC updateCoeffs() 상응 (phi
+        // 의존 BC의 valueFraction 갱신 — 직접 조립 경로 필수)
+        psiF.boundaryFieldRef().updateCoeffs();
+
         label nbf = 0;
         forAll(psiF.boundaryField(), patchi)
         {

@@ -25,10 +25,19 @@ Description
     face/boundary coefficients and explicit sources from the model's
     own divj/divq matrices and injecting them into the device assembly.
 
+    Supported physics: he == h or e (pressureWork e-form via device
+    flux-div with the shared multivariate weights), MRF (DDt stored
+    source + makeRelative/constrainPressure), buoyancy (p_rgh
+    formulation 1:1 with correctBuoyantPressure incl. netForce), AMR
+    topo changes and load-balancing redistribution (automatic
+    re-arming). Serial and MPI-parallel (processor coupling).
+
     v1 constraints (loud Fatal, no silent divergence): Euler/LTS ddt,
-    he == h, no fvModels sources / fvConstraints / relaxation on the
-    GPU-solved fields, no buoyancy/MRF/transonic/consistent, static
-    mesh. Serial and MPI-parallel (processor coupling) supported.
+    no fvModels sources / fvConstraints / relaxation on the GPU-solved
+    fields, no transonic (fvm::div(phid,p) makes the p-matrix
+    asymmetric -- needs upwind assembly + BiCGStab pEqn) and no
+    'consistent', static mesh (continuous mesh motion lacks
+    meshPhi/V0 physics on the device).
 
 SourceFiles
     gpuMulticomponentFluid.C

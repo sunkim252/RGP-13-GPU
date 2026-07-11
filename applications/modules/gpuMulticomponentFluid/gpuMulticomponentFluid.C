@@ -96,11 +96,17 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
                 << ttType << ") -- diffusion operators extracted from "
                 << "the model's divj/divq matrices" << nl << endl;
         }
-        if (thermo.he().name() != "h" && gpuEEqn_)
+        if
+        (
+            thermo.he().name() != "h"
+         && thermo.he().name() != "e"
+         && gpuEEqn_
+        )
         {
             FatalErrorInFunction
-                << "gpuEEqn (v1) supports sensible enthalpy (he == h) "
-                << "only" << exit(FatalError);
+                << "gpuEEqn supports sensible enthalpy (he == h) or "
+                << "sensible internal energy (he == e) only"
+                << exit(FatalError);
         }
 
         Info<< "gpuMulticomponentFluid: GPU transport ACTIVE -- "

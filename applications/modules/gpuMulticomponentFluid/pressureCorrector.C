@@ -7,8 +7,10 @@
   srcCellExtra ← -(fvc::ddt(rho) - psi*fvc::ddt(p)) [명시 잔여],
   플럭스 재구성: phi = phiHbyA + pEqn.flux().
   rAU/HbyA는 rgpUEqnAH(디바이스 상주 UEqn 행렬)에서 회수.
-  v1: 직렬·정적 메시·transient·비-transonic·비-consistent·MRF/buoyancy/
-  fvModels(p) 미지원(Fatal).
+  MRF: makeRelative(phiHbyA) + constrainPressure. 부력: p_rgh 정식화
+  (correctBuoyantPressure 1:1) — phig 항 + netForce/p 재구성 후처리.
+  v1: 정적 메시·transient·비-transonic·비-consistent·fvModels(p)
+  미지원(Fatal).
 \*---------------------------------------------------------------------------*/
 
 #include "gpuMulticomponentFluid.H"
@@ -18,6 +20,7 @@
 #include "fvcFlux.H"
 #include "fvcGrad.H"
 #include "fvcSnGrad.H"
+#include "fvcReconstruct.H"
 #include "fvmDdt.H"
 #include "fvmDiv.H"
 #include "fvmLaplacian.H"
@@ -66,13 +69,13 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
             << "gpuPEqn (v1) supports static-mesh transient runs only"
             << exit(FatalError);
     }
-    if (MRF.size() > 0 || buoyancy.valid())
-    {
-        FatalErrorInFunction
-            << "gpuPEqn (v1) does not support MRF/buoyancy"
-            << exit(FatalError);
-    }
-    checkGpuGuards(p);
+    // 부력: p_rgh 정식화 (stock correctBuoyantPressure의 비-transonic/
+    // 비-consistent/transient 경로) — 솔브 변수만 p_rgh로 바뀌고 조립
+    // 매핑은 동일, phig 항과 netForce/p 재구성 후처리가 추가된다
+    const bool buoyant = buoyancy.valid();
+    volScalarField& solveP = buoyant ? p_rgh_ : p_;
+
+    checkGpuGuards(solveP);
 
     const volScalarField& psi = thermo.psi();
     rho = thermo.rho();
@@ -170,7 +173,7 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
     }
     tH.ref().correctBoundaryConditions();
 
-    volVectorField HbyA(constrainHbyA(rAU*tH, U, p));
+    volVectorField HbyA(constrainHbyA(rAU*tH, U, solveP));
 
     const surfaceScalarField rhorAUf
     (
@@ -184,14 +187,28 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
       + rhorAUf*fvc::ddtCorr(rho, U, phi, rhoUf)
     );
 
+    MRF.makeRelative(rhof, phiHbyA);
+
+    // 부력: phig 항 — ghGradRhof는 netForce 재구성에도 쓰인다
+    tmp<surfaceScalarField> tGhGradRhof;
+    if (buoyant)
+    {
+        tGhGradRhof =
+            (-buoyancy->ghf*fvc::snGrad(rho)*mesh.magSf()).ptr();
+        phiHbyA += rhorAUf*tGhGradRhof();
+    }
+
     // Update the pressure BCs to ensure flux consistency
-    constrainPressure(p, rho, U, phiHbyA, rhorAUf, MRF);
+    constrainPressure(solveP, rho, U, phiHbyA, rhorAUf, MRF);
+
+    // CPU 규약: fvMatrix 생성자의 BC updateCoeffs() 상응
+    solveP.boundaryFieldRef().updateCoeffs();
 
     // ── pEqn 조립+솔브 (rgpPEqnSolve — 매핑은 파일 헤더 참조) ────────
     label nbf = 0;
-    forAll(p.boundaryField(), patchi)
+    forAll(solveP.boundaryField(), patchi)
     {
-        nbf += p.boundaryField()[patchi].size();
+        nbf += solveP.boundaryField()[patchi].size();
     }
 
     gpuPBuf_.setSize(3*nbf);
@@ -201,9 +218,10 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
     {
         label off = 0;
         label offPar = 0;
-        forAll(p.boundaryField(), patchi)
+        forAll(solveP.boundaryField(), patchi)
         {
-            const fvPatchScalarField& pp = p.boundaryField()[patchi];
+            const fvPatchScalarField& pp =
+                solveP.boundaryField()[patchi];
             const label np = pp.size();
             if (np == 0) continue;
 
@@ -257,9 +275,9 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
         }
     }
 
-    // 명시 잔여: fvc::ddt(rho) - psi*fvc::ddt(p) → b -= (·)*V
+    // 명시 잔여: fvc::ddt(rho) - psi*fvc::ddt(solveP) → b -= (·)*V
     const volScalarField ddtRho(fvc::ddt(rho));
-    const volScalarField ddtP(fvc::ddt(p));
+    const volScalarField ddtP(fvc::ddt(solveP));
     scalarField srcExtra(nc);
     {
         const scalarField& psic = psi.primitiveField();
@@ -272,14 +290,14 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
     }
 
     const bool needRef =
-        p.needReference() && pressureReference.refCell() >= 0;
+        solveP.needReference() && pressureReference.refCell() >= 0;
     const label refCell = needRef ? pressureReference.refCell() : 0;
     const scalar refValue = needRef ? pressureReference.refValue() : 0;
 
     const bool LTS = fv::localEulerDdt::enabled(mesh);
     const dictionary& sd = mesh.solution().solverDict
     (
-        p.select
+        solveP.select
         (
             !mesh.schemes().steady()
          && solutionControl::finalIteration(mesh)
@@ -303,13 +321,13 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
             srcExtra.begin(),
             rhorAUf.primitiveField().begin(),
             psi.primitiveField().begin(),
-            p.oldTime().primitiveField().begin(),
-            p.primitiveField().begin(),
+            solveP.oldTime().primitiveField().begin(),
+            solveP.primitiveField().begin(),
             phiHbyA.primitiveField().begin(),
             phiBA, bDiagA, bSrcA,
             needRef, refCell, refValue,
             tol, rtol, maxIter,
-            p.primitiveFieldRef().begin(),
+            solveP.primitiveFieldRef().begin(),
             gpuPFlux_.begin(),
             &res0, &resF, &nIter
         ))
@@ -318,11 +336,12 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
             << "rgpPEqnSolve: " << rgpPEqnLastError() << exit(FatalError);
     }
 
-    Info<< "rgpPCG:  Solving for p, Initial residual = " << res0
+    Info<< "rgpPCG:  Solving for " << solveP.name()
+        << ", Initial residual = " << res0
         << ", Final residual = " << resF
         << ", No Iterations " << nIter << endl;
 
-    p.correctBoundaryConditions();
+    solveP.correctBoundaryConditions();
 
     // ── 질량 플럭스 재구성: phi = phiHbyA + pEqn.flux() ─────────────
     {
@@ -332,9 +351,10 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
 
         label off = 0;
         label offPar = 0;
-        forAll(p.boundaryField(), patchi)
+        forAll(solveP.boundaryField(), patchi)
         {
-            const fvPatchScalarField& pp = p.boundaryField()[patchi];
+            const fvPatchScalarField& pp =
+                solveP.boundaryField()[patchi];
             const label np = pp.size();
             if (np == 0) continue;
 
@@ -367,6 +387,51 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
     }
 
     // ── stock 후처리 1:1 ────────────────────────────────────────────
+    if (buoyant)
+    {
+        // 순 압력-부력 힘 재구성/완화 → U 보정 (correctBuoyantPressure
+        // 1:1; pEqn.flux() = phi - phiHbyA, rhorAAtUf = rhorAUf)
+        const surfaceScalarField pEqnFlux(phi - phiHbyA);
+        netForce.ref().relax
+        (
+            fvc::reconstruct(tGhGradRhof() + pEqnFlux/rhorAUf),
+            solveP.relaxationFactor()
+        );
+
+        U = HbyA + rAU*netForce();
+        U.correctBoundaryConditions();
+        fvConstraints().constrain(U);
+        K = 0.5*magSqr(U);
+
+        p = solveP + rho*buoyancy->gh + buoyancy->pRef;
+        const bool constrained = fvConstraints().constrain(p);
+
+        thermo_.correctRho(psi*p - psip0);
+        if (constrained)
+        {
+            rho = thermo.rho();
+        }
+        // isothermalFluid::correctDensity (private) 인라인 — rho 수송
+        {
+            fvScalarMatrix rhoEqn
+            (
+                fvm::ddt(rho) + fvc::div(phi)
+             ==
+                fvModels().source(rho)
+            );
+            fvConstraints().constrain(rhoEqn);
+            rhoEqn.solve();
+            fvConstraints().constrain(rho);
+        }
+
+        fluidSolver::continuityErrors(rho, thermo.rho(), phi);
+
+        // rho 수송 후 p 재구성 (upstream 순서)
+        p = solveP + rho*buoyancy->gh + buoyancy->pRef;
+        p.relax();
+    }
+    else
+    {
     const bool constrained = fvConstraints().constrain(p);
 
     thermo_.correctRho(psi*p - psip0);
@@ -396,6 +461,7 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
     U.correctBoundaryConditions();
     fvConstraints().constrain(U);
     K = 0.5*magSqr(U);
+    }
 
     if (pimple.simpleRho())
     {

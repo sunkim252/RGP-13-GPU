@@ -39,6 +39,7 @@ namespace
 
         // CSR (AmgX 직결용): 구조는 호스트 보관, 슬롯맵·값은 디바이스
         std::vector<int> hOwn, hNei, hRowPtr, hColInd;
+        std::vector<int> hBfc;   // 경계면 faceCells 호스트 사본
         int nnz = 0;
         int *dDiagSlot = nullptr, *dUpSlot = nullptr, *dLoSlot = nullptr;
         int *dRowPtr = nullptr, *dColInd = nullptr;
@@ -51,6 +52,10 @@ namespace
         double *wLin = nullptr;              // 내부면 linear 가중치
         double *sf = nullptr, *dvec = nullptr;   // [3*nf] Sf, C_n-C_o
         double *bSf = nullptr;               // [3*nbf] 경계면 Sf
+        //- 셀→면 CSR (결정론적 grad 게더 — CPU surfaceIntegrate와
+        //  동일한 셀별 누적 순서: 내부면 오름차순 → 경계면 오름차순).
+        //  cfIdx 코드: (idx<<1)|neiBit, idx<nf 내부 / nf+k 경계
+        int *cfPtr = nullptr, *cfIdx = nullptr;
     } gSTM;
 
     struct STBuf
@@ -146,14 +151,17 @@ namespace
     {
         int* ip[] = {gM.own, gM.nei, gM.bfc,
                      gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot,
-                     gM.dRowPtr, gM.dColInd};
+                     gM.dRowPtr, gM.dColInd,
+                     gSTM.cfPtr, gSTM.cfIdx};
         for (auto p : ip) { if (p) cudaFree(p); }
         gM.own = gM.nei = gM.bfc = nullptr;
         gM.dDiagSlot = gM.dUpSlot = gM.dLoSlot = nullptr;
         gM.dRowPtr = gM.dColInd = nullptr;
+        gSTM.cfPtr = gSTM.cfIdx = nullptr;
         if (gM.dVals) { cudaFree(gM.dVals); gM.dVals = nullptr; }
         gM.hOwn.clear(); gM.hNei.clear();
         gM.hRowPtr.clear(); gM.hColInd.clear();
+        gM.hBfc.clear();
         gM.nnz = 0;
 
         double** dp[] =
@@ -613,6 +621,61 @@ __global__ void faceFlux
 
 // ── 스칼라 수송(Z/C): Gauss linear grad + limitedLinear(k=1) + 조립 ──
 
+//- 면 보간값 (linear): xf[f] = w ψ_o + (1-w) ψ_n
+__global__ void stWFaceInterp
+(
+    const int nf,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin, const double* __restrict__ x,
+    double* __restrict__ xf
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    xf[f] = wLin[f]*x[own[f]] + (1.0 - wLin[f])*x[nei[f]];
+}
+
+//- Gauss linear 셀 그래디언트 — 결정론적 게더판. 셀별 누적 순서가
+//  CPU fvc::grad(= surfaceIntegrate: 내부면 오름차순 → 경계면)와
+//  1:1이라 비트 재현. atomicAdd판(stGradFace)은 누적 순서가 비결정이라
+//  라운드오프 레벨(≈0) 필드에서 limiter r의 부호가 CPU와 갈릴 수 있다
+//  (limiter는 이산 결정이라 K-스케일 오차로 증폭 — gmc 벤치에서 실측).
+__global__ void stGradGather
+(
+    const int nc, const int nf, const int nbf,
+    const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
+    const double* __restrict__ sf, const double* __restrict__ bSf,
+    const double* __restrict__ xf, const double* __restrict__ bPsi,
+    const double* __restrict__ V, double* __restrict__ g
+)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    double gx = 0.0, gy = 0.0, gz = 0.0;
+    for (int j = cfPtr[c]; j < cfPtr[c + 1]; j++)
+    {
+        const int code = cfIdx[j];
+        const int idx = code >> 1;
+        if (idx < nf)
+        {
+            const double s = (code & 1) ? -1.0 : 1.0;
+            gx += s*(sf[idx]*xf[idx]);
+            gy += s*(sf[(size_t)nf + idx]*xf[idx]);
+            gz += s*(sf[(size_t)2*nf + idx]*xf[idx]);
+        }
+        else
+        {
+            const int k = idx - nf;
+            gx += bSf[k]*bPsi[k];
+            gy += bSf[(size_t)nbf + k]*bPsi[k];
+            gz += bSf[(size_t)2*nbf + k]*bPsi[k];
+        }
+    }
+    g[c] = gx/V[c];
+    g[(size_t)nc + c] = gy/V[c];
+    g[(size_t)2*nc + c] = gz/V[c];
+}
+
 //- Gauss linear 셀 그래디언트: g[k*nc+c] = (1/V) Σ ±Sf_k ψ_f
 __global__ void stGradFace
 (
@@ -808,6 +871,46 @@ __global__ void stFaceRowSum
     if (f >= nf) return;
     atomicAdd(&rs[own[f]], upper[f]);
     atomicAdd(&rs[nei[f]], lower[f]);
+}
+
+//- fvc::div(phi, q) 면 기여 — multivariate 가중치 w (mvConvection의
+//  결합 min-리미터가 임의 필드에 적용되는 것과 1:1)
+__global__ void stFluxDivFace
+(
+    const int nf,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ phi, const double* __restrict__ w,
+    const double* __restrict__ q, double* __restrict__ out
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const double val =
+        phi[f]*(w[f]*q[own[f]] + (1.0 - w[f])*q[nei[f]]);
+    atomicAdd(&out[own[f]], val);
+    atomicAdd(&out[nei[f]], -val);
+}
+
+__global__ void stFluxDivBFace
+(
+    const int nbf, const int* __restrict__ bfc,
+    const double* __restrict__ bPhi, const double* __restrict__ bQ,
+    double* __restrict__ out
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nbf) return;
+    atomicAdd(&out[bfc[k]], bPhi[k]*bQ[k]);
+}
+
+__global__ void stDivByV
+(
+    const int nc, const double* __restrict__ V, double* __restrict__ x
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    x[i] /= V[i];
 }
 
 //- BiCGStab 벡터 연산들
@@ -1855,6 +1958,7 @@ int rgpPEqnMeshUpload
     gM.nCells = nCells; gM.nIntFaces = nIntFaces; gM.nBFaces = nBFaces;
     gM.hOwn.assign(owner, owner + nIntFaces);
     gM.hNei.assign(neigh, neigh + nIntFaces);
+    gM.hBfc.assign(bFaceCells, bFaceCells + nBFaces);
 
     cudaError_t e;
     struct { void** d; const void* s; size_t bytes; } it[] =
@@ -2430,6 +2534,48 @@ int rgpSTEqnMeshUpload
                 return pfail(e, "steqn/buf malloc");
         }
     }
+
+    // 셀→면 CSR (결정론적 grad 게더): 내부면 오름차순 → 경계면
+    // 오름차순 — CPU surfaceIntegrate의 셀별 누적 순서와 동일
+    if (!gSTM.cfPtr)
+    {
+        if ((int)gM.hOwn.size() != nf || (int)gM.hBfc.size() != nbf)
+        {
+            snprintf(gPErr, sizeof(gPErr),
+                     "steqn: host own/bfc unavailable for gather CSR");
+            return -1;
+        }
+        std::vector<int> cnt(nc + 1, 0);
+        for (int f = 0; f < nf; f++)
+        {
+            cnt[gM.hOwn[f] + 1]++; cnt[gM.hNei[f] + 1]++;
+        }
+        for (int k = 0; k < nbf; k++) { cnt[gM.hBfc[k] + 1]++; }
+        for (int c = 0; c < nc; c++) { cnt[c + 1] += cnt[c]; }
+        std::vector<int> idx(cnt[nc]);
+        std::vector<int> pos(cnt.begin(), cnt.end() - 1);
+        for (int f = 0; f < nf; f++)
+        {
+            idx[pos[gM.hOwn[f]]++] = (f << 1);
+            idx[pos[gM.hNei[f]]++] = (f << 1) | 1;
+        }
+        for (int k = 0; k < nbf; k++)
+        {
+            idx[pos[gM.hBfc[k]]++] = ((nf + k) << 1);
+        }
+        if ((e = cudaMalloc(&gSTM.cfPtr, (nc + 1)*sizeof(int)))
+            != cudaSuccess) return pfail(e, "steqn/cfPtr malloc");
+        if ((e = cudaMalloc(&gSTM.cfIdx, idx.size()*sizeof(int)))
+            != cudaSuccess) return pfail(e, "steqn/cfIdx malloc");
+        if ((e = cudaMemcpy(gSTM.cfPtr, cnt.data(),
+                            (nc + 1)*sizeof(int),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "steqn/cfPtr H2D");
+        if ((e = cudaMemcpy(gSTM.cfIdx, idx.data(),
+                            idx.size()*sizeof(int),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "steqn/cfIdx H2D");
+    }
     return 0;
 }
 
@@ -2467,16 +2613,14 @@ int rgpSTWeightsField(const double* psi, const double* bPsi)
             return pfail(e, "stw/H2D bPsi");
     }
 
-    if ((e = cudaMemset(gST.grad, 0, (size_t)3*nc*sizeof(double)))
-        != cudaSuccess) return pfail(e, "stw/grad memset");
-    rgppeqn::stGradFace<<<nb(nf), BS>>>
-        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.sf, gB.x, gST.grad);
-    if (nbf > 0)
-    {
-        rgppeqn::stGradBFace<<<nb(nbf), BS>>>
-            (nbf, nc, gM.bfc, gSTM.bSf, gST.bPsi, gST.grad);
-    }
-    rgppeqn::stGradDivV<<<nb(nc), BS>>>(nc, gM.V, gST.grad);
+    // 결정론적 게더 grad (CPU fvc::grad와 셀별 누적 순서 1:1 — 비트
+    // 재현; limiter의 이산 결정이 라운드오프 grad 차이로 갈리는 것을
+    // 차단). 면 보간값 스테이징은 gST.lower (조립이 매 솔브 새로 씀)
+    rgppeqn::stWFaceInterp<<<nb(nf), BS>>>
+        (nf, gM.own, gM.nei, gSTM.wLin, gB.x, gST.lower);
+    rgppeqn::stGradGather<<<nb(nc), BS>>>
+        (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
+         gST.lower, gST.bPsi, gM.V, gST.grad);
     rgppeqn::stLimField<<<nb(nf), BS>>>
         (nf, nc, gM.own, gM.nei, gSTM.dvec, gST.phi, gB.x, gST.grad,
          gST.wLim);
@@ -2504,6 +2648,38 @@ int rgpSTGradAtPar(double* out3)
                         (size_t)3*gPar.totF*sizeof(double),
                         cudaMemcpyDeviceToHost)) != cudaSuccess)
         return pfail(e, "stw/parGather D2H");
+    return 0;
+}
+
+
+int rgpSTGradDump(double* out3)
+{
+    // 진단용: 직전 rgpSTWeightsField의 셀 grad [3*nc] D2H
+    const int nc = gM.nCells;
+    cudaError_t e;
+    if ((e = cudaMemcpy(out3, gST.grad, (size_t)3*nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "stw/gradDump");
+    return 0;
+}
+
+
+int rgpSTWeightsSet(const double* w)
+{
+    // 호스트-계산 가중치 직업로드 (CPU multivariate 스킴 산출물을
+    // 그대로 사용 — 컴파일러 FMA 축약 등 ULP 차이가 limiter의 이산
+    // 결정을 뒤집는 것을 원천 차단. gmc 벤치 실측: h처럼 2e6 크기에
+    // 1 ULP 요동인 평탄 필드에서 r 부호가 갈려 K-스케일 오차로 증폭)
+    const int nf = gM.nIntFaces;
+    if (!gST.wLim)
+    {
+        snprintf(gPErr, sizeof(gPErr), "stw: ST mesh not uploaded");
+        return -1;
+    }
+    cudaError_t e;
+    if ((e = cudaMemcpy(gST.wLim, w, (size_t)nf*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "stw/H2D wSet");
     return 0;
 }
 
@@ -2597,6 +2773,57 @@ int rgpSTEqnSolve
     if ((e = cudaMemcpy(psiOut, gB.x, (size_t)nc*sizeof(double),
                         cudaMemcpyDeviceToHost)) != cudaSuccess)
         return pfail(e, "steqn/D2H psi");
+
+    return 0;
+}
+
+
+int rgpSTFluxDiv
+(
+    const double* q, const double* bQ, const double* phiInt,
+    const double* bPhi, double* divOut
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gSTM.wLin || !gST.wLim)
+    {
+        snprintf(gPErr, sizeof(gPErr), "stFluxDiv: ST/weights not armed");
+        return -1;
+    }
+
+    cudaError_t e;
+    // 스테이징: q→gB.x, bQ→gB.bDiag, bPhi→gB.bSrc, phi→gST.phi,
+    // out→gB.pA — 모두 후속 솔브가 자체 재업로드하는 버퍼라 충돌 없음
+    struct { double* d; const double* s; size_t n; } up[] =
+    {
+        {gB.x, q, (size_t)nc}, {gST.phi, phiInt, (size_t)nf},
+        {gB.bDiag, bQ, (size_t)nbf}, {gB.bSrc, bPhi, (size_t)nbf}
+    };
+    for (auto& u : up)
+    {
+        if (u.n == 0 || !u.s) continue;
+        if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "stFluxDiv/H2D");
+    }
+
+    if ((e = cudaMemset(gB.pA, 0, (size_t)nc*sizeof(double)))
+        != cudaSuccess) return pfail(e, "stFluxDiv/memset");
+
+    rgppeqn::stFluxDivFace<<<nb(nf), BS>>>
+        (nf, gM.own, gM.nei, gST.phi, gST.wLim, gB.x, gB.pA);
+    if (nbf > 0)
+    {
+        rgppeqn::stFluxDivBFace<<<nb(nbf), BS>>>
+            (nbf, gM.bfc, gB.bSrc, gB.bDiag, gB.pA);
+    }
+    rgppeqn::stDivByV<<<nb(nc), BS>>>(nc, gM.V, gB.pA);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "stFluxDiv/launch");
+
+    if ((e = cudaMemcpy(divOut, gB.pA, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "stFluxDiv/D2H");
 
     return 0;
 }

@@ -150,6 +150,10 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         // muEff = (rho*nuEff) — dev2 명시항용. 라플라시안 계수는
         // muEff+muArt (LAD-U는 implicit laplacian에만 들어감 —
         // fvm::laplacian(a,U)+fvm::laplacian(b,U) == fvm::laplacian(a+b,U))
+        // CPU 규약: fvMatrix 생성자의 BC updateCoeffs() 상응 (phi
+        // 의존 BC의 valueFraction 갱신 — 직접 조립 경로 필수)
+        U.boundaryFieldRef().updateCoeffs();
+
         const volScalarField muEff(rho*momentumTransport->nuEff());
         tmp<volScalarField> tmuLap;
         if (LADUCoeff > 0)
