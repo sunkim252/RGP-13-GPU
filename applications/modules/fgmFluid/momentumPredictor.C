@@ -120,15 +120,18 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         // 침묵 오차 방지: CPU 경로의 relax/fvModels/fvConstraints(행렬)
         // 는 GPU 조립에 미반영 — U에 실제로 작용하는 것만 차단 (계수 1의
         // no-op relax, 다른 필드의 모델, 필드-레벨 제약은 무해하므로 허용)
+        // 방정식 완화: fvMatrix::relax(alpha) 1:1을 디바이스에서 수행
+        // (rgpUEqnSolve relaxAlpha/bRelax3 — 완화된 행렬이 pCorr의
+        // rAU/H에도 그대로 흘러가는 CPU 규약 유지)
+        scalar relaxAlpha = -1;
         if
         (
             mesh.solution().relaxEquation(U.name())
          && mesh.solution().equationRelaxationFactor(U.name()) != 1
         )
         {
-            FatalErrorInFunction
-                << "gpuUEqn (v1) does not support equation relaxation "
-                << "on U" << exit(FatalError);
+            relaxAlpha =
+                mesh.solution().equationRelaxationFactor(U.name());
         }
         if (fvModels().addsSupToField(U.name()))
         {
@@ -511,6 +514,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
 
         // 4) 경계 행렬 계수 (BC 가중치: 본 케이스 BC 타입들은 w 미사용
         //    — CD 가중치 전달)
+        List<double> bRelaxA;
         {
             label off = 0;
             label offp = 0;
@@ -616,6 +620,54 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                     << "rgpUEqnParCoeffs: " << rgpPEqnLastError()
                     << exit(FatalError);
             }
+
+            // relax 경계 배열 [add|rem|soff] — fvMatrix::relax의
+            // 경계 취급 1:1: uncoupled add=cmptMax(cmptMag(iC)),
+            // rem=cmptMin(iC); coupled add=rem=iC성분0, soff=|bC|
+            if (relaxAlpha > 0)
+            {
+                bRelaxA.setSize(3*max(nbf, label(1)), 0.0);
+                label off2 = 0;
+                label offp2 = 0;
+                forAll(U.boundaryField(), patchi)
+                {
+                    const fvPatchVectorField& pp =
+                        U.boundaryField()[patchi];
+                    const label np = pp.size();
+                    if (np == 0) continue;
+
+                    if (pp.coupled())
+                    {
+                        for (label f = 0; f < np; f++)
+                        {
+                            const scalar iC0 =
+                                bDiag3[off2 + f];
+                            bRelaxA[off2 + f] = iC0;
+                            bRelaxA[nbf + off2 + f] = iC0;
+                            bRelaxA[2*nbf + off2 + f] =
+                                mag(parB[offp2 + f]);
+                        }
+                        offp2 += np;
+                    }
+                    else
+                    {
+                        for (label f = 0; f < np; f++)
+                        {
+                            const scalar c0 = bDiag3[off2 + f];
+                            const scalar c1 =
+                                bDiag3[nbf + off2 + f];
+                            const scalar c2 =
+                                bDiag3[2*nbf + off2 + f];
+                            bRelaxA[off2 + f] =
+                                max(mag(c0), max(mag(c1), mag(c2)));
+                            bRelaxA[nbf + off2 + f] =
+                                min(c0, min(c1, c2));
+                            // soff = 0 (uncoupled)
+                        }
+                    }
+                    off2 += np;
+                }
+            }
         }
 
         const dictionary& sd = mesh.solution().solverDict
@@ -657,6 +709,8 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             tsrcBulk.valid() ? srcX3 : nullptr /*LAD-bulk*/,
             nullptr /*gradP3*/,
             bDiag3, bSrc3, solveCmpt,
+            relaxAlpha,
+            relaxAlpha > 0 ? bRelaxA.begin() : nullptr,
             tol, rtol, maxIter,
             U3out, res0, resF, iters
         );

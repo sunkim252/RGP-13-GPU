@@ -84,6 +84,8 @@ namespace
         double *bg9 = nullptr;                        // [9*nbf]
         double *rAU = nullptr, *HbyA3 = nullptr;      // [nc], [3*nc]
         double *parB = nullptr;   // [totF] 병렬 인터페이스 계수 (성분 공유)
+        double *rlx = nullptr;    // [3*nc] relax 스크래치 (sumOff|bAdd|bRem)
+        double *rlxB = nullptr;   // [3*nbf] relax 경계 배열 스테이징
         bool assembled = false;   // rgpUEqnSolve 조립 완료 여부 (AH 가드)
     } gU;
 
@@ -174,6 +176,7 @@ namespace
             &gST.rho, &gST.rhoOld, &gST.psiOld, &gST.gamma, &gST.sp,
             &gST.src, &gST.phi, &gST.wLim, &gST.lower, &gST.grad,
             &gST.bPsi, &gST.rA0, &gST.sA, &gST.yz, &gST.AyA, &gST.AzA,
+            &gU.rlx, &gU.rlxB,
             &gU.diag, &gU.upper, &gU.lower, &gU.b3, &gU.U3,
             &gU.bDiag3, &gU.bSrc3, &gU.workDiag, &gU.workB, &gU.H,
             &gU.grad9, &gU.src3, &gU.gradP, &gU.UB3, &gU.bfx3, &gU.bg9,
@@ -1340,6 +1343,64 @@ __global__ void pcUUpdate
     {
         U3[(size_t)k*nc + i] =
             HbyA3[(size_t)k*nc + i] - rAU[i]*gradP[(size_t)k*nc + i];
+    }
+}
+
+//- fvMatrix::relax 1:1 — ① 내부면 Σ|upper|+|lower| (sumOff)
+__global__ void uRelaxFaceSumMag
+(
+    const int nf,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ upper, const double* __restrict__ lower,
+    double* __restrict__ sumOff
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    atomicAdd(&sumOff[own[f]], fabs(upper[f]));
+    atomicAdd(&sumOff[nei[f]], fabs(lower[f]));
+}
+
+//- ② 경계 폴드: br=[add|rem|soff] 각 [nbf] — add/rem은 D 가감,
+//  soff는 coupled |bC|의 sumOff 기여 (호스트가 fvPatchField 계수로 계산)
+__global__ void uRelaxBFold
+(
+    const int nbf, const int nc, const int* __restrict__ bfc,
+    const double* __restrict__ br,
+    double* __restrict__ sumOff, double* __restrict__ bAdd,
+    double* __restrict__ bRem
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nbf) return;
+    atomicAdd(&bAdd[bfc[k]], br[k]);
+    atomicAdd(&bRem[bfc[k]], br[(size_t)nbf + k]);
+    atomicAdd(&sumOff[bfc[k]], br[(size_t)2*nbf + k]);
+}
+
+//- ③ 셀: D = max(|D0+Σadd|, sumOff)/alpha − Σrem,
+//        S_k += (D−D0)·ψ_k(현재) — 저장 소스라 H()에 포함(CPU 동일)
+__global__ void uRelaxCell
+(
+    const int nc, const double alpha,
+    const double* __restrict__ sumOff,
+    const double* __restrict__ bAdd, const double* __restrict__ bRem,
+    const double* __restrict__ U3,
+    double* __restrict__ diag, double* __restrict__ b3
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    const double D0 = diag[i];
+    double D = D0 + bAdd[i];
+    D = fmax(fabs(D), sumOff[i]);
+    D /= alpha;
+    D -= bRem[i];
+    diag[i] = D;
+    const double delta = D - D0;
+    for (int k = 0; k < 3; k++)
+    {
+        b3[(size_t)k*nc + i] += delta*U3[(size_t)k*nc + i];
     }
 }
 
@@ -3023,6 +3084,7 @@ int rgpUEqnSolve
     const double* gradP3,
     const double* bDiag3, const double* bSrc3,
     const int* solveCmpt,
+    double relaxAlpha, const double* bRelax3,
     double tol, double relTol, int maxIter,
     double* U3out, double* initRes3, double* finalRes3, int* iters3
 )
@@ -3124,6 +3186,48 @@ int rgpUEqnSolve
          nullptr, gM.gg, gU.diag, gU.upper, gU.lower);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "ueqn/assemble launch");
+
+    // ── fvMatrix::relax(alpha) 1:1 (조립 후·솔브 전; 완화된 diag/b3가
+    //    저장 행렬이 되어 이후 rgpUEqnAH의 rAU/H에도 그대로 반영 —
+    //    CPU에서 pEqn이 완화된 UEqn을 소비하는 규약과 동일) ─────────
+    if (relaxAlpha > 0.0 && bRelax3)
+    {
+        if (!gU.rlx)
+        {
+            if ((e = cudaMalloc(&gU.rlx, (size_t)3*nc*sizeof(double)))
+                != cudaSuccess) return pfail(e, "ueqn/relax malloc");
+        }
+        if (!gU.rlxB && nbf > 0)
+        {
+            if ((e = cudaMalloc(&gU.rlxB,
+                                (size_t)3*nbf*sizeof(double)))
+                != cudaSuccess) return pfail(e, "ueqn/relaxB malloc");
+        }
+        if ((e = cudaMemset(gU.rlx, 0, (size_t)3*nc*sizeof(double)))
+            != cudaSuccess) return pfail(e, "ueqn/relax memset");
+
+        double* dSumOff = gU.rlx;
+        double* dBAdd = gU.rlx + (size_t)nc;
+        double* dBRem = gU.rlx + (size_t)2*nc;
+
+        rgppeqn::uRelaxFaceSumMag<<<nb(nf), BS>>>
+            (nf, gM.own, gM.nei, gU.upper, gU.lower, dSumOff);
+        if (nbf > 0)
+        {
+            if ((e = cudaMemcpy(gU.rlxB, bRelax3,
+                                (size_t)3*nbf*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "ueqn/relaxB H2D");
+            rgppeqn::uRelaxBFold<<<nb(nbf), BS>>>
+                (nbf, nc, gM.bfc, gU.rlxB, dSumOff, dBAdd, dBRem);
+        }
+        rgppeqn::uRelaxCell<<<nb(nc), BS>>>
+            (nc, relaxAlpha, dSumOff, dBAdd, dBRem, gU.U3,
+             gU.diag, gU.b3);
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return pfail(e, "ueqn/relax launch");
+    }
+
     gU.assembled = true;
 
     // grad p (솔브 전용 소스) — null이면 Prep2의 디바이스 상주본 사용

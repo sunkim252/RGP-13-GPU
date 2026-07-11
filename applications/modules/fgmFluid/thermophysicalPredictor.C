@@ -291,42 +291,37 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                 }
             }
         };
-        if (hPtr_.valid() || WPtr_.valid())
+        // 수송 스칼라 목록: Z, C [+ h(비단열) + W(희석)] — h/W는 Z와
+        // 동일한 이류-확산 기계(소스 없음, gamma만 상이)라 같은 배치로
+        DynamicList<word> zcNames;
+        zcNames.append(Z_.name());
+        zcNames.append(C_.name());
+        if (hPtr_.valid()) { zcNames.append(hPtr_().name()); }
+        if (WPtr_.valid()) { zcNames.append(WPtr_().name()); }
+
+        forAll(zcNames, zi)
         {
-            FatalErrorInFunction
-                << "gpuZC (v1) does not support transported h/W tables"
-                << exit(FatalError);
-        }
-        if
-        (
+            const word& nm = zcNames[zi];
+            if
             (
-                mesh.solution().relaxEquation(Z_.name())
-             && mesh.solution().equationRelaxationFactor(Z_.name()) != 1
+                mesh.solution().relaxEquation(nm)
+             && mesh.solution().equationRelaxationFactor(nm) != 1
             )
-         || (
-                mesh.solution().relaxEquation(C_.name())
-             && mesh.solution().equationRelaxationFactor(C_.name()) != 1
-            )
-        )
-        {
-            FatalErrorInFunction
-                << "gpuZC (v1) does not support equation relaxation "
-                << "on Z/C" << exit(FatalError);
+            {
+                FatalErrorInFunction
+                    << "gpuZC (v1) does not support equation relaxation "
+                    << "on " << nm << exit(FatalError);
+            }
+            if (fvModels().addsSupToField(nm))
+            {
+                FatalErrorInFunction
+                    << "gpuZC (v1) does not support fvModels sources on "
+                    << nm << exit(FatalError);
+            }
+            // 행렬-레벨 fvConstraint 차단 (CPU 경로는 constrain(Eqn)을
+            // 적용 — GPU 조립은 미반영이므로 켜져 있으면 침묵 발산)
+            checkGpuConstraints(nm, "gpuZC");
         }
-        if
-        (
-            fvModels().addsSupToField(Z_.name())
-         || fvModels().addsSupToField(C_.name())
-        )
-        {
-            FatalErrorInFunction
-                << "gpuZC (v1) does not support fvModels sources on Z/C"
-                << exit(FatalError);
-        }
-        // 행렬-레벨 fvConstraint 차단 (CPU 경로는 constrain(ZEqn/CEqn)을
-        // 적용 — GPU 조립은 미반영이므로 켜져 있으면 침묵 발산)
-        checkGpuConstraints(Z_.name(), "gpuZC");
-        checkGpuConstraints(C_.name(), "gpuZC");
         if (Pstream::parRun() && gpuPEqnCheck_)
         {
             FatalErrorInFunction
@@ -337,6 +332,8 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         addWeightField(thermo.he());
         addWeightField(Z_);
         addWeightField(C_);
+        if (hPtr_.valid()) { addWeightField(hPtr_()); }
+        if (WPtr_.valid()) { addWeightField(WPtr_()); }
 
         if (rgpSTWeightsEnd())
         {
@@ -851,6 +848,30 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     {
         volScalarField& h = hPtr_();
         const volScalarField Dh("Dh", Deff("h"));
+
+        if (gpuZC_)
+        {
+            const volScalarField Dheff(Dh + Dart);
+            const scalarField h0
+            (
+                gpuPEqnCheck_ ? h.primitiveField() : scalarField()
+            );
+            solveScalarGpu(h, Dheff, contErr, nullptr);
+            if (gpuPEqnCheck_)
+            {
+                fvScalarMatrix chk
+                (
+                    fvm::ddt(rho, h)
+                  + mvConvection->fvmDiv(phi, h)
+                  - fvm::Sp(contErr, h)
+                  - fvm::laplacian(Dheff, h)
+                );
+                checkSTMatrix(chk, h, h0);
+            }
+            fvConstraints().constrain(h);
+        }
+        else
+        {
         fvScalarMatrix hEqn
         (
             fvm::ddt(rho, h)
@@ -865,6 +886,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         fvConstraints().constrain(hEqn);
         hEqn.solve("Yi");
         fvConstraints().constrain(h);
+        }
 
         // Bound h to the manifold-representable enthalpy band
         // [hAd(Z)+dh_min, hAd(Z)+dh_max] -- the same table-consistency
@@ -905,6 +927,30 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     {
         volScalarField& W = WPtr_();
         const volScalarField DW("DW", Deff("Z"));   // W diffuses like Z
+
+        if (gpuZC_)
+        {
+            const volScalarField DWeff(DW + Dart);
+            const scalarField W0
+            (
+                gpuPEqnCheck_ ? W.primitiveField() : scalarField()
+            );
+            solveScalarGpu(W, DWeff, contErr, nullptr);
+            if (gpuPEqnCheck_)
+            {
+                fvScalarMatrix chk
+                (
+                    fvm::ddt(rho, W)
+                  + mvConvection->fvmDiv(phi, W)
+                  - fvm::Sp(contErr, W)
+                  - fvm::laplacian(DWeff, W)
+                );
+                checkSTMatrix(chk, W, W0);
+            }
+            fvConstraints().constrain(W);
+        }
+        else
+        {
         fvScalarMatrix WEqn
         (
             fvm::ddt(rho, W)
@@ -919,6 +965,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         fvConstraints().constrain(WEqn);
         WEqn.solve("Yi");
         fvConstraints().constrain(W);
+        }
 
         // Bound W to the tabulated dilution range (outside it the manifold
         // clamps at the edge slice anyway; keep the transported field in-band).

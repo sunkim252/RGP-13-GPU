@@ -5,7 +5,8 @@
     + divDevTau(= -laplacian(muEff,U) - div(muEff*dev2(T(grad U))))
     [+ MRF.DDt(rho,U) — srcExtra3 저장 소스]
     == -grad(p) | netForce() [부력] (솔브-전용 소스)
-  v1: fvModels/fvConstraints/relax/consistent 미지원(Fatal), 정적 메시.
+  방정식 완화(relax)는 fvMatrix::relax 1:1 디바이스 수행.
+  v1: fvModels/fvConstraints/consistent 미지원(Fatal), 정적 메시.
 \*---------------------------------------------------------------------------*/
 
 #include "gpuMulticomponentFluid.H"
@@ -31,15 +32,15 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
 
     volVectorField& U(U_);
 
+    // 방정식 완화: fvMatrix::relax(alpha) 1:1 디바이스 수행
+    scalar relaxAlpha = -1;
     if
     (
         mesh.solution().relaxEquation(U.name())
      && mesh.solution().equationRelaxationFactor(U.name()) != 1
     )
     {
-        FatalErrorInFunction
-            << "gpuUEqn (v1) does not support relaxation on U"
-            << exit(FatalError);
+        relaxAlpha = mesh.solution().equationRelaxationFactor(U.name());
     }
     if (fvModels().addsSupToField(U.name()))
     {
@@ -383,6 +384,7 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
     }
 
     // 경계 행렬 계수
+    List<double> bRelaxA;
     {
         label off = 0;
         label offp = 0;
@@ -478,6 +480,49 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
                 << "rgpUEqnParCoeffs: " << rgpPEqnLastError()
                 << exit(FatalError);
         }
+
+        // relax 경계 배열 [add|rem|soff] (fvMatrix::relax 경계 취급
+        // 1:1 — fgmFluid gpuUEqn과 동일 규약)
+        if (relaxAlpha > 0)
+        {
+            bRelaxA.setSize(3*max(nbf, label(1)), 0.0);
+            label off2 = 0;
+            label offp2 = 0;
+            forAll(U.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pp =
+                    U.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+
+                if (pp.coupled())
+                {
+                    for (label f = 0; f < np; f++)
+                    {
+                        const scalar iC0 = bDiag3[off2 + f];
+                        bRelaxA[off2 + f] = iC0;
+                        bRelaxA[nbf + off2 + f] = iC0;
+                        bRelaxA[2*nbf + off2 + f] =
+                            mag(gpuParB_[offp2 + f]);
+                    }
+                    offp2 += np;
+                }
+                else
+                {
+                    for (label f = 0; f < np; f++)
+                    {
+                        const scalar c0 = bDiag3[off2 + f];
+                        const scalar c1 = bDiag3[nbf + off2 + f];
+                        const scalar c2 = bDiag3[2*nbf + off2 + f];
+                        bRelaxA[off2 + f] =
+                            max(mag(c0), max(mag(c1), mag(c2)));
+                        bRelaxA[nbf + off2 + f] =
+                            min(c0, min(c1, c2));
+                    }
+                }
+                off2 += np;
+            }
+        }
     }
 
     const dictionary& sd = mesh.solution().solverDict
@@ -547,6 +592,8 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
             MRF.size() ? srcX3 : nullptr,
             buoyancy.valid() ? nF3 : nullptr,
             bDiag3, bSrc3, solveCmpt,
+            relaxAlpha,
+            relaxAlpha > 0 ? bRelaxA.begin() : nullptr,
             tol, rtol, maxIter,
             U3out, res0, resF, iters
         ))

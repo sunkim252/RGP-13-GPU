@@ -165,6 +165,11 @@ int rgpUEqnPrep2
     const double* bndFlux3
 );
 
+/*  relaxAlpha > 0 이면 fvMatrix::relax(alpha) 1:1을 디바이스에서 수행
+    (조립 후·솔브 전): D=max(|D+Σadd_b|, Σ|off|+Σsoff_b)/α − Σrem_b,
+    S += (D−D0)·ψ현재. bRelax3 = [add|rem|soff] 각 [nbf] 연접 —
+    uncoupled: add=cmptMax(cmptMag(iC)), rem=cmptMin(iC), soff=0;
+    coupled(processor): add=rem=iC성분0, soff=|bC|.                   */
 int rgpUEqnSolve
 (
     double dtInv, const double* rdtCell,
@@ -175,6 +180,7 @@ int rgpUEqnSolve
     const double* gradP3,
     const double* bDiag3, const double* bSrc3,
     const int* solveCmpt,
+    double relaxAlpha, const double* bRelax3,
     double tol, double relTol, int maxIter,
     double* U3out, double* initRes3, double* finalRes3, int* iters3
 );
