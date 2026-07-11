@@ -170,23 +170,18 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
             << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
             << exit(FatalError);
     }
-    // CSR 구조 준비: amgx 직결에는 필수, PCG에는 무-atomics SpMV용
-    // 선택 최적화(부재 시 LDU 경로 폴백) — VRAM이 빠듯한 카드에서
-    // OOM이면 pcg는 경고 후 계속 (2Mv2×106종이 6GB에서 실측)
+    // CSR 구조는 amgx 직결 전용 — pcg의 무-atomics CSR SpMV는 이득 0으로
+    // 실측(e12d61a)돼 nnz(≈nc+2nf)×(8+4)B가 순수 VRAM 낭비(2.6M에서
+    // ~385MB; 6GB 카드 풀스택의 OOM 요인). pcg는 LDU 경로 사용.
+    gpuPEqnNnz_ = 0;
+    if (gpuPEqnSolver_ == "amgx")
     {
         int nnz = 0;
         if (rgpPEqnCsrPrepare(&nnz))
         {
-            if (gpuPEqnSolver_ == "amgx")
-            {
-                FatalErrorInFunction
-                    << "rgpPEqnCsrPrepare: " << rgpPEqnLastError()
-                    << exit(FatalError);
-            }
-            WarningInFunction
+            FatalErrorInFunction
                 << "rgpPEqnCsrPrepare: " << rgpPEqnLastError()
-                << " -- continuing with the LDU SpMV path" << endl;
-            nnz = 0;
+                << exit(FatalError);
         }
         gpuPEqnNnz_ = nnz;
     }
