@@ -39,7 +39,9 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
     gpuMeshFaces_(-1),
     gpuMeshStampTime_(-1),
     gpuNonOrtho_(false),
-    gpuNonOrthoWarned_(false)
+    gpuNonOrthoWarned_(false),
+    gpuNOSrcDev_(false),
+    gpuNOLimitCoeff_(-1)
 {
     {
         const IOdictionary dict
@@ -219,6 +221,78 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
         FatalErrorInFunction
             << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
             << exit(FatalError);
+    }
+
+    // 비직교 보정 소스 디바이스화 자격 판정·아밍 (fgmFluid 1:1 —
+    // corrected/limited-corrected snGrad + Gauss linear grad(p) + 직렬;
+    // 부적격/VRAM 부족이면 호스트 fvc 경로 유지)
+    gpuNOSrcDev_ = false;
+    if (gpuNonOrtho_ && !Pstream::parRun())
+    {
+        scalar lc = -1;
+        bool devOK = false;
+        {
+            ITstream& isn = mesh.schemes().snGrad(p_.name());
+            isn.rewind();
+            const word snType(isn);
+            if (snType == "corrected") { devOK = true; }
+            else if (snType == "limited")
+            {
+                token t(isn);
+                if (t.isWord() && t.wordToken() == "corrected")
+                {
+                    lc = readScalar(isn);
+                    devOK = true;
+                }
+                else if (t.isNumber())
+                {
+                    lc = t.number();
+                    devOK = true;
+                }
+            }
+        }
+        if (devOK)
+        {
+            ITstream& isg =
+                mesh.schemes().grad("grad(" + p_.name() + ')');
+            isg.rewind();
+            const word gd1(isg);
+            word gd2;
+            if (!isg.eof()) { gd2 = word(isg); }
+            devOK = (gd1 == "Gauss" && gd2 == "linear");
+        }
+        if (devOK)
+        {
+            List<double> dno(nif);
+            const scalarField& dnof =
+                mesh.nonOrthDeltaCoeffs().primitiveField();
+            forAll(dno, f) { dno[f] = dnof[f]; }
+            const surfaceVectorField& kf =
+                mesh.nonOrthCorrectionVectors();
+            List<double> kf3(3*nif);
+            forAll(mesh.owner(), f)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    kf3[k*nif + f] = kf.primitiveField()[f][k];
+                }
+            }
+            const int rcNO = rgpPEqnNOArm(kf3.begin(), dno.begin());
+            if (rcNO == 0)
+            {
+                gpuNOSrcDev_ = true;
+                gpuNOLimitCoeff_ = lc;
+                Info<< "gpuMulticomponentFluid: non-orthogonal "
+                    << "correction source on the device" << nl << endl;
+            }
+            else
+            {
+                WarningInFunction
+                    << "device non-ortho source unavailable ("
+                    << rgpPEqnLastError()
+                    << ") -- keeping the host fvc path" << endl;
+            }
+        }
     }
 
     // 수송용 메시 (선형 가중치, Sf, d, 경계 Sf)

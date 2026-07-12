@@ -284,6 +284,12 @@ protected:
 
         //- 비직교 안내 래치 (아밍마다 반복 출력 방지)
         mutable bool gpuNonOrthoWarned_ = false;
+
+        //- 비직교 보정 소스 디바이스화 (아밍 시 자격 판정: corrected/
+        //  limited-corrected snGrad + Gauss linear grad(p) + 직렬) —
+        //  부적격/VRAM 부족이면 호스트 fvc 경로 유지
+        mutable bool gpuNOSrcDev_ = false;
+        mutable scalar gpuNOLimitCoeff_ = -1;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
         mutable List<double> gpuPEqnFlux_;  // 내부면 플럭스 out
         mutable List<double> gpuPEqnParB_;  // processor 인터페이스 계수

@@ -193,6 +193,82 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
             << "rgpPEqnMeshUpload: " << rgpPEqnLastError()
             << exit(FatalError);
     }
+
+    // ── 비직교 보정 소스 디바이스화 자격 판정·아밍: 패스당 호스트
+    //    grad(p)+correction+div(~0.7s/2.6M)를 디바이스로. 자격 =
+    //    corrected/limited-corrected snGrad + Gauss linear grad(p) +
+    //    직렬(coupled 면은 이웃 grad 필요). 부적격/VRAM 부족이면
+    //    호스트 fvc 경로 그대로 (정합 폴백) ──
+    gpuNOSrcDev_ = false;
+    if (gpuNonOrtho_ && !Pstream::parRun())
+    {
+        scalar lc = -1;
+        bool devOK = false;
+        {
+            ITstream& isn = mesh.schemes().snGrad(p_.name());
+            isn.rewind();
+            const word snType(isn);
+            if (snType == "corrected") { devOK = true; }
+            else if (snType == "limited")
+            {
+                token t(isn);
+                if (t.isWord() && t.wordToken() == "corrected")
+                {
+                    lc = readScalar(isn);
+                    devOK = true;
+                }
+                else if (t.isNumber())
+                {
+                    lc = t.number();
+                    devOK = true;
+                }
+            }
+        }
+        if (devOK)
+        {
+            ITstream& isg =
+                mesh.schemes().grad("grad(" + p_.name() + ')');
+            isg.rewind();
+            const word gd1(isg);
+            word gd2;
+            if (!isg.eof()) { gd2 = word(isg); }
+            devOK = (gd1 == "Gauss" && gd2 == "linear");
+        }
+        if (devOK)
+        {
+            List<double> dno(nif);
+            const scalarField& dnof =
+                mesh.nonOrthDeltaCoeffs().primitiveField();
+            forAll(dno, f) { dno[f] = dnof[f]; }
+            const surfaceVectorField& kf =
+                mesh.nonOrthCorrectionVectors();
+            List<double> kf3(3*nif);
+            forAll(mesh.owner(), f)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    kf3[k*nif + f] = kf.primitiveField()[f][k];
+                }
+            }
+            const int rcNO = rgpPEqnNOArm(kf3.begin(), dno.begin());
+            if (rcNO == 0)
+            {
+                gpuNOSrcDev_ = true;
+                gpuNOLimitCoeff_ = lc;
+                Info<< "fgmFluid: non-orthogonal correction source on "
+                    << "the device (snGrad "
+                    << (lc >= 0 ? "limited corrected" : "corrected")
+                    << ")" << nl << endl;
+            }
+            else
+            {
+                WarningInFunction
+                    << "device non-ortho source unavailable ("
+                    << rgpPEqnLastError()
+                    << ") -- keeping the host fvc path" << endl;
+            }
+        }
+    }
     // CSR 구조는 amgx 직결 전용 — pcg의 무-atomics CSR SpMV는 이득 0으로
     // 실측(e12d61a)돼 nnz(≈nc+2nf)×(8+4)B가 순수 VRAM 낭비(2.6M에서
     // ~385MB; 6GB 카드 풀스택의 OOM 요인). pcg는 LDU 경로 사용.
@@ -1071,6 +1147,136 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         auto nonOrthoSrc = [&](tmp<surfaceScalarField>& tCorrFaceOut)
             -> scalarField
         {
+            // ── 디바이스 패스트패스: grad(결정론 게더)·면 보정·div를
+            //    GPU에서 (CPU FP 순서 1:1 — gpuPEqnCheck의 소스 열이
+            //    CPU fvMatrix와의 교차검증 계기). 경계(작음)는 호스트:
+            //    gaussGrad 경계보정 → kf_b&gradB → limiter → A_b·corr ──
+            if (gpuNOSrcDev_)
+            {
+                const surfaceScalarField A(trAUf()*mesh.magSf());
+
+                label nbfL = 0;
+                forAll(p.boundaryField(), patchi)
+                {
+                    nbfL += p.boundaryField()[patchi].size();
+                }
+
+                List<double> pBF(max(nbfL, label(1)), 0.0);
+                {
+                    label off = 0;
+                    forAll(p.boundaryField(), patchi)
+                    {
+                        const fvPatchScalarField& pp =
+                            p.boundaryField()[patchi];
+                        forAll(pp, k) { pBF[off + k] = pp[k]; }
+                        off += pp.size();
+                    }
+                }
+
+                List<double> bG3(3*max(nbfL, label(1)), 0.0);
+                if (rgpPEqnNOCorrPrep
+                    (
+                        p.primitiveField().begin(), pBF.begin(),
+                        A.primitiveField().begin(),
+                        gpuNOLimitCoeff_, bG3.begin()
+                    ))
+                {
+                    FatalErrorInFunction
+                        << "rgpPEqnNOCorrPrep: " << rgpPEqnLastError()
+                        << exit(FatalError);
+                }
+
+                List<double> cfB(max(nbfL, label(1)), 0.0);
+                const surfaceVectorField& kf =
+                    mesh.nonOrthCorrectionVectors();
+                {
+                    label off = 0;
+                    forAll(p.boundaryField(), patchi)
+                    {
+                        const fvPatchScalarField& pp =
+                            p.boundaryField()[patchi];
+                        const label np = pp.size();
+                        if (np == 0) continue;
+                        const vectorField nHat
+                        (
+                            mesh.boundary()[patchi].nf()
+                        );
+                        const scalarField snG(pp.snGrad());
+                        const vectorField& kfb =
+                            kf.boundaryField()[patchi];
+                        const scalarField& Ab =
+                            A.boundaryField()[patchi];
+                        for (label k = 0; k < np; k++)
+                        {
+                            const vector gI
+                            (
+                                bG3[off + k],
+                                bG3[nbfL + off + k],
+                                bG3[2*nbfL + off + k]
+                            );
+                            const vector gradB
+                            (
+                                gI + nHat[k]*(snG[k] - (nHat[k] & gI))
+                            );
+                            const scalar corrB = kfb[k] & gradB;
+                            scalar lim = 1.0;
+                            if (gpuNOLimitCoeff_ >= 0)
+                            {
+                                lim = min
+                                (
+                                    gpuNOLimitCoeff_*mag(snG[k])
+                                   /(
+                                        (1.0 - gpuNOLimitCoeff_)
+                                       *mag(corrB) + small
+                                    ),
+                                    scalar(1)
+                                );
+                            }
+                            cfB[off + k] = Ab[k]*(lim*corrB);
+                        }
+                        off += np;
+                    }
+                }
+
+                tCorrFaceOut = surfaceScalarField::New
+                (
+                    "pFaceFluxCorr", mesh,
+                    dimensionedScalar
+                    (
+                        A.dimensions()*p.dimensions()/dimLength, 0
+                    )
+                );
+                scalarField r(mesh.nCells());
+                if (rgpPEqnNOCorrFinish
+                    (
+                        cfB.begin(), r.begin(),
+                        tCorrFaceOut.ref().primitiveFieldRef().begin()
+                    ))
+                {
+                    FatalErrorInFunction
+                        << "rgpPEqnNOCorrFinish: " << rgpPEqnLastError()
+                        << exit(FatalError);
+                }
+                {
+                    label off = 0;
+                    forAll
+                    (
+                        tCorrFaceOut.ref().boundaryFieldRef(), patchi
+                    )
+                    {
+                        fvsPatchScalarField& pb =
+                            tCorrFaceOut.ref().boundaryFieldRef()[patchi];
+                        forAll(pb, k) { pb[k] = cfB[off + k]; }
+                        off += pb.size();
+                    }
+                }
+                if (tamdSrc.valid())
+                {
+                    r += tamdSrc().primitiveField();
+                }
+                return r;
+            }
+
             tmp<fv::snGradScheme<scalar>> tsn
             (
                 fv::snGradScheme<scalar>::New

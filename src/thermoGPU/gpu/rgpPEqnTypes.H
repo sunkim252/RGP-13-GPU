@@ -256,6 +256,28 @@ int rgpSTEqnSolve
     double* initRes, double* finalRes, int* nIters
 );
 
+/*  비직교 보정 소스 디바이스화 (limited/corrected snGrad 전용, 직렬 v1;
+    호출자는 스킴 파싱·경계 corr_b 계산·강등 폴백을 담당):
+    Arm: kf3=[3*nf] 비직교 보정 벡터 SoA, dcsNO=[nf] nonOrthDeltaCoeffs.
+         VRAM 부족 시 -2 (호스트 경로 강등).
+    Prep: p 셀값·경계 면값(linear interp 규약)·gMsf=rAUf*magSf 업로드
+         → grad(결정론 게더)·면 보정 플럭스 디바이스 계산, 경계셀
+         grad [3*nbf] D2H (호스트가 gaussGrad 경계보정 + corr_b/limiter_b
+         + bCorr=A_b·lim_b·corr_b 계산).
+    Finish: bCorr=[nbf] 합류 → src=div(A·lim·corr)/V [nc] D2H,
+         corrFOut=[nf] 면 보정 플럭스(플럭스 재구성 차감용) D2H.
+    limitCoeff < 0 → corrected(무리미터).                              */
+int rgpPEqnNOArm(const double* kf3, const double* dcsNO);
+int rgpPEqnNOCorrPrep
+(
+    const double* pCell, const double* pBFace, const double* gMsf,
+    double limitCoeff, double* bGrad3Out
+);
+int rgpPEqnNOCorrFinish
+(
+    const double* bCorr, double* srcOut, double* corrFOut
+);
+
 void rgpPEqnFree(void);
 const char* rgpPEqnLastError(void);
 

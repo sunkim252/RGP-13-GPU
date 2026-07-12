@@ -97,6 +97,16 @@ namespace
         double *rhoOld = nullptr, *Uold3 = nullptr, *phiOld = nullptr;
     } gPC;
 
+    //- 비직교 보정 소스 (limited/corrected snGrad의 correction(p)를
+    //  디바이스에서 — grad는 결정론 CSR 게더, 면/셀 산술은 CPU FP 순서
+    //  1:1). kf/dcsNO는 아밍 시 상주, 나머지는 pass별 재사용
+    struct NOBuf
+    {
+        double *kf3 = nullptr, *dcs = nullptr;    // [3*nf], [nf] 상주
+        double *corrF = nullptr, *bCorr = nullptr; // [nf], [nbf]
+        int armed = 0;
+    } gNO;
+
     struct PBuf
     {
         // 행렬/벡터 (모두 [nCells] 또는 [nIntFaces])
@@ -182,9 +192,11 @@ namespace
             &gU.grad9, &gU.src3, &gU.gradP, &gU.UB3, &gU.bfx3, &gU.bg9,
             &gU.rAU, &gU.HbyA3, &gU.parB,
             &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
-            &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld
+            &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld,
+            &gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
+        gNO.armed = 0;
 
         int* dic_i[] = {gDIC.colorOf, gDIC.colCells,
                         gDIC.fwdFace, gDIC.bwdFace};
@@ -1448,6 +1460,107 @@ __global__ void stRelaxCellGather
     D -= bRem;
     diag[c] = D;
     b[c] += (D - D0)*psi[c];
+}
+
+//- 비직교 보정: 면 보간 (CPU surfaceInterpolationScheme::interpolate
+//  1:1 — λ(P−N)+N; w*P+(1−w)*N 형태와 ULP가 다르므로 정확 재현)
+__global__ void noFaceInterp
+(
+    const int nf,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin, const double* __restrict__ x,
+    double* __restrict__ xf
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    xf[f] = wLin[f]*(x[own[f]] - x[nei[f]]) + x[nei[f]];
+}
+
+//- 비직교 보정: 면 보정 플럭스 cf = gMsf·(lim·(kf & gradf))
+//  gradf = λ(g_o−g_n)+g_n (dotInterpolate 1:1), lim = limitedSnGrad
+//  리미터 (limitCoeff<0 → corrected 무리미터). Foam min 의미론
+//  (NaN → 1) 유지.
+__global__ void noFaceCorr
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin,
+    const double* __restrict__ kf3, const double* __restrict__ dcs,
+    const double* __restrict__ x, const double* __restrict__ gMsf,
+    const double* __restrict__ g3,
+    const double limitCoeff,
+    double* __restrict__ corrF
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const int o = own[f], n = nei[f];
+    const double w = wLin[f];
+    const double g0 = w*(g3[o] - g3[n]) + g3[n];
+    const double g1 =
+        w*(g3[(size_t)nc + o] - g3[(size_t)nc + n]) + g3[(size_t)nc + n];
+    const double g2 =
+        w*(g3[(size_t)2*nc + o] - g3[(size_t)2*nc + n])
+      + g3[(size_t)2*nc + n];
+    const double corr =
+        kf3[f]*g0 + kf3[(size_t)nf + f]*g1 + kf3[(size_t)2*nf + f]*g2;
+
+    double lim = 1.0;
+    if (limitCoeff >= 0.0)
+    {
+        const double snGO = dcs[f]*(x[n] - x[o]);
+        const double a =
+            limitCoeff*fabs(snGO)
+           /((1.0 - limitCoeff)*fabs(corr) + 1e-15);
+        lim = (a < 1.0) ? a : 1.0;
+    }
+    corrF[f] = gMsf[f]*(lim*corr);
+}
+
+//- 비직교 보정: 결정론적 surfaceIntegrate (fvc::div(ssf) 1:1 — 셀별
+//  내부면 오름차순 ± → 경계 patch 순 +, 마지막 /V)
+__global__ void noSurfInt
+(
+    const int nc, const int nf,
+    const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
+    const double* __restrict__ corrF, const double* __restrict__ bCorr,
+    const double* __restrict__ V,
+    double* __restrict__ src
+)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    double s = 0.0;
+    for (int j = cfPtr[c]; j < cfPtr[c + 1]; j++)
+    {
+        const int code = cfIdx[j];
+        const int idx = code >> 1;
+        if (idx < nf)
+        {
+            s += (code & 1) ? -corrF[idx] : corrF[idx];
+        }
+        else
+        {
+            s += bCorr[idx - nf];
+        }
+    }
+    src[c] = s/V[c];
+}
+
+//- 비직교 보정: 경계셀 grad 채집 (호스트 corr_b 계산용)
+__global__ void noBGather
+(
+    const int nbf, const int nc, const int* __restrict__ bfc,
+    const double* __restrict__ g3, double* __restrict__ bg3
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nbf) return;
+    const int c = bfc[k];
+    bg3[k] = g3[c];
+    bg3[(size_t)nbf + k] = g3[(size_t)nc + c];
+    bg3[(size_t)2*nbf + k] = g3[(size_t)2*nc + c];
 }
 
 //- 솔브 전용 소스: workB += s*g*V (grad p는 저장 소스가 아니라
@@ -3006,6 +3119,149 @@ int rgpSTEqnDump
         if ((e = cudaMemcpy(o.h, o.d, o.n*sizeof(double),
                             cudaMemcpyDeviceToHost)) != cudaSuccess)
             return pfail(e, "steqn/dump");
+    }
+    return 0;
+}
+
+
+//- 비직교 보정 소스 디바이스화 — 아밍: 비직교 보정 벡터 kf(SoA)와
+//  nonOrthDeltaCoeffs를 상주 업로드(+작업 버퍼 지연 할당). VRAM 부족
+//  시 -2 반환 → 호출자는 호스트 fvc 경로로 영구 강등 (rgpPCorrEnsure
+//  강등 규약과 동일).
+int rgpPEqnNOArm(const double* kf3, const double* dcsNO)
+{
+    const int nf = gM.nIntFaces, nbf = gM.nBFaces;
+    cudaError_t e;
+    struct { double** d; const double* s; size_t n; } it[] =
+    {
+        {&gNO.kf3, kf3, (size_t)3*nf},
+        {&gNO.dcs, dcsNO, (size_t)nf},
+        {&gNO.corrF, nullptr, (size_t)nf},
+        {&gNO.bCorr, nullptr, (size_t)(nbf > 0 ? nbf : 1)}
+    };
+    for (auto& a : it)
+    {
+        if (!*a.d)
+        {
+            if ((e = cudaMalloc(a.d, a.n*sizeof(double))) != cudaSuccess)
+            {
+                double** ps[] =
+                    {&gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr};
+                for (auto p : ps)
+                {
+                    if (*p) { cudaFree(*p); *p = nullptr; }
+                }
+                gNO.armed = 0;
+                snprintf(gPErr, sizeof(gPErr),
+                         "noArm/malloc: %s", cudaGetErrorString(e));
+                return -2;
+            }
+        }
+        if (a.s)
+        {
+            if ((e = cudaMemcpy(*a.d, a.s, a.n*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "noArm/H2D");
+        }
+    }
+    gNO.armed = 1;
+    return 0;
+}
+
+
+//- pass별 1단계: p 업로드 → 면 보간(CPU 1:1) → 결정론 게더 grad →
+//  면 보정 플럭스 corrF = gMsf·(lim·(kf&gradf)) (디바이스 보관) +
+//  경계셀 grad D2H (호스트가 gaussGrad 경계보정·corr_b·limiter_b 계산)
+int rgpPEqnNOCorrPrep
+(
+    const double* pCell, const double* pBFace, const double* gMsf,
+    double limitCoeff, double* bGrad3Out
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gNO.armed || !gSTM.cfPtr || !gSTM.wLin || !gST.grad)
+    {
+        snprintf(gPErr, sizeof(gPErr),
+                 "noCorr: NO buffers/ST mesh not armed");
+        return -1;
+    }
+    cudaError_t e;
+    struct { double* d; const double* s; size_t n; } up[] =
+    {
+        {gB.pA, pCell, (size_t)nc},
+        {gST.bPsi, pBFace, (size_t)nbf},
+        {gB.rAUf, gMsf, (size_t)nf}
+    };
+    for (auto& u : up)
+    {
+        if (u.n == 0 || !u.s) continue;
+        if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "noCorr/H2D");
+    }
+
+    rgppeqn::noFaceInterp<<<nb(nf), BS>>>
+        (nf, gM.own, gM.nei, gSTM.wLin, gB.pA, gB.flux);
+    rgppeqn::stGradGather<<<nb(nc), BS>>>
+        (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
+         gB.flux, gST.bPsi, gM.V, gST.grad);
+    rgppeqn::noFaceCorr<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, gNO.kf3, gNO.dcs,
+         gB.pA, gB.rAUf, gST.grad, limitCoeff, gNO.corrF);
+    if (nbf > 0 && bGrad3Out)
+    {
+        if (!gU.rlxB)
+        {
+            if ((e = cudaMalloc(&gU.rlxB, (size_t)3*nbf*sizeof(double)))
+                != cudaSuccess) return pfail(e, "noCorr/bg malloc");
+        }
+        rgppeqn::noBGather<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gST.grad, gU.rlxB);
+        if ((e = cudaMemcpy(bGrad3Out, gU.rlxB,
+                            (size_t)3*nbf*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "noCorr/bg D2H");
+    }
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "noCorr/launch");
+    return 0;
+}
+
+
+//- pass별 2단계: 호스트 경계 보정 플럭스 합류 → 결정론 surfaceIntegrate
+//  (fvc::div 1:1) → 소스(per-vol)·면 보정 플럭스 D2H (플럭스 재구성용)
+int rgpPEqnNOCorrFinish
+(
+    const double* bCorr, double* srcOut, double* corrFOut
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gNO.armed)
+    {
+        snprintf(gPErr, sizeof(gPErr), "noCorr: not armed");
+        return -1;
+    }
+    cudaError_t e;
+    if (nbf > 0 && bCorr)
+    {
+        if ((e = cudaMemcpy(gNO.bCorr, bCorr, (size_t)nbf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "noFin/H2D");
+    }
+    rgppeqn::noSurfInt<<<nb(nc), BS>>>
+        (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gNO.corrF, gNO.bCorr,
+         gM.V, gST.sp);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "noFin/launch");
+    if ((e = cudaMemcpy(srcOut, gST.sp, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "noFin/D2H src");
+    if (corrFOut)
+    {
+        if ((e = cudaMemcpy(corrFOut, gNO.corrF,
+                            (size_t)nf*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "noFin/D2H corrF");
     }
     return 0;
 }

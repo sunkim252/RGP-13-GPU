@@ -108,6 +108,11 @@ class gpuMulticomponentFluid
         mutable bool gpuNonOrtho_;
         mutable bool gpuNonOrthoWarned_;
 
+        //- 비직교 보정 소스 디바이스화 (자격: corrected/limited-corrected
+        //  snGrad + Gauss linear grad(p) + 직렬; 아니면 호스트 fvc 유지)
+        mutable bool gpuNOSrcDev_;
+        mutable scalar gpuNOLimitCoeff_;
+
 
     // Private Member Functions
 

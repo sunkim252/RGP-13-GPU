@@ -444,7 +444,114 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
     // L.source = −V·div(ΓmagSf·corr) → M 소스 += div(·) (per-vol).
     // fluxRequired라 faceFluxCorrection = ΓmagSf·corr도 보존
     // (플럭스 재구성에서 −).
-    if (gpuNonOrtho_)
+    if (gpuNonOrtho_ && gpuNOSrcDev_)
+    {
+        // 디바이스 패스트패스 (fgmFluid 1:1 — 경계만 호스트)
+        const surfaceScalarField A(rhorAUf*mesh.magSf());
+
+        List<double> pBF(max(nbf, label(1)), 0.0);
+        {
+            label off = 0;
+            forAll(solveP.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pp =
+                    solveP.boundaryField()[patchi];
+                forAll(pp, k) { pBF[off + k] = pp[k]; }
+                off += pp.size();
+            }
+        }
+
+        List<double> bG3(3*max(nbf, label(1)), 0.0);
+        if (rgpPEqnNOCorrPrep
+            (
+                solveP.primitiveField().begin(), pBF.begin(),
+                A.primitiveField().begin(),
+                gpuNOLimitCoeff_, bG3.begin()
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnNOCorrPrep: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        List<double> cfB(max(nbf, label(1)), 0.0);
+        const surfaceVectorField& kf = mesh.nonOrthCorrectionVectors();
+        {
+            label off = 0;
+            forAll(solveP.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pp =
+                    solveP.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+                const vectorField nHat(mesh.boundary()[patchi].nf());
+                const scalarField snG(pp.snGrad());
+                const vectorField& kfb = kf.boundaryField()[patchi];
+                const scalarField& Ab = A.boundaryField()[patchi];
+                for (label k = 0; k < np; k++)
+                {
+                    const vector gI
+                    (
+                        bG3[off + k],
+                        bG3[nbf + off + k],
+                        bG3[2*nbf + off + k]
+                    );
+                    const vector gradB
+                    (
+                        gI + nHat[k]*(snG[k] - (nHat[k] & gI))
+                    );
+                    const scalar corrB = kfb[k] & gradB;
+                    scalar lim = 1.0;
+                    if (gpuNOLimitCoeff_ >= 0)
+                    {
+                        lim = min
+                        (
+                            gpuNOLimitCoeff_*mag(snG[k])
+                           /(
+                                (1.0 - gpuNOLimitCoeff_)*mag(corrB)
+                              + small
+                            ),
+                            scalar(1)
+                        );
+                    }
+                    cfB[off + k] = Ab[k]*(lim*corrB);
+                }
+                off += np;
+            }
+        }
+
+        tPCorrFace = surfaceScalarField::New
+        (
+            "pFaceFluxCorr", mesh,
+            dimensionedScalar
+            (
+                A.dimensions()*solveP.dimensions()/dimLength, 0
+            )
+        );
+        scalarField r(nc);
+        if (rgpPEqnNOCorrFinish
+            (
+                cfB.begin(), r.begin(),
+                tPCorrFace.ref().primitiveFieldRef().begin()
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnNOCorrFinish: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+        {
+            label off = 0;
+            forAll(tPCorrFace.ref().boundaryFieldRef(), patchi)
+            {
+                fvsPatchScalarField& pb =
+                    tPCorrFace.ref().boundaryFieldRef()[patchi];
+                forAll(pb, k) { pb[k] = cfB[off + k]; }
+                off += pb.size();
+            }
+        }
+        srcExtra += r;
+    }
+    else if (gpuNonOrtho_)
     {
         tPCorrFace = surfaceScalarField::New
         (
