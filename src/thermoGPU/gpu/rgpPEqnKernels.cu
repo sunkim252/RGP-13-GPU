@@ -1764,33 +1764,35 @@ namespace
             return -1;
         }
 
-        cudaError_t e;
+        // 조립 입력은 일회성 읽기 — rgpInPtr로 native zero-copy 자격.
         // null 입력 → rgpPCorrPrep 디바이스 상주본(rAUf/psis/phiHbyAv)
-        const double* dRAUf = rAUfInt ? gB.rAUf : gPC.rAUf;
-        const double* dPsis = psis ? gB.psis : gPC.psis;
-        const double* dPhi = phiInt ? gB.phiInt : gPC.phiH;
-        struct { double* d; const double* s; size_t n; } up[] =
-        {
-            {gB.rAUf, rAUfInt, rAUfInt ? (size_t)nf : 0},
-            {gB.psis, psis, psis ? (size_t)nc : 0},
-            {gB.pOld, pOld, (size_t)nc},
-            {gB.phiInt, phiInt, phiInt ? (size_t)nf : 0},
-            {gB.phiB, phiB, (size_t)nbf}, {gB.bDiag, bDiag, (size_t)nbf},
-            {gB.bSrc, bSrc, (size_t)nbf}
-        };
-        for (auto& u : up)
-        {
-            if (u.n == 0 || !u.s) continue;
-            if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
-                                cudaMemcpyHostToDevice)) != cudaSuccess)
-                return pfail(e, "peqn/H2D");
-        }
+        cudaError_t e = cudaSuccess;
+        const double* dRAUf = rAUfInt
+            ? rgpInPtr(rAUfInt, gB.rAUf, (size_t)nf, &e) : gPC.rAUf;
+        if (e != cudaSuccess) return pfail(e, "peqn/H2D rAUf");
+        const double* dPsis = psis
+            ? rgpInPtr(psis, gB.psis, (size_t)nc, &e) : gPC.psis;
+        if (e != cudaSuccess) return pfail(e, "peqn/H2D psis");
+        const double* dPOld = rgpInPtr(pOld, gB.pOld, (size_t)nc, &e);
+        if (e != cudaSuccess) return pfail(e, "peqn/H2D pOld");
+        const double* dPhi = phiInt
+            ? rgpInPtr(phiInt, gB.phiInt, (size_t)nf, &e) : gPC.phiH;
+        if (e != cudaSuccess) return pfail(e, "peqn/H2D phi");
+        const double* dPhiB = nbf > 0
+            ? rgpInPtr(phiB, gB.phiB, (size_t)nbf, &e) : gB.phiB;
+        if (e != cudaSuccess) return pfail(e, "peqn/H2D phiB");
+        const double* dBDiag = nbf > 0
+            ? rgpInPtr(bDiag, gB.bDiag, (size_t)nbf, &e) : gB.bDiag;
+        if (e != cudaSuccess) return pfail(e, "peqn/H2D bDiag");
+        const double* dBSrc = nbf > 0
+            ? rgpInPtr(bSrc, gB.bSrc, (size_t)nbf, &e) : gB.bSrc;
+        if (e != cudaSuccess) return pfail(e, "peqn/H2D bSrc");
 
         cudaError_t er;
         const double* dRdt = stageRdt(rdtH, &er);
         if (er != cudaSuccess) return pfail(er, "peqn/rdt");
         rgppeqn::cellAssemble<<<nb(nc), BS>>>
-            (nc, dtInv, dRdt, dPsis, gM.V, gB.pOld, gB.diag, gB.b);
+            (nc, dtInv, dRdt, dPsis, gM.V, dPOld, gB.diag, gB.b);
         if (srcExtra)   // AMD 등 명시항 (저장 소스: b += extra*V)
         {
             const double* dX = rgpInPtr(srcExtra, gB.pA, (size_t)nc, &er);
@@ -1803,7 +1805,7 @@ namespace
         if (nbf > 0)
         {
             rgppeqn::bFaceAssemble<<<nb(nbf), BS>>>
-                (nbf, gM.bfc, gB.bDiag, gB.bSrc, gB.phiB, gB.diag, gB.b);
+                (nbf, gM.bfc, dBDiag, dBSrc, dPhiB, gB.diag, gB.b);
         }
         if (needRef)
         {
@@ -3074,28 +3076,43 @@ int rgpSTEqnSolve
         return -1;
     }
 
+    // 조립 입력은 일회성 읽기 — rgpInPtr로 native zero-copy 자격
+    // (코히런트 HW에서 H2D 소거). x0(gB.x)만은 반복 벡터라 항상
+    // 디바이스 상주 복사 (C2C 반복 접근은 HBM보다 느림 — rgpStage 규약)
     cudaError_t e;
-    struct { double* d; const double* s; size_t n; } up[] =
-    {
-        {gST.rho, rho, (size_t)nc}, {gST.rhoOld, rhoOld, (size_t)nc},
-        {gST.psiOld, psiOld, (size_t)nc}, {gB.x, p0, (size_t)nc},
-        {gST.phi, phiInt, (size_t)nf},
-        {gST.gamma, gammaFace ? nullptr : gammaCell, (size_t)nc},
-        // Fickian류: CPU-추출 면 계수 Γ_f (gB.rAUf 스테이징 재사용 —
-        // pEqn은 자기 솔브 때 재업로드하므로 충돌 없음)
-        {gB.rAUf, gammaFace, (size_t)nf},
-        {gST.sp, spCell, (size_t)nc},
-        {gST.src, hasSrc ? srcCell : nullptr, (size_t)nc},
-        {gST.bPsi, bPsi, (size_t)nbf},
-        {gB.bDiag, bDiag, (size_t)nbf}, {gB.bSrc, bSrc, (size_t)nbf}
-    };
-    for (auto& u : up)
-    {
-        if (u.n == 0 || !u.s) continue;
-        if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
-                            cudaMemcpyHostToDevice)) != cudaSuccess)
-            return pfail(e, "steqn/H2D");
-    }
+    const double* dRho = rgpInPtr(rho, gST.rho, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D rho");
+    const double* dRhoOld = rgpInPtr(rhoOld, gST.rhoOld, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D rhoOld");
+    const double* dPsiOld = rgpInPtr(psiOld, gST.psiOld, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D psiOld");
+    const double* dPhi = rgpInPtr(phiInt, gST.phi, (size_t)nf, &e);
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D phi");
+    const double* dGammaC = gammaFace ? gST.gamma
+        : rgpInPtr(gammaCell, gST.gamma, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D gamma");
+    // Fickian류: CPU-추출 면 계수 Γ_f (gB.rAUf 스테이징 재사용 —
+    // pEqn은 자기 솔브 때 재업로드하므로 충돌 없음)
+    const double* dGammaF = gammaFace
+        ? rgpInPtr(gammaFace, gB.rAUf, (size_t)nf, &e) : nullptr;
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D gammaF");
+    const double* dSp = rgpInPtr(spCell, gST.sp, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D sp");
+    const double* dSrc = hasSrc
+        ? rgpInPtr(srcCell, gST.src, (size_t)nc, &e) : gST.src;
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D src");
+    const double* dBPsi = nbf > 0
+        ? rgpInPtr(bPsi, gST.bPsi, (size_t)nbf, &e) : gST.bPsi;
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D bPsi");
+    const double* dBDiag = nbf > 0
+        ? rgpInPtr(bDiag, gB.bDiag, (size_t)nbf, &e) : gB.bDiag;
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D bDiag");
+    const double* dBSrc = nbf > 0
+        ? rgpInPtr(bSrc, gB.bSrc, (size_t)nbf, &e) : gB.bSrc;
+    if (e != cudaSuccess) return pfail(e, "steqn/H2D bSrc");
+    if ((e = cudaMemcpy(gB.x, p0, (size_t)nc*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "steqn/H2D x0");
 
     // (가중치 gST.wLim은 rgpSTWeightsBegin/Field/End가 사전 준비)
 
@@ -3103,12 +3120,11 @@ int rgpSTEqnSolve
     const double* dRdt = stageRdt(rdtCell, &e);
     if (e != cudaSuccess) return pfail(e, "steqn/rdt");
     rgppeqn::stCellAssemble<<<nb(nc), BS>>>
-        (nc, dtInv, dRdt, hasSrc, gST.rho, gST.rhoOld, gST.psiOld,
-         gST.sp, gST.src, gM.V, gB.diag, gB.b);
+        (nc, dtInv, dRdt, hasSrc, dRho, dRhoOld, dPsiOld,
+         dSp, dSrc, gM.V, gB.diag, gB.b);
     rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
-        (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
-         gammaFace ? gB.rAUf : nullptr,
-         gM.gg, gB.diag, gB.upper, gST.lower);
+        (nf, gM.own, gM.nei, dPhi, gST.wLim, gSTM.wLin, dGammaC,
+         dGammaF, gM.gg, gB.diag, gB.upper, gST.lower);
 
     // ── fvMatrix::relax(alpha) 1:1 — CPU 규약대로 경계 폴드 전
     //    (iC 분리 상태의 diag)에서 수행. ψ현재 = gB.x(p0 업로드본).
@@ -3128,16 +3144,15 @@ int rgpSTEqnSolve
                                 (size_t)3*nbf*sizeof(double)))
                 != cudaSuccess) return pfail(e, "steqn/relaxB malloc");
         }
+        const double* dBr = gU.rlxB;
         if (nbf > 0)
         {
-            if ((e = cudaMemcpy(gU.rlxB, bRelaxA,
-                                (size_t)3*nbf*sizeof(double),
-                                cudaMemcpyHostToDevice)) != cudaSuccess)
-                return pfail(e, "steqn/relaxB H2D");
+            dBr = rgpInPtr(bRelaxA, gU.rlxB, (size_t)3*nbf, &e);
+            if (e != cudaSuccess) return pfail(e, "steqn/relaxB H2D");
         }
         rgppeqn::stRelaxCellGather<<<nb(nc), BS>>>
             (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
-             gB.upper, gST.lower, gU.rlxB,
+             gB.upper, gST.lower, dBr,
              relaxAlpha, gB.x, gB.diag, gB.b);
         if ((e = cudaGetLastError()) != cudaSuccess)
             return pfail(e, "steqn/relax launch");
@@ -3146,10 +3161,11 @@ int rgpSTEqnSolve
     if (nbf > 0)
     {
         rgppeqn::stBFaceAssemble<<<nb(nbf), BS>>>
-            (nbf, gM.bfc, gB.bDiag, gB.bSrc, gB.diag, gB.b);
+            (nbf, gM.bfc, dBDiag, dBSrc, gB.diag, gB.b);
     }
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "steqn/assemble launch");
+    (void)dBPsi;
 
     // 병렬: 호스트가 rgpPEqnParCoeffs로 이 방정식의 인터페이스 계수를
     // 직전에 업로드한다 (proc 패치 없는 랭크는 리덕션만 참여)
@@ -3363,26 +3379,22 @@ int rgpPEqnNOCorrPrep
                  "noCorr: NO buffers/ST mesh not armed");
         return -1;
     }
+    // 모든 입력은 일회성 읽기 — rgpInPtr (native 코히런트면 zero-copy,
+    // copy 모드면 기존 별칭 스테이징에 memcpy)
     cudaError_t e;
-    struct { double* d; const double* s; size_t n; } up[] =
-    {
-        {gB.pA, pCell, (size_t)nc},
-        {gST.bPsi, pBFace, (size_t)nbf},
-        {gB.rAUf, gMsf, (size_t)nf}
-    };
-    for (auto& u : up)
-    {
-        if (u.n == 0 || !u.s) continue;
-        if ((e = cudaMemcpy(u.d, u.s, u.n*sizeof(double),
-                            cudaMemcpyHostToDevice)) != cudaSuccess)
-            return pfail(e, "noCorr/H2D");
-    }
+    const double* dP2 = rgpInPtr(pCell, gB.pA, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "noCorr/H2D p");
+    const double* dPBF = nbf > 0
+        ? rgpInPtr(pBFace, gST.bPsi, (size_t)nbf, &e) : gST.bPsi;
+    if (e != cudaSuccess) return pfail(e, "noCorr/H2D pBF");
+    const double* dGMsf = rgpInPtr(gMsf, gB.rAUf, (size_t)nf, &e);
+    if (e != cudaSuccess) return pfail(e, "noCorr/H2D gMsf");
 
     rgppeqn::noFaceInterp<<<nb(nf), BS>>>
-        (nf, gM.own, gM.nei, gSTM.wLin, gB.pA, gB.flux);
+        (nf, gM.own, gM.nei, gSTM.wLin, dP2, gB.flux);
     rgppeqn::stGradGather<<<nb(nc), BS>>>
         (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
-         gB.flux, gST.bPsi, gM.V, gST.grad);
+         gB.flux, dPBF, gM.V, gST.grad);
     // xf(gB.flux) 소비 완료 — 이후 z-성분 스테이지로 재사용
     double *vx, *vy, *vz;
     if (!noStage3(vx, vy, vz, &e))
@@ -3401,7 +3413,7 @@ int rgpPEqnNOCorrPrep
         // C3 스테이징: gU.src3 [3*nc] 별칭 (momentum 후 유휴) —
         // 없으면 자체 지연 할당
         double* c3d = gU.src3;
-        if (!c3d)
+        if (!c3d && gRgpUnified != 2)
         {
             if (!gNO.ownC3)
             {
@@ -3416,54 +3428,46 @@ int rgpPEqnNOCorrPrep
             }
             c3d = gNO.ownC3;
         }
-        if ((e = cudaMemcpy(c3d, gNO.hC3.data(),
-                            (size_t)3*nc*sizeof(double),
-                            cudaMemcpyHostToDevice)) != cudaSuccess)
-            return pfail(e, "noCorr/C3 H2D");
+        const double* dC3 =
+            rgpInPtr(gNO.hC3.data(), c3d, (size_t)3*nc, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/C3 H2D");
         // Cf 성분 스테이징 (동기 memcpy가 위 커널 완료를 대기 — 순서
         // 안전; z는 xf가 쓰던 gB.flux)
-        struct { double* d; const double* s; } cfUp[] =
-        {
-            {vx, Cf3}, {vy, Cf3 + (size_t)nf}, {vz, Cf3 + (size_t)2*nf}
-        };
-        for (auto& u : cfUp)
-        {
-            if ((e = cudaMemcpy(u.d, u.s, (size_t)nf*sizeof(double),
-                                cudaMemcpyHostToDevice)) != cudaSuccess)
-                return pfail(e, "noCorr/Cf H2D");
-        }
+        const double* dCfx = rgpInPtr(Cf3, vx, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
+        const double* dCfy =
+            rgpInPtr(Cf3 + (size_t)nf, vy, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
+        const double* dCfz =
+            rgpInPtr(Cf3 + (size_t)2*nf, vz, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
         // cellMDLimited (min/max 스크래치는 BiCG 작업 버퍼 재사용 —
         // pEqn 솔브 전이라 유휴)
         const double rk = (gNO.mdK < 1.0) ? (1.0/gNO.mdK - 1.0) : 0.0;
         rgppeqn::noMDMinMax<<<nb(nc), BS>>>
             (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gM.own, gM.nei,
-             gB.pA, gST.bPsi, rk, gST.rA0, gST.sA);
+             dP2, dPBF, rk, gST.rA0, gST.sA);
         rgppeqn::noMDLimit<<<nb(nc), BS>>>
             (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
-             vx, vy, vz, c3d, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
+             dCfx, dCfy, dCfz, dC3, gNO.CfB3, gST.rA0, gST.sA,
+             gST.grad);
     }
     // kf 성분 스테이징 (Cf 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장).
     // dcs → gB.upper 별칭 (pEqn 솔브 조립이 직후 재작성),
     // corrF → gST.lower 별칭 (ZC 전용, pCorr 동안 유휴)
-    {
-        struct { double* d; const double* s; } kfUp[] =
-        {
-            {vx, kf3}, {vy, kf3 + (size_t)nf}, {vz, kf3 + (size_t)2*nf}
-        };
-        for (auto& u : kfUp)
-        {
-            if ((e = cudaMemcpy(u.d, u.s, (size_t)nf*sizeof(double),
-                                cudaMemcpyHostToDevice)) != cudaSuccess)
-                return pfail(e, "noCorr/kf H2D");
-        }
-    }
-    if ((e = cudaMemcpy(gB.upper, gNO.hDcs.data(),
-                        (size_t)nf*sizeof(double),
-                        cudaMemcpyHostToDevice)) != cudaSuccess)
-        return pfail(e, "noCorr/dcs H2D");
+    const double* dKfx = rgpInPtr(kf3, vx, (size_t)nf, &e);
+    if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
+    const double* dKfy = rgpInPtr(kf3 + (size_t)nf, vy, (size_t)nf, &e);
+    if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
+    const double* dKfz =
+        rgpInPtr(kf3 + (size_t)2*nf, vz, (size_t)nf, &e);
+    if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
+    const double* dDcs =
+        rgpInPtr(gNO.hDcs.data(), gB.upper, (size_t)nf, &e);
+    if (e != cudaSuccess) return pfail(e, "noCorr/dcs H2D");
     rgppeqn::noFaceCorr<<<nb(nf), BS>>>
-        (nf, nc, gM.own, gM.nei, gSTM.wLin, vx, vy, vz, gB.upper,
-         gB.pA, gB.rAUf, gST.grad, limitCoeff, gST.lower);
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, dKfx, dKfy, dKfz, dDcs,
+         dP2, dGMsf, gST.grad, limitCoeff, gST.lower);
     if (nbf > 0 && bGrad3Out)
     {
         if (!gU.rlxB)
@@ -3497,21 +3501,20 @@ int rgpPEqnNOCorrFinish
         snprintf(gPErr, sizeof(gPErr), "noCorr: not armed");
         return -1;
     }
-    cudaError_t e;
-    if (nbf > 0 && bCorr)
-    {
-        if ((e = cudaMemcpy(gNO.bCorr, bCorr, (size_t)nbf*sizeof(double),
-                            cudaMemcpyHostToDevice)) != cudaSuccess)
-            return pfail(e, "noFin/H2D");
-    }
-    // corrF = gST.lower 별칭 (Prep가 채움)
+    cudaError_t e = cudaSuccess;
+    const double* dBCorr = (nbf > 0 && bCorr)
+        ? rgpInPtr(bCorr, gNO.bCorr, (size_t)nbf, &e) : gNO.bCorr;
+    if (e != cudaSuccess) return pfail(e, "noFin/H2D");
+    // corrF = gST.lower 별칭 (Prep가 채움); src 출력은 native면 호스트
+    // 직접 쓰기 (일회성)
+    double* oSrc = rgpOutPtr(srcOut, gST.sp);
     rgppeqn::noSurfInt<<<nb(nc), BS>>>
-        (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gST.lower, gNO.bCorr,
-         gM.V, gST.sp);
+        (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gST.lower, dBCorr,
+         gM.V, oSrc);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "noFin/launch");
-    if ((e = cudaMemcpy(srcOut, gST.sp, (size_t)nc*sizeof(double),
-                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+    if ((e = rgpOutFinish(srcOut, oSrc, gST.sp, (size_t)nc))
+        != cudaSuccess)
         return pfail(e, "noFin/D2H src");
     if (corrFOut)
     {
@@ -3731,12 +3734,24 @@ int rgpUEqnSolve
                  "host weights required");
         return -1;
     }
+    // 일회성 조립 입력은 rgpInPtr (native zero-copy 자격); 퍼시스턴트
+    // 디바이스 상태(U3/b3/bDiag3/bSrc3/gradP — relax·성분 솔브·AH가
+    // 이후에도 읽음)는 복사 유지
+    const double* dURho = rgpInPtr(rho, gST.rho, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "ueqn/H2D rho");
+    const double* dURhoOld = rgpInPtr(rhoOld, gST.rhoOld, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "ueqn/H2D rhoOld");
+    const double* dUPhi = phiInt
+        ? rgpInPtr(phiInt, gST.phi, (size_t)nf, &e) : gST.phi;
+    if (e != cudaSuccess) return pfail(e, "ueqn/H2D phi");
+    const double* dUW = w
+        ? rgpInPtr(w, gST.wLim, (size_t)nf, &e) : gST.wLim;
+    if (e != cudaSuccess) return pfail(e, "ueqn/H2D w");
+    const double* dUMu = mu
+        ? rgpInPtr(mu, gST.gamma, (size_t)nc, &e) : gST.gamma;
+    if (e != cudaSuccess) return pfail(e, "ueqn/H2D mu");
     struct { double* d; const double* s; size_t n; } up[] =
     {
-        {gST.rho, rho, (size_t)nc}, {gST.rhoOld, rhoOld, (size_t)nc},
-        {gST.phi, phiInt, phiInt ? (size_t)nf : 0},
-        {gST.wLim, w, w ? (size_t)nf : 0},
-        {gST.gamma, mu, mu ? (size_t)nc : 0},
         {gU.U3, U3, U3 ? (size_t)3*nc : 0},
         {gU.bDiag3, bDiag3, (size_t)3*nbf},
         {gU.bSrc3, bSrc3, (size_t)3*nbf}
@@ -3748,11 +3763,11 @@ int rgpUEqnSolve
                             cudaMemcpyHostToDevice)) != cudaSuccess)
             return pfail(e, "ueqn/H2D");
     }
-    // U3old는 gST.grad 스테이징, srcExp3는 gU.b3(셀 커널이 in-place로
-    // b3 완성 — 셀별 독립이라 안전); null이면 gU.src3 → gU.b3 복사.
-    if ((e = cudaMemcpy(gST.grad, U3old, (size_t)3*nc*sizeof(double),
-                        cudaMemcpyHostToDevice)) != cudaSuccess)
-        return pfail(e, "ueqn/H2D U3old");
+    // U3old는 gST.grad 스테이징(일회성 → rgpInPtr), srcExp3는 gU.b3
+    // (셀 커널이 in-place로 b3 완성 — 셀별 독립이라 안전); null이면
+    // gU.src3 → gU.b3 복사.
+    const double* dU3old = rgpInPtr(U3old, gST.grad, (size_t)3*nc, &e);
+    if (e != cudaSuccess) return pfail(e, "ueqn/H2D U3old");
     if (srcExp3)
     {
         if ((e = cudaMemcpy(gU.b3, srcExp3, (size_t)3*nc*sizeof(double),
@@ -3770,13 +3785,13 @@ int rgpUEqnSolve
     const double* dRdt = stageRdt(rdtCell, &e);
     if (e != cudaSuccess) return pfail(e, "ueqn/rdt");
     rgppeqn::uCellAssemble<<<nb(nc), BS>>>
-        (nc, dtInv, dRdt, gST.rho, gST.rhoOld, gM.V, gST.grad, gU.b3,
+        (nc, dtInv, dRdt, dURho, dURhoOld, gM.V, dU3old, gU.b3,
          gU.diag, gU.b3);
     if (srcExtra3)   // LAD-bulk 등 명시항 (저장 소스 — H()에 포함)
     {
-        // gST.grad 재사용: 위 uCellAssemble(gST.grad=U3old 읽음)와 이
-        // H2D가 모두 legacy NULL 스트림이라 스트림 순서가 보장된다 —
-        // 커널을 비-디폴트 스트림으로 옮기면 이 재사용부터 깨진다
+        // gST.grad 재사용: 위 uCellAssemble(dU3old ← gST.grad 스테이징
+        // 가능)와 이 H2D가 모두 legacy NULL 스트림이라 스트림 순서가
+        // 보장된다 — 비-디폴트 스트림으로 옮기면 이 재사용부터 깨진다
         const double* dX =
             rgpInPtr(srcExtra3, gST.grad, (size_t)3*nc, &e);
         if (e != cudaSuccess) return pfail(e, "ueqn/srcExtra");
@@ -3788,7 +3803,7 @@ int rgpUEqnSolve
         }
     }
     rgppeqn::stFaceAssemble<<<nb(nf), BS>>>
-        (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
+        (nf, gM.own, gM.nei, dUPhi, dUW, gSTM.wLin, dUMu,
          nullptr, gM.gg, gU.diag, gU.upper, gU.lower);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "ueqn/assemble launch");
@@ -3820,12 +3835,11 @@ int rgpUEqnSolve
             (nf, gM.own, gM.nei, gU.upper, gU.lower, dSumOff);
         if (nbf > 0)
         {
-            if ((e = cudaMemcpy(gU.rlxB, bRelax3,
-                                (size_t)3*nbf*sizeof(double),
-                                cudaMemcpyHostToDevice)) != cudaSuccess)
-                return pfail(e, "ueqn/relaxB H2D");
+            const double* dBr =
+                rgpInPtr(bRelax3, gU.rlxB, (size_t)3*nbf, &e);
+            if (e != cudaSuccess) return pfail(e, "ueqn/relaxB H2D");
             rgppeqn::uRelaxBFold<<<nb(nbf), BS>>>
-                (nbf, nc, gM.bfc, gU.rlxB, dSumOff, dBAdd, dBRem);
+                (nbf, nc, gM.bfc, dBr, dSumOff, dBAdd, dBRem);
         }
         rgppeqn::uRelaxCell<<<nb(nc), BS>>>
             (nc, relaxAlpha, dSumOff, dBAdd, dBRem, gU.U3,
