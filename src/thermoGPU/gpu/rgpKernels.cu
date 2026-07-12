@@ -847,6 +847,7 @@ static int chainPrepare
     int nCells, const double* p,
     const int* yMap, int nYHost, const double* yHost,
     const int* coeffMap,
+    const double** dPOut,
     const double** dTOut, rgp::YView* yvOut, rgp::TabView* tvOut
 );
 
@@ -1063,6 +1064,7 @@ static int chainPrepare
     int nCells, const double* p,
     const int* yMap, int nYHost, const double* yHost,
     const int* coeffMap,
+    const double** dPOut,
     const double** dTOut, rgp::YView* yvOut, rgp::TabView* tvOut
 )
 {
@@ -1086,9 +1088,11 @@ static int chainPrepare
             != cudaSuccess) return fail(e, "chain/malloc yMap");
     }
 
-    const size_t b1 = (size_t)nCells*sizeof(double);
-    if ((e = cudaMemcpy(gBuf.p, p, b1, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "chain/H2D p");
+    // p 입력: native 코히런트면 호스트 포인터 그대로(zero-copy),
+    // 아니면 gBuf.p로 스테이징 (rgpInPtr 규약)
+    const double* dP = rgpInPtr(p, gBuf.p, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "chain/H2D p");
+    *dPOut = dP;
     if ((e = cudaMemcpy(gBuf.yMap, yMap, n*sizeof(int),
                         cudaMemcpyHostToDevice))
         != cudaSuccess) return fail(e, "chain/H2D yMap");
@@ -1178,12 +1182,13 @@ int rgpGpuEvaluateFromFgm
         return -1;
     }
 
+    const double* dP = nullptr;
     const double* dT = nullptr;
     rgp::YView yv{};
     rgp::TabView tvC{};
     int rc = chainPrepare
     (
-        nCells, p, yMap, nYHost, yHost, coeffMap, &dT, &yv, &tvC
+        nCells, p, yMap, nYHost, yHost, coeffMap, &dP, &dT, &yv, &tvC
     );
     if (rc) return rc;
 
@@ -1193,26 +1198,35 @@ int rgpGpuEvaluateFromFgm
     constexpr int blockSize = 128;
     const int gridSize = (nCells + blockSize - 1)/blockSize;
 
+    // 출력: native면 커널이 호스트 필드에 직접 씀(zero-copy), 아니면
+    // gBuf로 스테이징 후 D2H (rgpOutPtr/rgpOutFinish 규약)
+    double* oRho = rgpOutPtr(rho, gBuf.rho);
+    double* oMu = rgpOutPtr(mu, gBuf.mu);
+    double* oKappa = rgpOutPtr(kappa, gBuf.kappa);
+    double* oCp = rgpOutPtr(Cp, gBuf.Cp);
+    double* oCv = rgpOutPtr(Cv, gBuf.Cv);
+    double* oPsi = rgpOutPtr(psi, gBuf.psi);
+
     rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, dT, yv, tvC,
-        gBuf.rho, gBuf.mu, gBuf.kappa, gBuf.Cp, gBuf.Cv, gBuf.psi
+        kp, nCells, dP, dT, yv, tvC,
+        oRho, oMu, oKappa, oCp, oCv, oPsi
     );
     cudaError_t e;
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "evaluateFromFgm/launch");
 
-    const size_t b1 = (size_t)nCells*sizeof(double);
-    struct { double* h; double* d; const char* w; } outs[] =
+    const size_t n1 = (size_t)nCells;
+    struct { double* h; double* o; double* d; } outs[] =
     {
-        {rho, gBuf.rho, "rho"}, {mu, gBuf.mu, "mu"},
-        {kappa, gBuf.kappa, "kappa"}, {Cp, gBuf.Cp, "Cp"},
-        {Cv, gBuf.Cv, "Cv"}, {psi, gBuf.psi, "psi"}
+        {rho, oRho, gBuf.rho}, {mu, oMu, gBuf.mu},
+        {kappa, oKappa, gBuf.kappa}, {Cp, oCp, gBuf.Cp},
+        {Cv, oCv, gBuf.Cv}, {psi, oPsi, gBuf.psi}
     };
     for (auto& o : outs)
     {
-        if ((e = cudaMemcpy(o.h, o.d, b1, cudaMemcpyDeviceToHost))
-            != cudaSuccess) return fail(e, "evaluateFromFgm/D2H");
+        if ((e = rgpOutFinish(o.h, o.o, o.d, n1)) != cudaSuccess)
+            return fail(e, "evaluateFromFgm/D2H");
     }
 
     return 0;
@@ -1238,12 +1252,13 @@ int rgpGpuEvaluateHaFromFgm
         return -1;
     }
 
+    const double* dP = nullptr;
     const double* dT = nullptr;
     rgp::YView yv{};
     rgp::TabView tvC{};
     int rc = chainPrepare
     (
-        nCells, p, yMap, nYHost, yHost, coeffMap, &dT, &yv, &tvC
+        nCells, p, yMap, nYHost, yHost, coeffMap, &dP, &dT, &yv, &tvC
     );
     if (rc) return rc;
 
@@ -1253,18 +1268,19 @@ int rgpGpuEvaluateHaFromFgm
     constexpr int blockSize = 128;
     const int gridSize = (nCells + blockSize - 1)/blockSize;
 
-    // 출력은 rho 디바이스 버퍼 재사용 (Cp는 직후 refresh 체인이 쓸 수
-    // 있으므로 피한다 — ha 전용 호출 뒤 항상 D2H로 회수됨)
+    // 출력: native면 호스트 ha에 직접(zero-copy), 아니면 rho 디바이스
+    // 버퍼 스테이징 후 D2H (Cp는 직후 refresh 체인이 쓰므로 피함)
+    double* oHa = rgpOutPtr(ha, gBuf.rho);
     rgp::rgpHaKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, dT, yv, tvC, gBuf.rho
+        kp, nCells, dP, dT, yv, tvC, oHa
     );
     cudaError_t e;
     if ((e = cudaGetLastError()) != cudaSuccess)
         return fail(e, "evaluateHaFromFgm/launch");
 
-    if ((e = cudaMemcpy(ha, gBuf.rho, (size_t)nCells*sizeof(double),
-                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+    if ((e = rgpOutFinish(ha, oHa, gBuf.rho, (size_t)nCells))
+        != cudaSuccess)
         return fail(e, "evaluateHaFromFgm/D2H");
 
     return 0;
