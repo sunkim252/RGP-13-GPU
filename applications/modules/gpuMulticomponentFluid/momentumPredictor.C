@@ -13,7 +13,10 @@
 #include "fvmDdt.H"
 #include "fvmDiv.H"
 #include "fvmLaplacian.H"
+#include "fvcDiv.H"
 #include "fvcGrad.H"
+#include "snGradScheme.H"
+#include "surfaceInterpolate.H"
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
 #include "processorFvPatch.H"
@@ -119,6 +122,28 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
     U.boundaryFieldRef().updateCoeffs();
 
     const volScalarField muEff(rho*momentumTransport->nuEff());
+
+    // 비직교 명시 보정: −fvm::laplacian(muEff,U)의 corrected 소스
+    // = +div(ΓmagSf·correction(U)) (gaussLaplacianScheme 1:1) —
+    // 저장 소스(H() 포함)라 MRF와 같은 srcX3 슬롯에 합산
+    tmp<fv::snGradScheme<vector>> tsnU
+    (
+        fv::snGradScheme<vector>::New
+        (
+            mesh, mesh.schemes().snGrad(U.name())
+        )
+    );
+    const surfaceScalarField dcsU(tsnU().deltaCoeffs(U));
+
+    tmp<volVectorField> tCorrU;
+    if (gpuNonOrtho_)
+    {
+        const surfaceScalarField muMagSf
+        (
+            fvc::interpolate(muEff)*mesh.magSf()
+        );
+        tCorrU = fvc::div(muMagSf*tsnU().correction(U));
+    }
 
     {
         const vectorField& Uc = U.primitiveField();
@@ -411,7 +436,7 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
 
                 const scalarField pdc
                 (
-                    mesh.deltaCoeffs().boundaryField()[patchi]
+                    dcsU.boundaryField()[patchi]
                 );
                 const vectorField gic(pp.gradientInternalCoeffs(pdc));
                 const vectorField gbc(pp.gradientBoundaryCoeffs(pdc));
@@ -548,15 +573,32 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
     const bool LTS = fv::localEulerDdt::enabled(mesh);
 
     // MRF: +MRF.DDt(rho,U) — 명시 저장 소스 (H()에 포함, CPU fvMatrix
-    // 소스와 동일 위상) → srcExtra3 = -DDt (LHS→RHS 이항)
-    if (MRF.size())
+    // 소스와 동일 위상) → srcExtra3 = -DDt (LHS→RHS 이항).
+    // 비직교 보정 소스(tCorrU)도 같은 저장 소스 슬롯에 합산.
+    const bool useSrcX = MRF.size() || tCorrU.valid();
+    if (useSrcX)
     {
-        const volVectorField::Internal DDtU(MRF.DDt(rho, U));
-        for (label i = 0; i < nc; i++)
+        for (label i = 0; i < 3*nc; i++) { srcX3[i] = 0.0; }
+        if (MRF.size())
         {
-            for (label k = 0; k < 3; k++)
+            const volVectorField::Internal DDtU(MRF.DDt(rho, U));
+            for (label i = 0; i < nc; i++)
             {
-                srcX3[k*nc + i] = -DDtU[i][k];
+                for (label k = 0; k < 3; k++)
+                {
+                    srcX3[k*nc + i] = -DDtU[i][k];
+                }
+            }
+        }
+        if (tCorrU.valid())
+        {
+            const vectorField& cu = tCorrU().primitiveField();
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    srcX3[k*nc + i] += cu[i][k];
+                }
             }
         }
     }
@@ -589,7 +631,7 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
             rho.oldTime().primitiveField().begin(),
             U3old, nullptr, nullptr, nullptr, nullptr,
             nullptr,
-            MRF.size() ? srcX3 : nullptr,
+            useSrcX ? srcX3 : nullptr,
             buoyancy.valid() ? nF3 : nullptr,
             bDiag3, bSrc3, solveCmpt,
             relaxAlpha,

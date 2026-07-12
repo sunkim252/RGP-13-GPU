@@ -102,6 +102,12 @@ class gpuMulticomponentFluid
         //  solveScalarGpu의 coupled 계수에 사용)
         mutable List<double> gpuProcW_;
 
+        //- 비직교 스킴 (corrected/limited snGrad) — 아밍 시 감지.
+        //  GPU 라플라시안: 면 계수 = 스킴 deltaCoeffs(nonOrthDeltaCoeffs)
+        //  + 호스트 명시 보정 소스 + pEqn 보정자 루프 (fgmFluid 1:1)
+        mutable bool gpuNonOrtho_;
+        mutable bool gpuNonOrthoWarned_;
+
 
     // Private Member Functions
 

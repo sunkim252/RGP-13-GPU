@@ -5,6 +5,7 @@
 #include "gpuMulticomponentFluid.H"
 #include "addToRunTimeSelectionTable.H"
 #include "fvConstraint.H"
+#include "snGradScheme.H"
 #include "processorFvPatchFields.H"
 #include "processorFvPatch.H"
 #include "PstreamReduceOps.H"
@@ -36,7 +37,9 @@ Foam::solvers::gpuMulticomponentFluid::gpuMulticomponentFluid(fvMesh& mesh)
     gpuMeshArmed_(false),
     gpuMeshCells_(-1),
     gpuMeshFaces_(-1),
-    gpuMeshStampTime_(-1)
+    gpuMeshStampTime_(-1),
+    gpuNonOrtho_(false),
+    gpuNonOrthoWarned_(false)
 {
     {
         const IOdictionary dict
@@ -163,6 +166,29 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
         nbf += thermo.T().boundaryField()[patchi].size();
     }
 
+    // 비직교 스킴 감지 (fgmFluid::armGpuPEqnMesh 1:1): corrected/limited
+    // snGrad면 ⓐ 면 계수는 스킴 deltaCoeffs(=nonOrthDeltaCoeffs)
+    // ⓑ 명시 보정 소스는 각 방정식 조립부가 scheme.correction()으로
+    // 호스트 계산해 주입 (gaussLaplacianScheme 1:1). gg는 pEqn·수송·
+    // UEqn 라플라시안 공용 — 필드별 스킴이 다르면 기본(p) 스킴 기준.
+    tmp<fv::snGradScheme<scalar>> tsnP
+    (
+        fv::snGradScheme<scalar>::New
+        (
+            mesh, mesh.schemes().snGrad(p_.name())
+        )
+    );
+    gpuNonOrtho_ = tsnP().corrected();
+    if (gpuNonOrtho_ && !gpuNonOrthoWarned_)
+    {
+        Info<< "gpuMulticomponentFluid: corrected snGrad scheme detected"
+            << " -- GPU laplacians use scheme deltaCoeffs + explicit "
+            << "non-orthogonal correction sources (host-computed, "
+            << "1:1 with gaussLaplacianScheme)" << nl << endl;
+        gpuNonOrthoWarned_ = true;
+    }
+    const surfaceScalarField dcsP(tsnP().deltaCoeffs(p_));
+
     List<int> own(nif), nei(nif);
     forAll(mesh.owner(), f)
     {
@@ -171,7 +197,7 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
     }
     List<double> gg(nif);
     const scalarField& magSf = mesh.magSf().primitiveField();
-    const scalarField& dc = mesh.deltaCoeffs().primitiveField();
+    const scalarField& dc = dcsP.primitiveField();
     forAll(gg, f) { gg[f] = magSf[f]*dc[f]; }
 
     List<int> bfc(nbf);

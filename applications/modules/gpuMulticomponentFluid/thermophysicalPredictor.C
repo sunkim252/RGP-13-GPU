@@ -9,6 +9,8 @@
 #include "fvmDdt.H"
 #include "fvmDiv.H"
 #include "fvmLaplacian.H"
+#include "snGradScheme.H"
+#include "surfaceInterpolate.H"
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
 #include "processorFvPatch.H"
@@ -50,6 +52,35 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
     // 동일하게 갱신 (누락 시 스테일 계수로 outlet 인접 셀이 K-스케일
     // 이탈 — gmc 벤치 실측)
     psiF.boundaryFieldRef().updateCoeffs();
+
+    // 비직교: 면 계수는 gg(=magSf·scheme.deltaCoeffs, 아밍 시 업로드)로
+    // 이미 반영 — 여기서는 coupled 경계 pdc와 명시 보정 소스
+    // (gaussLaplacianScheme 1:1: −fvm::laplacian이 방정식에 −로
+    // 들어가므로 src += div(ΓmagSf·correction(ψ))). diffOp(Fickian
+    // 추출) 경로는 모델 행렬이 보정 소스를 이미 포함 — 스킵.
+    tmp<fv::snGradScheme<scalar>> tsnST
+    (
+        fv::snGradScheme<scalar>::New
+        (
+            mesh, mesh.schemes().snGrad(psiF.name())
+        )
+    );
+    const surfaceScalarField dcsST(tsnST().deltaCoeffs(psiF));
+
+    tmp<volScalarField> tCorrDiv;
+    if (gpuNonOrtho_ && !diffOp)
+    {
+        const surfaceScalarField gammaMagSf
+        (
+            fvc::interpolate(gamma)*mesh.magSf()
+        );
+        tCorrDiv = fvc::div(gammaMagSf*tsnST().correction(psiF));
+    }
+    scalarField srcEff(src);
+    if (tCorrDiv.valid())
+    {
+        srcEff += tCorrDiv().primitiveField();
+    }
 
     label nbf = 0;
     forAll(psiF.boundaryField(), patchi)
@@ -102,7 +133,7 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
             {
                 const scalarField pdc
                 (
-                    mesh.deltaCoeffs().boundaryField()[patchi]
+                    dcsST.boundaryField()[patchi]
                 );
                 const scalarField gic(pp.gradientInternalCoeffs(pdc));
                 const scalarField gbc(pp.gradientBoundaryCoeffs(pdc));
@@ -229,7 +260,7 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
             diffOp ? nullptr : gamma.primitiveField().begin(),
             diffOp ? Gface.begin() : nullptr,
             sp.begin(),
-            src.begin(),
+            srcEff.begin(),
             bPsiA, bDiagA, bSrcA,
             tol, rtol, maxIter,
             psiF.primitiveFieldRef().begin(),

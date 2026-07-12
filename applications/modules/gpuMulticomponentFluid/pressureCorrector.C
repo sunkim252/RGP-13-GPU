@@ -17,9 +17,11 @@
 #include "constrainHbyA.H"
 #include "constrainPressure.H"
 #include "fvcDdt.H"
+#include "fvcDiv.H"
 #include "fvcFlux.H"
 #include "fvcGrad.H"
 #include "fvcSnGrad.H"
+#include "snGradScheme.H"
 #include "fvcReconstruct.H"
 #include "fvmDdt.H"
 #include "fvmDiv.H"
@@ -215,6 +217,18 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
     double* bDiagA = gpuPBuf_.begin();
     double* bSrcA = bDiagA + nbf;
     double* phiBA = bSrcA + nbf;
+
+    // 비직교: coupled 경계 pdc·명시 보정 소스·faceFluxCorrection은
+    // solveP의 snGrad 스킴으로 (fgmFluid 패턴 1:1; 직교 스킴이면
+    // deltaCoeffs와 동일 — 비트-불변)
+    tmp<fv::snGradScheme<scalar>> tsnPE
+    (
+        fv::snGradScheme<scalar>::New
+        (
+            mesh, mesh.schemes().snGrad(solveP.name())
+        )
+    );
+    const surfaceScalarField dcsPEqn(tsnPE().deltaCoeffs(solveP));
     {
         label off = 0;
         label offPar = 0;
@@ -238,7 +252,7 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
                 // fvc 보간이 이미 면값. iC → diag, bC → 인터페이스.
                 const scalarField pdc
                 (
-                    mesh.deltaCoeffs().boundaryField()[patchi]
+                    dcsPEqn.boundaryField()[patchi]
                 );
                 const scalarField gic(pp.gradientInternalCoeffs(pdc));
                 const scalarField gbc(pp.gradientBoundaryCoeffs(pdc));
@@ -275,18 +289,39 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
         }
     }
 
-    // 명시 잔여: fvc::ddt(rho) - psi*fvc::ddt(solveP) → b -= (·)*V
     const volScalarField ddtRho(fvc::ddt(rho));
+
+    // 명시 잔여: fvc::ddt(rho) - psi*fvc::ddt(solveP) → b -= (·)*V.
+    // stock pDDtEqn 1:1 — 보정자 루프 밖에서 1회 동결:
+    // correction(fvm::ddt(p))의 명시부 fvc::ddt(p)는 사전-솔브 p
+    // 기준이며 패스마다 재계산하지 않는다 (재계산 시 방정식이 패스마다
+    // 이동해 수렴 파괴 — 왜곡 메시 gmc 벤치 실측: 패스2 초기잔차
+    // 0.26 vs CPU 0.01, 2스텝 T 9.6K 이탈)
     const volScalarField ddtP(fvc::ddt(solveP));
-    scalarField srcExtra(nc);
+    scalarField srcExtra0(nc);
     {
         const scalarField& psic = psi.primitiveField();
         const scalarField& dr = ddtRho.primitiveField();
         const scalarField& dp = ddtP.primitiveField();
-        forAll(srcExtra, i)
+        forAll(srcExtra0, i)
         {
-            srcExtra[i] = -(dr[i] - psic[i]*dp[i]);
+            srcExtra0[i] = -(dr[i] - psic[i]*dp[i]);
         }
+    }
+
+    // 검증 모드용 동결 pDDt 행렬 (stock pDDtEqn 상응)
+    autoPtr<fvScalarMatrix> pDDtChk;
+    if (gpuCheck_)
+    {
+        pDDtChk.set
+        (
+            new fvScalarMatrix
+            (
+                fvc::ddt(rho)
+              + psi*correction(fvm::ddt(solveP))
+              + fvc::div(phiHbyA)
+            )
+        );
     }
 
     const bool needRef =
@@ -311,6 +346,114 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
 
     double res0 = 0, resF = 0;
     int nIter = 0;
+
+    // ── 검증 모드: CPU pEqn fvMatrix 계수와 대조 (fgmFluid 1:1;
+    //    serial-only는 생성자 가드). 보정자 루프 밖(사전)과 루프 내
+    //    각 패스에서 호출 — 패스별 재조립 검증 ──
+    auto pEqnCheck = [&]()
+    {
+        // stock 1:1: 동결 pDDt + 패스별 laplacian 재조립
+        fvScalarMatrix pEqnChk
+        (
+            pDDtChk() - fvm::laplacian(rhorAUf, solveP)
+        );
+        if (needRef)
+        {
+            pEqnChk.setReference
+            (
+                pressureReference.refCell(),
+                pressureReference.refValue()
+            );
+        }
+
+        scalarField diagC(pEqnChk.diag());
+        scalarField srcC(pEqnChk.source());
+        forAll(solveP.boundaryField(), patchi)
+        {
+            const labelUList& fc = mesh.boundary()[patchi].faceCells();
+            const scalarField& iC = pEqnChk.internalCoeffs()[patchi];
+            const scalarField& bC = pEqnChk.boundaryCoeffs()[patchi];
+            forAll(fc, k)
+            {
+                diagC[fc[k]] += iC[k];
+                srcC[fc[k]] += bC[k];
+            }
+        }
+
+        scalarField srcChk(srcExtra0);
+        if (gpuNonOrtho_)
+        {
+            srcChk += fvc::div
+            (
+                rhorAUf*mesh.magSf()*tsnPE().correction(solveP)
+            )().primitiveField();
+        }
+
+        List<double> dG(nc), uG(mesh.owner().size()), bG(nc);
+        if (rgpPEqnAssembleDump
+            (
+                LTS ? 1.0 : 1.0/runTime.deltaTValue(),
+                LTS
+              ? fv::localEulerDdt::localRDeltaT(mesh)
+                   .primitiveField().begin()
+              : nullptr,
+                srcChk.begin(),
+                rhorAUf.primitiveField().begin(),
+                psi.primitiveField().begin(),
+                solveP.oldTime().primitiveField().begin(),
+                phiHbyA.primitiveField().begin(),
+                phiBA, bDiagA, bSrcA,
+                needRef, refCell, refValue,
+                dG.begin(), uG.begin(), bG.begin()
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpPEqnAssembleDump: " << rgpPEqnLastError()
+                << exit(FatalError);
+        }
+
+        scalar dMax = 0, uMax = 0, bMax = 0;
+        forAll(diagC, i)
+        {
+            dMax = max(dMax, mag(dG[i] - diagC[i])
+                /max(mag(diagC[i]), small));
+            bMax = max(bMax, mag(bG[i] - srcC[i])
+                /max(mag(srcC[i]), small));
+        }
+        const scalarField& uC = pEqnChk.upper();
+        forAll(uC, f)
+        {
+            uMax = max(uMax, mag(uG[f] - uC[f])
+                /max(mag(uC[f]), small));
+        }
+        Info<< "gpuPEqnCheck: maxRel diag = " << dMax
+            << ", upper = " << uMax << ", source = " << bMax << endl;
+    };
+
+    // ── 비직교 보정자 루프 (CPU while(correctNonOrthogonal()) 1:1):
+    //    매 패스 최신 solveP로 명시 잔여(ddtP)·보정 소스·
+    //    faceFluxCorrection을 재계산해 재조립·재솔브. 직교(0회)
+    //    케이스는 1회 실행 = 기존과 동일 ──
+    tmp<surfaceScalarField> tPCorrFace;
+    while (pimple.correctNonOrthogonal())
+    {
+    if (gpuCheck_) { pEqnCheck(); }
+    scalarField srcExtra(srcExtra0);
+
+    // 비직교 명시 보정 (gaussLaplacianScheme 1:1): M = pDDt − L 에서
+    // L.source = −V·div(ΓmagSf·corr) → M 소스 += div(·) (per-vol).
+    // fluxRequired라 faceFluxCorrection = ΓmagSf·corr도 보존
+    // (플럭스 재구성에서 −).
+    if (gpuNonOrtho_)
+    {
+        tPCorrFace = surfaceScalarField::New
+        (
+            "pFaceFluxCorr",
+            rhorAUf*mesh.magSf()*tsnPE().correction(solveP)
+        );
+        srcExtra += fvc::div(tPCorrFace())().primitiveField();
+    }
+
     if (rgpPEqnSolve
         (
             LTS ? 1.0 : 1.0/runTime.deltaTValue(),
@@ -342,12 +485,26 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
         << ", No Iterations " << nIter << endl;
 
     solveP.correctBoundaryConditions();
+    }   // while correctNonOrthogonal
 
     // ── 질량 플럭스 재구성: phi = phiHbyA + pEqn.flux() ─────────────
+    //    비직교: pEqn.flux()에 faceFluxCorrection(−ΓmagSf·corr)이
+    //    포함되므로(fvMatrix::flux 1:1) 내부·경계 모두 차감
     {
         scalarField& phic = phi.primitiveFieldRef();
         const scalarField& ph = phiHbyA.primitiveField();
-        forAll(phic, f) { phic[f] = ph[f] + gpuPFlux_[f]; }
+        if (tPCorrFace.valid())
+        {
+            const scalarField& cf = tPCorrFace().primitiveField();
+            forAll(phic, f)
+            {
+                phic[f] = ph[f] + gpuPFlux_[f] - cf[f];
+            }
+        }
+        else
+        {
+            forAll(phic, f) { phic[f] = ph[f] + gpuPFlux_[f]; }
+        }
 
         label off = 0;
         label offPar = 0;
@@ -362,13 +519,21 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
             const scalarField& phb = phiHbyA.boundaryField()[patchi];
             scalarField& phibf = phi.boundaryFieldRef()[patchi];
 
+            const scalarField corrB
+            (
+                tPCorrFace.valid()
+              ? scalarField(tPCorrFace().boundaryField()[patchi])
+              : scalarField(np, 0.0)
+            );
+
             if (pp.coupled())
             {
                 for (label k = 0; k < np; k++)
                 {
                     const scalar fluxB =
                         bDiagA[off + k]*pi[k]
-                      - gpuParB_[offPar + k]*pp[k];
+                      - gpuParB_[offPar + k]*pp[k]
+                      - corrB[k];
                     phibf[k] = phb[k] + fluxB;
                 }
                 offPar += np;
@@ -378,7 +543,8 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
                 for (label k = 0; k < np; k++)
                 {
                     const scalar fluxB =
-                        bDiagA[off + k]*pi[k] - bSrcA[off + k];
+                        bDiagA[off + k]*pi[k] - bSrcA[off + k]
+                      - corrB[k];
                     phibf[k] = phb[k] + fluxB;
                 }
             }
