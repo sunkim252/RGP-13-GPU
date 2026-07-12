@@ -25,6 +25,7 @@ run_one() {  # $1=디렉터리 $2=RGP_GPU_UNIFIED("auto"=미설정) $3=chemonly?
       set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
       [ '$mode' != auto ] && export RGP_GPU_UNIFIED=$mode
       cd '$d'
+      [ -d 0 ] || cp -a 0.orig 0
       foamDictionary -entry endTime -set 2e-5 system/controlDict
       foamDictionary -entry adjustTimeStep -set no system/controlDict
       foamDictionary -entry writeControl -set runTime system/controlDict

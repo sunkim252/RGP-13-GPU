@@ -16,6 +16,7 @@ rm -rf "$RUN" && cp -a "$CASE" "$RUN"
 apptainer exec --nv "$SIF" bash -c "
   set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
   cd '$RUN'
+  [ -d 0 ] || cp -a 0.orig 0
   foamDictionary -entry endTime -set 2e-5 system/controlDict
   foamDictionary -entry writeControl -set adjustableRunTime system/controlDict
   foamDictionary -entry writeInterval -set 2e-5 system/controlDict
