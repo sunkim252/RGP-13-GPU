@@ -12,7 +12,7 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
 #
 # x86 판과의 차이:
 #  - OpenFOAM/ThirdParty를 %files 복사 대신 소스 클론 → aarch64 네이티브 빌드
-#    (WM_ARCH=linuxARM64; 로컬 x86 빌드 트리는 재사용 불가)
+#    (WM_ARCH=linuxArm64; 로컬 x86 빌드 트리는 재사용 불가)
 #  - CUDA_ARCH: sm_90(H100) + compute_90 PTX(Blackwell급 JIT 폴백)
 #  - MPI 경로: Make/options가 $(shell uname -m)으로 아치-중립 (수정 완료)
 #  - AmgX: MPI 빌드 필수(분산 API) — cmake 로그의 "MPI build:TRUE" 검증
@@ -37,7 +37,7 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
     export FOAM_INST_DIR=/opt/OpenFOAM
     export CUDA_HOME=/usr/local/cuda
     export PATH=${CUDA_HOME}/bin:${PATH}
-    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linuxARM64Gcc/amgx-2.4.0
+    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linuxArm64Gcc/amgx-2.4.0
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${AMGX_DIR}/lib:${LD_LIBRARY_PATH}
     export LIB_RGP13_SRC=/opt/OpenFOAM/RGP-13-realFluid/src
     . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc || true
@@ -64,22 +64,33 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
     set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc; set -e
     cd /opt/OpenFOAM/OpenFOAM-13 && ./Allwmake -j $(nproc) 2>&1 | tail -5
 
-    # ─── wmake CUDA 룰 (linuxARM64Gcc): H100 sm_90 + PTX 폴백 ───
-    RULES=/opt/OpenFOAM/OpenFOAM-13/wmake/rules/linuxARM64Gcc/cuda
-    mkdir -p $RULES
-    cat > $RULES/general <<'EOF'
+    # ─── wmake CUDA 룰 (linuxArm64Gcc): H100 sm_90 + PTX 폴백 ───
+    # x86 def와 동일 구조(검증됨): rules/<arch>/cuda 파일 + general에 include.
+    # 주의: OF-13의 ARM 룰 디렉터리 이름은 linuxArm64Gcc.
+    RULES_DIR=/opt/OpenFOAM/OpenFOAM-13/wmake/rules/linuxArm64Gcc
+    [ -d "$RULES_DIR" ] || { echo "ARM64 rules dir missing: $RULES_DIR"; exit 1; }
+
+    cat > $RULES_DIR/cuda <<'CUDA_RULES'
+# ── wmake CUDA compilation rules (aarch64 / GH200) ──
 SUFFIXES += .cu
 
 CUDA_ARCH   = -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90
-
-cutoEXE     = $(CUDA_HOME)/bin/nvcc
-cutoFLAGS   = -std=c++14 -O3 -fmad=false \
+NVCC        = nvcc
+# -fmad=false: FMA 축약 금지 -- CPU(g++ 비-FMA 코드젠)와의 ULP 정합.
+# --use_fast_math 금지(정합 검증 신뢰성). x86 룰과 플래그 동일 유지.
+NVCC_FLAGS  = -std=c++14 -O3 -fmad=false \
+              -Xcompiler -fPIC -Xcompiler -Wall \
               $(CUDA_ARCH) \
-              -Xcompiler -fPIC
+              -DLIB_NAME=$(notdir $(LIB).$(SO)) \
+              -D$(WM_ARCH) -DWM_ARCH_OPTION=$(WM_ARCH_OPTION) \
+              -DWM_$(WM_PRECISION_OPTION) -DWM_LABEL_SIZE=$(WM_LABEL_SIZE)
 
-.cu.o:
-	$(cutoEXE) $(cutoFLAGS) -c $< -o $@
-EOF
+cutoo       = $(WM_SCHEDULER) $(NVCC) $(NVCC_FLAGS) \
+              $(LIB_HEADER_DIRS) -c $< -o $@
+CUDA_RULES
+
+    grep -q 'rules)/cuda' $RULES_DIR/general 2>/dev/null || \
+        echo 'include $(DEFAULT_RULES)/cuda' >> $RULES_DIR/general
 
     # ─── RGP-13 realFluid + GPU 스택 (x86 def와 동일 순서) ───
     set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc; set -e
@@ -95,7 +106,7 @@ EOF
     ( cd src/gpuChemistry && wmake libso ) 2>&1 | tail -3
 
     # ─── AmgX (sm_90 + MPI 필수 — 분산 API) ───
-    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linuxARM64Gcc/amgx-2.4.0
+    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linuxArm64Gcc/amgx-2.4.0
     cd /opt/OpenFOAM/ThirdParty-13
     git clone --recursive --depth 1 -b v2.4.0 \
         https://github.com/NVIDIA/AMGX.git amgx-src
