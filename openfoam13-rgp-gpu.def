@@ -168,14 +168,21 @@ CUDA_RULES
     # ─── AmgX 스택 (libRGP13amgx — fvSolution 'solver amgx' +
     #     fgmProperties 'gpuPEqnSolver amgx') ────────────────────────────
     # 로컬 ThirdParty에 빌드된 amgx-2.4.0이 %files로 함께 복사된다.
-    # 없으면(새 호스트) 소스에서 sm_89+sm_90으로 빌드.
+    # 없으면(새 호스트) 소스에서 sm_75+sm_89+sm_90으로 빌드.
+    # ⚠️ 분산(멀티랭크) AmgX는 MPI 빌드 필수 — 비-MPI 빌드의 분산 API는
+    #    스텁(BAD_PARAMETERS)이라 rgpPEqnAmgxSolveDist가 즉사한다.
+    #    cmake가 "This is a MPI build:TRUE"를 찍는지 반드시 확인.
     export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linux64Gcc/amgx-2.4.0
     if [ ! -f $AMGX_DIR/lib/libamgxsh.so ]; then
         cd /opt/OpenFOAM/ThirdParty-13
         git clone --recursive --depth 1 -b v2.4.0 \
             https://github.com/NVIDIA/AMGX.git amgx-src
         mkdir -p amgx-src/build && cd amgx-src/build
-        cmake .. -DCUDA_ARCH="89;90" -DCMAKE_INSTALL_PREFIX=$AMGX_DIR
+        cmake .. -DCUDA_ARCH="75;89;90" -DCMAKE_INSTALL_PREFIX=$AMGX_DIR \
+            -DMPI_C_COMPILER=mpicc -DMPI_CXX_COMPILER=mpicxx \
+            | tee cmake.log
+        grep -q "This is a MPI build:TRUE" cmake.log \
+            || { echo "AmgX: MPI NOT FOUND -- distributed path unusable"; exit 1; }
         make -j$(nproc) && make install
         cd /opt/OpenFOAM/ThirdParty-13 && rm -rf amgx-src
     fi

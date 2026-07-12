@@ -1,0 +1,119 @@
+Bootstrap: docker
+From: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+# ─────────────────────────────────────────────────────────────────────────────
+# openfoam13-rgp-gpu-arm64.def — GH200(Grace-Hopper, aarch64)용 RGP-13-GPU
+#
+# x86 def(openfoam13-rgp-gpu.def)의 aarch64 판. **GH200 노드에서 빌드**해야
+# 한다(apptainer가 호스트 아치의 docker 이미지를 pull — nvidia/cuda 태그는
+# multi-arch라 같은 태그로 arm64 레이어를 받는다).
+#
+#   apptainer build openfoam13-rgp-gpu-arm64.sif openfoam13-rgp-gpu-arm64.def
+#
+# x86 판과의 차이:
+#  - OpenFOAM/ThirdParty를 %files 복사 대신 소스 클론 → aarch64 네이티브 빌드
+#    (WM_ARCH=linuxARM64; 로컬 x86 빌드 트리는 재사용 불가)
+#  - CUDA_ARCH: sm_90(H100) + compute_90 PTX(Blackwell급 JIT 폴백)
+#  - MPI 경로: Make/options가 $(shell uname -m)으로 아치-중립 (수정 완료)
+#  - AmgX: MPI 빌드 필수(분산 API) — cmake 로그의 "MPI build:TRUE" 검증
+#
+# GH200 브링업 체크리스트 (첫 실행에서 확인):
+#  1. thermoGPU ARMED 배너: "coherent HW: yes" + "unified-native" —
+#     rgpGpuInit이 PageableMemoryAccessUsesHostPageTables로 자동 감지
+#  2. RGP_GPU_UNIFIED=0으로 강제 copy 실행과 필드 비트 대조(정합 확인)
+#  3. 멀티 슈퍼칩: 랭크→GPU 매핑(myProcNo % nDev), gpuPEqnSolver
+#     pcg/amgx 둘 다 병렬 지원
+# ─────────────────────────────────────────────────────────────────────────────
+
+%labels
+    Author sunkim
+    Project RGP-13-GPU
+    Description OpenFOAM-13 + RGP-13 realFluid + CUDA (GH200 aarch64, coherent-ready)
+
+%files
+    RGP-13-realFluid /opt/OpenFOAM/RGP-13-realFluid
+
+%environment
+    export FOAM_INST_DIR=/opt/OpenFOAM
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=${CUDA_HOME}/bin:${PATH}
+    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linuxARM64Gcc/amgx-2.4.0
+    export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${AMGX_DIR}/lib:${LD_LIBRARY_PATH}
+    export LIB_RGP13_SRC=/opt/OpenFOAM/RGP-13-realFluid/src
+    . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc || true
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake git wget flex bison \
+        zlib1g-dev libboost-system-dev libboost-thread-dev \
+        libopenmpi-dev openmpi-bin gnuplot libreadline-dev \
+        libncurses-dev libxt-dev rsync python3
+    rm -rf /var/lib/apt/lists/*
+
+    # ─── OpenFOAM-13 + ThirdParty-13 (aarch64 네이티브 빌드) ───
+    mkdir -p /opt/OpenFOAM && cd /opt/OpenFOAM
+    if [ ! -d OpenFOAM-13 ]; then
+        git clone --depth 1 https://github.com/OpenFOAM/OpenFOAM-13.git
+        git clone --depth 1 https://github.com/OpenFOAM/ThirdParty-13.git
+    fi
+    # ⚠️ 로컬 AMR core-mod(adce153)를 쓰려면 위 클론 대신 수정 트리를
+    #    rsync로 가져올 것 (GH200에서 x86 %files 복사는 불가 — 소스는
+    #    아치 무관이므로 rsync/git이 정답)
+    set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc; set -e
+    cd /opt/OpenFOAM/OpenFOAM-13 && ./Allwmake -j $(nproc) 2>&1 | tail -5
+
+    # ─── wmake CUDA 룰 (linuxARM64Gcc): H100 sm_90 + PTX 폴백 ───
+    RULES=/opt/OpenFOAM/OpenFOAM-13/wmake/rules/linuxARM64Gcc/cuda
+    mkdir -p $RULES
+    cat > $RULES/general <<'EOF'
+SUFFIXES += .cu
+
+CUDA_ARCH   = -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90
+
+cutoEXE     = $(CUDA_HOME)/bin/nvcc
+cutoFLAGS   = -std=c++14 -O3 -fmad=false \
+              $(CUDA_ARCH) \
+              -Xcompiler -fPIC
+
+.cu.o:
+	$(cutoEXE) $(cutoFLAGS) -c $< -o $@
+EOF
+
+    # ─── RGP-13 realFluid + GPU 스택 (x86 def와 동일 순서) ───
+    set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc; set -e
+    export FOAM_USER_LIBBIN=$FOAM_LIBBIN
+    export LIB_RGP13_SRC=/opt/OpenFOAM/RGP-13-realFluid/src
+    export CUDA_HOME=/usr/local/cuda
+    cd /opt/OpenFOAM/RGP-13-realFluid
+    ( cd src/thermoGPU && wmake libso ) 2>&1 | tail -3
+    ( cd src && ./Allwmake ) 2>&1 | tail -3
+    ( cd applications/modules/fgmFluid && wmake libso ) 2>&1 | tail -3
+    ( cd applications/modules/gpuMulticomponentFluid && wmake libso ) \
+        2>&1 | tail -3
+    ( cd src/gpuChemistry && wmake libso ) 2>&1 | tail -3
+
+    # ─── AmgX (sm_90 + MPI 필수 — 분산 API) ───
+    export AMGX_DIR=/opt/OpenFOAM/ThirdParty-13/platforms/linuxARM64Gcc/amgx-2.4.0
+    cd /opt/OpenFOAM/ThirdParty-13
+    git clone --recursive --depth 1 -b v2.4.0 \
+        https://github.com/NVIDIA/AMGX.git amgx-src
+    mkdir -p amgx-src/build && cd amgx-src/build
+    cmake .. -DCUDA_ARCH="90" -DCMAKE_INSTALL_PREFIX=$AMGX_DIR \
+        -DMPI_C_COMPILER=mpicc -DMPI_CXX_COMPILER=mpicxx | tee cmake.log
+    grep -q "This is a MPI build:TRUE" cmake.log \
+        || { echo "AmgX: MPI NOT FOUND"; exit 1; }
+    make -j$(nproc) amgxsh && make install
+    cd /opt/OpenFOAM/ThirdParty-13 && rm -rf amgx-src
+    ( cd /opt/OpenFOAM/RGP-13-realFluid/src/amgxFoam && wmake libso ) \
+        2>&1 | tail -3
+
+    # 산출물 검증
+    ls -lh $FOAM_LIBBIN/libRGP13realFluid.so $FOAM_LIBBIN/libfgmFluid.so \
+        $FOAM_LIBBIN/libgpuMulticomponentFluid.so \
+        $FOAM_LIBBIN/librgpThermoGPU.so $FOAM_LIBBIN/libRGP13gpuChemistry.so \
+        $FOAM_LIBBIN/libRGP13amgx.so
+
+%runscript
+    exec /bin/bash "$@"

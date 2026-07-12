@@ -1,7 +1,7 @@
 EXE_INC = \
     -I$(AMGX_DIR)/include \
-    -I/usr/lib/x86_64-linux-gnu/openmpi/include
+    -I/usr/lib/$(shell uname -m)-linux-gnu/openmpi/include
 
 LIB_LIBS = \
     $(AMGX_DIR)/lib/libamgxsh.so \
-    -L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi
+    -L/usr/lib/$(shell uname -m)-linux-gnu/openmpi/lib -lmpi
