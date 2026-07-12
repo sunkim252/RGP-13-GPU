@@ -99,15 +99,22 @@ namespace
 
     //- 비직교 보정 소스 (limited/corrected snGrad의 correction(p)를
     //  디바이스에서 — grad는 결정론 CSR 게더, 면/셀 산술은 CPU FP 순서
-    //  1:1). VRAM 절약: kf3/Cf3 [3*nf]는 상주 대신 패스별 스테이징
-    //  (UEqn grad9가 pCorr 동안 유휴라 별칭; 없거나 작으면 자체 할당).
+    //  1:1). VRAM 절약(6GB 카드 실측 OOM 2회의 교훈): 큰 배열은 전부
+    //  패스별 스테이징 — pCorr 시점에 유휴인 기존 버퍼를 별칭:
+    //    dcs → gB.upper (솔브 조립이 직후 재작성)
+    //    corrF → gST.lower (ZC 솔브 전용, pCorr 동안 유휴)
+    //    C3 → gU.src3 (UEqn 명시항, momentum 후 유휴; 없으면 자체)
+    //    kf3/Cf3 → gU.grad9 (없거나 작으면 자체)
+    //  디바이스 상주 순증은 CfB3/bCorr(경계 크기)뿐. dcs/C3 호스트
+    //  사본은 여기 보관해 Prep가 패스마다 업로드.
     //  mdK >= 0 이면 grad에 cellMDLimited 리미터(결정론 CSR 재생).
     struct NOBuf
     {
-        double *dcs = nullptr;                     // [nf] 상주
-        double *corrF = nullptr, *bCorr = nullptr; // [nf], [nbf]
-        double *C3 = nullptr, *CfB3 = nullptr;     // [3*nc], [3*nbf]
+        double *bCorr = nullptr;                   // [nbf]
+        double *CfB3 = nullptr;                    // [3*nbf]
         double *ownStage = nullptr;                // 자체 [3*nf] (필요시)
+        double *ownC3 = nullptr;                   // 자체 [3*nc] (필요시)
+        std::vector<double> hDcs, hC3;
         double mdK = -1;
         int armed = 0;
     } gNO;
@@ -198,10 +205,11 @@ namespace
             &gU.rAU, &gU.HbyA3, &gU.parB,
             &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld,
-            &gNO.dcs, &gNO.corrF, &gNO.bCorr,
-            &gNO.C3, &gNO.CfB3, &gNO.ownStage
+            &gNO.bCorr, &gNO.CfB3, &gNO.ownStage, &gNO.ownC3
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
+        gNO.hDcs.clear();
+        gNO.hC3.clear();
         gNO.armed = 0;
         gNO.mdK = -1;
 
@@ -3247,12 +3255,15 @@ int rgpPEqnNOArm
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
     cudaError_t e = cudaSuccess;
     const int useMD = (mdK >= 0 && C3);
+
+    // 호스트 사본 (패스별 스테이징 업로드용)
+    gNO.hDcs.assign(dcsNO, dcsNO + nf);
+    if (useMD) { gNO.hC3.assign(C3, C3 + (size_t)3*nc); }
+    else { gNO.hC3.clear(); }
+
     struct { double** d; const double* s; size_t n; } it[] =
     {
-        {&gNO.dcs, dcsNO, (size_t)nf},
-        {&gNO.corrF, nullptr, (size_t)nf},
         {&gNO.bCorr, nullptr, (size_t)(nbf > 0 ? nbf : 1)},
-        {&gNO.C3, useMD ? C3 : nullptr, useMD ? (size_t)3*nc : 0},
         {&gNO.CfB3, useMD ? CfB3 : nullptr,
          useMD ? (size_t)3*(nbf > 0 ? nbf : 1) : 0}
     };
@@ -3265,13 +3276,14 @@ int rgpPEqnNOArm
             {
                 double** ps[] =
                 {
-                    &gNO.dcs, &gNO.corrF, &gNO.bCorr,
-                    &gNO.C3, &gNO.CfB3, &gNO.ownStage
+                    &gNO.bCorr, &gNO.CfB3, &gNO.ownStage, &gNO.ownC3
                 };
                 for (auto p : ps)
                 {
                     if (*p) { cudaFree(*p); *p = nullptr; }
                 }
+                gNO.hDcs.clear();
+                gNO.hC3.clear();
                 gNO.armed = 0;
                 snprintf(gPErr, sizeof(gPErr),
                          "noArm/malloc: %s", cudaGetErrorString(e));
@@ -3362,11 +3374,28 @@ int rgpPEqnNOCorrPrep
          gB.flux, gST.bPsi, gM.V, gST.grad);
     if (gNO.mdK >= 0)
     {
-        if (!Cf3)
+        if (!Cf3 || gNO.hC3.empty())
         {
-            snprintf(gPErr, sizeof(gPErr), "noCorr: Cf3 required (MD)");
+            snprintf(gPErr, sizeof(gPErr), "noCorr: Cf3/C3 required");
             return -1;
         }
+        // C3 스테이징: gU.src3 [3*nc] 별칭 (momentum 후 유휴) —
+        // 없으면 자체 지연 할당
+        double* c3d = gU.src3;
+        if (!c3d)
+        {
+            if (!gNO.ownC3)
+            {
+                if ((e = cudaMalloc(&gNO.ownC3,
+                                    (size_t)3*nc*sizeof(double)))
+                    != cudaSuccess) return pfail(e, "noCorr/C3 malloc");
+            }
+            c3d = gNO.ownC3;
+        }
+        if ((e = cudaMemcpy(c3d, gNO.hC3.data(),
+                            (size_t)3*nc*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "noCorr/C3 H2D");
         // Cf3 스테이징 (동기 memcpy가 위 커널들 완료를 대기 — 순서 안전)
         if ((e = cudaMemcpy(stage, Cf3, (size_t)3*nf*sizeof(double),
                             cudaMemcpyHostToDevice)) != cudaSuccess)
@@ -3379,15 +3408,21 @@ int rgpPEqnNOCorrPrep
              gB.pA, gST.bPsi, rk, gST.rA0, gST.sA);
         rgppeqn::noMDLimit<<<nb(nc), BS>>>
             (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
-             stage, gNO.C3, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
+             stage, c3d, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
     }
-    // kf3 스테이징 (Cf3 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장)
+    // kf3 스테이징 (Cf3 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장).
+    // dcs → gB.upper 별칭 (pEqn 솔브 조립이 직후 재작성),
+    // corrF → gST.lower 별칭 (ZC 전용, pCorr 동안 유휴)
     if ((e = cudaMemcpy(stage, kf3, (size_t)3*nf*sizeof(double),
                         cudaMemcpyHostToDevice)) != cudaSuccess)
         return pfail(e, "noCorr/kf3 H2D");
+    if ((e = cudaMemcpy(gB.upper, gNO.hDcs.data(),
+                        (size_t)nf*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "noCorr/dcs H2D");
     rgppeqn::noFaceCorr<<<nb(nf), BS>>>
-        (nf, nc, gM.own, gM.nei, gSTM.wLin, stage, gNO.dcs,
-         gB.pA, gB.rAUf, gST.grad, limitCoeff, gNO.corrF);
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, stage, gB.upper,
+         gB.pA, gB.rAUf, gST.grad, limitCoeff, gST.lower);
     if (nbf > 0 && bGrad3Out)
     {
         if (!gU.rlxB)
@@ -3428,8 +3463,9 @@ int rgpPEqnNOCorrFinish
                             cudaMemcpyHostToDevice)) != cudaSuccess)
             return pfail(e, "noFin/H2D");
     }
+    // corrF = gST.lower 별칭 (Prep가 채움)
     rgppeqn::noSurfInt<<<nb(nc), BS>>>
-        (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gNO.corrF, gNO.bCorr,
+        (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gST.lower, gNO.bCorr,
          gM.V, gST.sp);
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "noFin/launch");
@@ -3438,7 +3474,7 @@ int rgpPEqnNOCorrFinish
         return pfail(e, "noFin/D2H src");
     if (corrFOut)
     {
-        if ((e = cudaMemcpy(corrFOut, gNO.corrF,
+        if ((e = cudaMemcpy(corrFOut, gST.lower,
                             (size_t)nf*sizeof(double),
                             cudaMemcpyDeviceToHost)) != cudaSuccess)
             return pfail(e, "noFin/D2H corrF");
