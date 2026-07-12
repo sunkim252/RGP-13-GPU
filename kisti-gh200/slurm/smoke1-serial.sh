@@ -10,13 +10,15 @@
 set -eu
 SIF=${SIF:-$PWD/openfoam13-rgp-gpu-arm64.sif}
 CASE=${CASE:-$PWD/RGP-13-realFluid/testCases/h2CounterFlow_gpuChem}
-RUN=$SLURM_SUBMIT_DIR/smoke1-case
+RUN=${SLURM_SUBMIT_DIR:-$PWD}/smoke1-case
 rm -rf "$RUN" && cp -a "$CASE" "$RUN"
 
 apptainer exec --nv "$SIF" bash -c "
   set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
   cd '$RUN'
   foamDictionary -entry endTime -set 2e-5 system/controlDict
+  foamDictionary -entry writeControl -set timeStep system/controlDict
+  foamDictionary -entry writeInterval -set 20 system/controlDict
   blockMesh > log.blockMesh 2>&1 || true
   [ -f system/setFieldsDict ] && setFields > log.setFields 2>&1 || true
   foamRun > log.smoke1 2>&1

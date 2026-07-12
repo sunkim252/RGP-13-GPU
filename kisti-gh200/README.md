@@ -26,9 +26,14 @@ srun --partition=<beta-partition> --gres=gpu:1 --pty bash   # 정책 확인
 ## 1. 소스 반입
 
 ```bash
-git clone https://github.com/sunkim252/RGP-13-GPU.git
-# 또는 (외부망 차단 시) 로컬에서: tar 없이 git bundle 권장
-#   git bundle create rgp13-gpu.bundle main && scp → git clone rgp13-gpu.bundle
+# ⚠️ 저장소 루트가 곧 RGP-13-realFluid 트리다 — def의 %files와 스모크
+#    스크립트가 "부모디렉터리/RGP-13-realFluid" 레이아웃을 가정하므로
+#    반드시 클론 대상 디렉터리명을 RGP-13-realFluid로 줄 것:
+mkdir -p ~/RGP-13-GPU && cd ~/RGP-13-GPU
+git clone https://github.com/sunkim252/RGP-13-GPU.git RGP-13-realFluid
+# 또는 (외부망 차단 시) 로컬에서: git bundle 권장
+#   git bundle create rgp13-gpu.bundle main && scp →
+#   git clone rgp13-gpu.bundle RGP-13-realFluid
 ```
 
 ⚠️ AMR core-mod가 필요한 케이스를 돌릴 거면 OpenFOAM-13은 upstream 클론이
@@ -38,9 +43,9 @@ def의 클론 단계를 대체한다(소스는 아치 무관).
 ## 2. 컨테이너 빌드 (GH200 노드에서 — 2h± 예상)
 
 ```bash
-cd RGP-13-GPU
-apptainer build openfoam13-rgp-gpu-arm64.sif RGP-13-realFluid/../openfoam13-rgp-gpu-arm64.def
-# def는 저장소 루트 기준: openfoam13-rgp-gpu-arm64.def
+cd ~/RGP-13-GPU     # RGP-13-realFluid의 부모 (%files 상대경로 기준)
+apptainer build openfoam13-rgp-gpu-arm64.sif \
+    RGP-13-realFluid/openfoam13-rgp-gpu-arm64.def
 ```
 
 빌드가 검증하는 것: OF-13 aarch64 네이티브(WM_ARCH=linuxArm64) →

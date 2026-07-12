@@ -18,9 +18,11 @@ prep() {  # $1=디렉터리 $2=dlb(on/off)
       set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
       cd '$d'
       foamDictionary -entry endTime -set 2e-5 system/controlDict
+  foamDictionary -entry writeControl -set timeStep system/controlDict
+      foamDictionary -entry writeInterval -set 20 system/controlDict
       blockMesh > log.blockMesh 2>&1 || true
       [ -f system/setFieldsDict ] && setFields > log.setFields 2>&1 || true
-      foamDictionary -entry gpuCoeffs -set \"{ dlb $dlb; }\" \
+      foamDictionary -entry gpuCoeffs/dlb -set $dlb \
           constant/chemistryProperties
       decomposePar -force > log.decomp 2>&1
     "
@@ -35,17 +37,18 @@ runp() {
     "
 }
 
-prep "$SLURM_SUBMIT_DIR/smoke3-dlb1" on  && runp "$SLURM_SUBMIT_DIR/smoke3-dlb1"
-prep "$SLURM_SUBMIT_DIR/smoke3-dlb0" off && runp "$SLURM_SUBMIT_DIR/smoke3-dlb0"
+prep "${SLURM_SUBMIT_DIR:-$PWD}/smoke3-dlb1" on  && runp "${SLURM_SUBMIT_DIR:-$PWD}/smoke3-dlb1"
+prep "${SLURM_SUBMIT_DIR:-$PWD}/smoke3-dlb0" off && runp "${SLURM_SUBMIT_DIR:-$PWD}/smoke3-dlb0"
 
 echo '=== 랭크→GPU 매핑/DLB 텔레메트리 ==='
-grep -m2 -E "GPU|DLB" "$SLURM_SUBMIT_DIR/smoke3-dlb1/log.par" || true
+grep -m2 -E "GPU|DLB" "${SLURM_SUBMIT_DIR:-$PWD}/smoke3-dlb1/log.par" || true
 
 # DLB on/off 최종장 비트-파리티 (랭크별)
 fail=0
 for r in 0 1 2 3; do
-    tD=$(ls -d "$SLURM_SUBMIT_DIR"/smoke3-dlb1/processor$r/[0-9]* | sort -g | tail -1)
-    tO="$SLURM_SUBMIT_DIR/smoke3-dlb0/processor$r/$(basename "$tD")"
+    tD=$(ls -d "${SLURM_SUBMIT_DIR:-$PWD}"/smoke3-dlb1/processor$r/[0-9]* | sort -g | tail -1)
+    case "$(basename "$tD")" in 0) echo "SMOKE3 FAIL: no time dirs"; fail=1; break;; esac
+    tO="${SLURM_SUBMIT_DIR:-$PWD}/smoke3-dlb0/processor$r/$(basename "$tD")"
     for f in "$tD"/*; do
         b=$(basename "$f"); [ -f "$f" ] || continue
         cmp -s "$f" "$tO/$b" || { echo "DIFF p$r/$b"; fail=1; }

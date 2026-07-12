@@ -20,20 +20,24 @@ run_one() {  # $1=디렉터리 $2=RGP_GPU_UNIFIED값("auto"면 미설정)
       [ '$mode' != auto ] && export RGP_GPU_UNIFIED=$mode
       cd '$d'
       foamDictionary -entry endTime -set 2e-5 system/controlDict
+  foamDictionary -entry writeControl -set timeStep system/controlDict
+      foamDictionary -entry writeInterval -set 20 system/controlDict
       blockMesh > log.blockMesh 2>&1 || true
       [ -f system/setFieldsDict ] && setFields > log.setFields 2>&1 || true
       foamRun > log.run 2>&1
     "
 }
 
-run_one "$SLURM_SUBMIT_DIR/smoke2-native" auto
-run_one "$SLURM_SUBMIT_DIR/smoke2-copy"   0
+run_one "${SLURM_SUBMIT_DIR:-$PWD}/smoke2-native" auto
+run_one "${SLURM_SUBMIT_DIR:-$PWD}/smoke2-copy"   0
 
-grep -m1 "coherent HW" "$SLURM_SUBMIT_DIR/smoke2-native/log.run" || true
+grep -m1 "coherent HW" "${SLURM_SUBMIT_DIR:-$PWD}/smoke2-native/log.run" || true
 
 # 최종 시간 디렉터리 비교
-tN=$(ls -d "$SLURM_SUBMIT_DIR"/smoke2-native/[0-9]* | sort -g | tail -1)
-tC=$(ls -d "$SLURM_SUBMIT_DIR"/smoke2-copy/[0-9]*   | sort -g | tail -1)
+tN=$(ls -d "${SLURM_SUBMIT_DIR:-$PWD}"/smoke2-native/[0-9]* | sort -g | tail -1)
+tC=$(ls -d "${SLURM_SUBMIT_DIR:-$PWD}"/smoke2-copy/[0-9]*   | sort -g | tail -1)
+# 0/만 있으면(계산이 아무것도 안 써졌으면) 게이트는 무효 — 실패 처리
+case "$(basename "$tN")" in 0) echo "SMOKE2 FAIL: no time dirs written"; exit 1;; esac
 echo "compare: $(basename "$tN") vs $(basename "$tC")"
 fail=0
 for f in "$tN"/*; do

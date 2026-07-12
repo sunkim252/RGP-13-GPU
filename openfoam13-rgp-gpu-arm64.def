@@ -49,7 +49,8 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
         build-essential ca-certificates cmake git wget flex bison \
         zlib1g-dev libboost-system-dev libboost-thread-dev \
         libopenmpi-dev openmpi-bin gnuplot libreadline-dev \
-        libncurses-dev libxt-dev rsync python3
+        libncurses-dev libxt-dev rsync python3 libfl-dev \
+        libscotch-dev libptscotch-dev
     rm -rf /var/lib/apt/lists/*
 
     # ─── OpenFOAM-13 + ThirdParty-13 (aarch64 네이티브 빌드) ───
@@ -62,7 +63,12 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
     #    rsync로 가져올 것 (GH200에서 x86 %files 복사는 불가 — 소스는
     #    아치 무관이므로 rsync/git이 정답)
     set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc; set -e
+    # ThirdParty(scotch 래퍼) 먼저 — 없으면 decomposePar scotch 불가
+    cd /opt/OpenFOAM/ThirdParty-13 && ./Allwmake -j $(nproc) 2>&1 | tail -3
     cd /opt/OpenFOAM/OpenFOAM-13 && ./Allwmake -j $(nproc) 2>&1 | tail -5
+    # 빌드 산출 하드 게이트 (| tail이 실패를 가리므로 명시 검증)
+    [ -x /opt/OpenFOAM/OpenFOAM-13/platforms/linuxArm64GccDPInt32Opt/bin/foamRun ] \
+        || { echo "OpenFOAM-13 build FAILED"; exit 1; }
 
     # ─── wmake CUDA 룰 (linuxArm64Gcc): H100 sm_90 + PTX 폴백 ───
     # x86 def와 동일 구조(검증됨): rules/<arch>/cuda 파일 + general에 include.

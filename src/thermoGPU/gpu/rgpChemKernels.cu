@@ -460,8 +460,17 @@ extern "C"
 
 int rgpChemInit(int deviceId)
 {
-    cudaError_t e = cudaSetDevice(deviceId < 0 ? 0 : deviceId);
-    if (e != cudaSuccess) return fail(e, "rgpChemInit");
+    // rgpGpuInit에 위임: cudaSetDevice + 코히런트 HW 감지(gRgpUnified
+    // 설정). 화학 전용 스택(gpuMulticomponentFluid 등 fgmFluid 없는
+    // 구성)에서도 native/mapped 스테이징과 RGP_GPU_UNIFIED override가
+    // 동작하도록 — 미호출이면 gRgpUnified=0으로 남아 GH200에서 native
+    // 화학 경로가 죽은 코드가 된다.
+    extern int rgpGpuInit(int);
+    if (rgpGpuInit(deviceId))
+    {
+        snprintf(gErr, sizeof(gErr), "rgpChemInit: rgpGpuInit failed");
+        return -1;
+    }
     return 0;
 }
 
@@ -543,8 +552,6 @@ int rgpChemIntegrate
     //    mapped는 등록 별칭, native는 호스트 포인터 직행 ──
     const double* pIn = rgpInPtr(p, gBuf.p, (size_t)nCells, &e);
     if (e != cudaSuccess) return fail(e, "integrate/H2D p");
-    const double* dtIn = rgpInPtr(dt, gBuf.dt, (size_t)nCells, &e);
-    if (e != cudaSuccess) return fail(e, "integrate/H2D dt");
     // T/c는 커널이 읽고 쓰는 RW 버퍼 — in으로 스테이징 후 같은
     // 포인터에 커널이 쓰고, rgpOutFinish로 회수(스테이징 경유 시만 D2H)
     double* Tio = const_cast<double*>
@@ -557,6 +564,8 @@ int rgpChemIntegrate
         rgpInPtr(c, gBuf.c, (size_t)nCells*n, &e)
     );
     if (e != cudaSuccess) return fail(e, "integrate/H2D c");
+    const double* dtIn = rgpInPtr(dt, gBuf.dt, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "integrate/H2D dt");
 
     constexpr int blockSize = 64;
     const int gridSize = (nCells + blockSize - 1)/blockSize;
@@ -567,15 +576,22 @@ int rgpChemIntegrate
     static int residentBlocks = 0;
     if (!residentBlocks)
     {
-        int dev = 0, nSM = 0, thrSM = 0;
+        int dev = 0, nSM = 0, occBlk = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&nSM, cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute
+        // 실제 상주 가능 블록 수(레지스터/블록 한계 반영) — 최대
+        // 스레드/SM 근사보다 풀이 작아진다 (대형 mech에서 수 GB 차이)
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor
         (
-            &thrSM, cudaDevAttrMaxThreadsPerMultiProcessor, dev
+            &occBlk, rgpchem::chemIntegrateKernel, blockSize, 0
         );
-        residentBlocks = (nSM*thrSM)/blockSize;
-        if (residentBlocks < 1) { residentBlocks = 1; }
+        residentBlocks = nSM*occBlk;
+        if (residentBlocks < 1)
+        {
+            fprintf(stderr, "rgpChemIntegrate: occupancy query failed "
+                    "-- wk pool capped at 1 block (slow)\n");
+            residentBlocks = 1;
+        }
     }
     const int gridInt = gridSize < residentBlocks ? gridSize
                                                   : residentBlocks;

@@ -403,6 +403,7 @@ int rgpFgmEvaluate
 
     gB.lastN = nCells;
     gB.outActive = oOut;   // 체인(he 재시드/refresh)이 읽을 위치
+    gSkipFirst = 0; gSkipN = 0;   // one-shot: 다음 호출자에 안 새게
     return 0;
 }
 
