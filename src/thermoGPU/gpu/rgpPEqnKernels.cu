@@ -125,6 +125,18 @@ namespace
         std::vector<double> hDcs, hC3;
         double mdK = -1;
         int armed = 0;
+
+        // 메시-불변 입력(kf3/Cf3/C3/dcs)의 디바이스 상주 캐시.
+        // 성분별 재스테이징이 rd0110에서 패스당 ~560MB × 12패스/스텝
+        // = 6.7GB/스텝의 불필요 H2D였음(nvprof 실측) — VRAM 여유가
+        // 있으면 아밍 시 1회 업로드로 대체. 부족하면 res=nullptr로
+        // 기존 재스테이징 경로 그대로(비트-동일). native(2)는 호스트
+        // 직행이라 캐시 불필요.
+        double *resKf = nullptr;                   // [3*nf]
+        double *resCf = nullptr;                   // [3*nf] (MD시)
+        double *resC3 = nullptr;                   // [3*nc] (MD시)
+        double *resDcs = nullptr;                  // [nf]
+        int resLoaded = 0;   // kf/Cf는 첫 Prep에서 lazy 업로드
     } gNO;
 
     struct PBuf
@@ -221,13 +233,15 @@ namespace
             &gU.rAU, &gU.HbyA3, &gU.parB,
             &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld,
-            &gNO.bCorr, &gNO.CfB3, &gNO.ownStage, &gNO.ownC3
+            &gNO.bCorr, &gNO.CfB3, &gNO.ownStage, &gNO.ownC3,
+            &gNO.resKf, &gNO.resCf, &gNO.resC3, &gNO.resDcs
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gNO.hDcs.clear();
         gNO.hC3.clear();
         gNO.armed = 0;
         gNO.mdK = -1;
+        gNO.resLoaded = 0;
 
         int* dic_i[] = {gDIC.colorOf, gDIC.colCells,
                         gDIC.fwdFace, gDIC.bwdFace};
@@ -3574,6 +3588,53 @@ int rgpPEqnNOArm
         }
     }
     gNO.mdK = useMD ? mdK : -1;
+
+    // ── 메시-불변 상주 캐시 (여유 VRAM 시에만; 실패는 성능 폴백일 뿐) ──
+    gNO.resLoaded = 0;
+    if (gRgpUnified != 2)
+    {
+        double* frees[] = {gNO.resKf, gNO.resCf, gNO.resC3, gNO.resDcs};
+        for (auto pf : frees) { if (pf) cudaFree(pf); }
+        gNO.resKf = gNO.resCf = gNO.resC3 = gNO.resDcs = nullptr;
+
+        const size_t need =
+            ((size_t)3*nf + (useMD ? (size_t)3*nf + 3*nc : 0)
+             + (size_t)nf)*sizeof(double);
+        size_t freeB = 0, totB = 0;
+        if (cudaMemGetInfo(&freeB, &totB) == cudaSuccess
+         && freeB > need + (size_t)256*1024*1024)
+        {
+            bool ok =
+                cudaMalloc(&gNO.resKf, (size_t)3*nf*sizeof(double))
+                    == cudaSuccess
+             && cudaMalloc(&gNO.resDcs, (size_t)nf*sizeof(double))
+                    == cudaSuccess
+             && (!useMD ||
+                 (cudaMalloc(&gNO.resCf, (size_t)3*nf*sizeof(double))
+                      == cudaSuccess
+               && cudaMalloc(&gNO.resC3, (size_t)3*nc*sizeof(double))
+                      == cudaSuccess));
+            if (ok)
+            {
+                ok = cudaMemcpy(gNO.resDcs, dcsNO, nf*sizeof(double),
+                                cudaMemcpyHostToDevice) == cudaSuccess
+                  && (!useMD ||
+                      cudaMemcpy(gNO.resC3, C3,
+                                 (size_t)3*nc*sizeof(double),
+                                 cudaMemcpyHostToDevice) == cudaSuccess);
+            }
+            if (!ok)
+            {
+                cudaGetLastError();
+                double* ps[] =
+                    {gNO.resKf, gNO.resCf, gNO.resC3, gNO.resDcs};
+                for (auto pp : ps) { if (pp) cudaFree(pp); }
+                gNO.resKf = gNO.resCf = gNO.resC3 = gNO.resDcs
+                    = nullptr;
+            }
+        }
+    }
+
     gNO.armed = 1;
     return 0;
 }
@@ -3663,9 +3724,10 @@ int rgpPEqnNOCorrPrep
     rgppeqn::stGradGather<<<nb(nc), BS>>>
         (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
          gB.flux, dPBF, gM.V, gST.grad);
-    // xf(gB.flux) 소비 완료 — 이후 z-성분 스테이지로 재사용
-    double *vx, *vy, *vz;
-    if (!noStage3(vx, vy, vz, &e))
+    // xf(gB.flux) 소비 완료 — 이후 z-성분 스테이지로 재사용.
+    // 상주 캐시가 있으면 성분 스테이징 자체가 불필요.
+    double *vx = nullptr, *vy = nullptr, *vz = nullptr;
+    if (!gNO.resKf && !noStage3(vx, vy, vz, &e))
     {
         snprintf(gPErr, sizeof(gPErr),
                  "noCorr/stage: %s", cudaGetErrorString(e));
@@ -3696,19 +3758,42 @@ int rgpPEqnNOCorrPrep
             }
             c3d = gNO.ownC3;
         }
-        const double* dC3 =
-            rgpInPtr(gNO.hC3.data(), c3d, (size_t)3*nc, &e);
-        if (e != cudaSuccess) return pfail(e, "noCorr/C3 H2D");
-        // Cf 성분 스테이징 (동기 memcpy가 위 커널 완료를 대기 — 순서
-        // 안전; z는 xf가 쓰던 gB.flux)
-        const double* dCfx = rgpInPtr(Cf3, vx, (size_t)nf, &e);
-        if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
-        const double* dCfy =
-            rgpInPtr(Cf3 + (size_t)nf, vy, (size_t)nf, &e);
-        if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
-        const double* dCfz =
-            rgpInPtr(Cf3 + (size_t)2*nf, vz, (size_t)nf, &e);
-        if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
+        const double* dC3;
+        if (gNO.resC3)
+        {
+            dC3 = gNO.resC3;   // 상주 캐시 (아밍 시 업로드)
+        }
+        else
+        {
+            dC3 = rgpInPtr(gNO.hC3.data(), c3d, (size_t)3*nc, &e);
+            if (e != cudaSuccess) return pfail(e, "noCorr/C3 H2D");
+        }
+        // Cf 성분: 상주 캐시(첫 패스 lazy 업로드) 또는 기존 별칭 스테이징
+        const double *dCfx, *dCfy, *dCfz;
+        if (gNO.resCf)
+        {
+            if (!gNO.resLoaded)
+            {
+                if ((e = cudaMemcpy(gNO.resCf, Cf3,
+                                    (size_t)3*nf*sizeof(double),
+                                    cudaMemcpyHostToDevice))
+                    != cudaSuccess) return pfail(e, "noCorr/resCf H2D");
+            }
+            dCfx = gNO.resCf;
+            dCfy = gNO.resCf + (size_t)nf;
+            dCfz = gNO.resCf + (size_t)2*nf;
+        }
+        else
+        {
+            // (동기 memcpy가 위 커널 완료를 대기 — 순서 안전; z는
+            // xf가 쓰던 gB.flux)
+            dCfx = rgpInPtr(Cf3, vx, (size_t)nf, &e);
+            if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
+            dCfy = rgpInPtr(Cf3 + (size_t)nf, vy, (size_t)nf, &e);
+            if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
+            dCfz = rgpInPtr(Cf3 + (size_t)2*nf, vz, (size_t)nf, &e);
+            if (e != cudaSuccess) return pfail(e, "noCorr/Cf H2D");
+        }
         // cellMDLimited (min/max 스크래치는 BiCG 작업 버퍼 재사용 —
         // pEqn 솔브 전이라 유휴)
         const double rk = (gNO.mdK < 1.0) ? (1.0/gNO.mdK - 1.0) : 0.0;
@@ -3720,19 +3805,36 @@ int rgpPEqnNOCorrPrep
              dCfx, dCfy, dCfz, dC3, gNO.CfB3, gST.rA0, gST.sA,
              gST.grad);
     }
-    // kf 성분 스테이징 (Cf 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장).
-    // dcs → gB.upper 별칭 (pEqn 솔브 조립이 직후 재작성),
-    // corrF → gST.lower 별칭 (ZC 전용, pCorr 동안 유휴)
-    const double* dKfx = rgpInPtr(kf3, vx, (size_t)nf, &e);
-    if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
-    const double* dKfy = rgpInPtr(kf3 + (size_t)nf, vy, (size_t)nf, &e);
-    if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
-    const double* dKfz =
-        rgpInPtr(kf3 + (size_t)2*nf, vz, (size_t)nf, &e);
-    if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
-    const double* dDcs =
-        rgpInPtr(gNO.hDcs.data(), gB.upper, (size_t)nf, &e);
-    if (e != cudaSuccess) return pfail(e, "noCorr/dcs H2D");
+    // kf 성분: 상주 캐시(첫 패스 lazy) 또는 기존 별칭 스테이징
+    // (Cf 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장).
+    // dcs → 상주 캐시 또는 gB.upper 별칭, corrF → gST.lower 별칭
+    const double *dKfx, *dKfy, *dKfz, *dDcs;
+    if (gNO.resKf)
+    {
+        if (!gNO.resLoaded)
+        {
+            if ((e = cudaMemcpy(gNO.resKf, kf3,
+                                (size_t)3*nf*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "noCorr/resKf H2D");
+            gNO.resLoaded = 1;
+        }
+        dKfx = gNO.resKf;
+        dKfy = gNO.resKf + (size_t)nf;
+        dKfz = gNO.resKf + (size_t)2*nf;
+        dDcs = gNO.resDcs;
+    }
+    else
+    {
+        dKfx = rgpInPtr(kf3, vx, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
+        dKfy = rgpInPtr(kf3 + (size_t)nf, vy, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
+        dKfz = rgpInPtr(kf3 + (size_t)2*nf, vz, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/kf H2D");
+        dDcs = rgpInPtr(gNO.hDcs.data(), gB.upper, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/dcs H2D");
+    }
     rgppeqn::noFaceCorr<<<nb(nf), BS>>>
         (nf, nc, gM.own, gM.nei, gSTM.wLin, dKfx, dKfy, dKfz, dDcs,
          dP2, dGMsf, gST.grad, limitCoeff, gST.lower);
