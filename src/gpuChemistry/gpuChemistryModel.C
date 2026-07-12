@@ -14,7 +14,10 @@
 #include "IStringStream.H"
 #include "Tuple2.H"
 #include "thermodynamicConstants.H"
+#include "PstreamBuffers.H"
+#include "PstreamReduceOps.H"
 #include <cstring>
+#include <algorithm>
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
@@ -28,6 +31,8 @@ Foam::gpuChemistryModel<ThermoType>::gpuChemistryModel
     relTol_(1e-5),
     absTol_(1e-12),
     retrieveTol_(0),
+    dlb_(true),
+    dlbThreshold_(1.3),
     armed_(false)
 {
     if (this->found("gpuCoeffs"))
@@ -53,6 +58,11 @@ Foam::gpuChemistryModel<ThermoType>::gpuChemistryModel
             Info<< "gpuChemistry: retrieve cache on, tol = "
                 << retrieveTol_ << endl;
         }
+
+        // 랭크 간 부하균형 (병렬 전용; 화염면 편중 완화)
+        dlb_ = dict.lookupOrDefault<Switch>("dlb", true);
+        dlbThreshold_ =
+            dict.lookupOrDefault<scalar>("dlbThreshold", 1.3);
     }
 }
 
@@ -262,15 +272,285 @@ Foam::scalar Foam::gpuChemistryModel<ThermoType>::solveBatch
         }
     }
 
-    long long stats[2] = {0, 0};
-    if (rgpChemIntegrate
-        (
-            nc, dtB_.begin(), relTol_, absTol_,
-            pB_.begin(), TB_.begin(), cB_.begin(), stats
-        ))
+    // ── 랭크 간 부하균형(DLB): 직전 스텝 substep 비용으로 과부하
+    //    랭크의 최고비용 셀을 저부하 랭크로 이송. 셀별 적분은 독립·
+    //    결정론 — 어느 랭크에서 계산돼도 결과 비트-동일. 매칭은 모든
+    //    랭크가 allgather된 부하로 동일하게 계산(결정론 두-포인터) ──
+    const bool doDlb = dlb_ && Pstream::parRun() && nc > 0;
+    labelList expIds;                 // 내보낸 로컬 셀 (전송 순서 연접)
+    DynamicList<label> sendTo, sendCnt;
+    DynamicList<label> recvFromRank;
+    labelList retained;               // 잔류 로컬 셀 id (배치 앞부분)
+    label nImp = 0;                   // 수입 셀 수 (배치 뒷부분)
+    List<label> impFromCnt;           // recv별 수입 셀 수
+    bool dlbActive = false;
+
+    if (doDlb)
     {
-        FatalErrorInFunction
-            << "rgpChemIntegrate: " << rgpChemLastError() << exit(FatalError);
+        if (dlbCost_.size() != nc)
+        {
+            dlbCost_.setSize(nc);
+            forAll(dlbCost_, i) { dlbCost_[i] = 1; }
+        }
+        scalar myLoad = 0;
+        forAll(dlbCost_, i) { myLoad += scalar(dlbCost_[i]); }
+        List<scalar> loads(Pstream::nProcs(), scalar(0));
+        loads[Pstream::myProcNo()] = myLoad;
+        Pstream::gatherList(loads);
+        Pstream::scatterList(loads);
+        scalar total = 0;
+        scalar maxLoad = 0;
+        forAll(loads, r)
+        {
+            total += loads[r];
+            maxLoad = max(maxLoad, loads[r]);
+        }
+        const scalar avg = total/Pstream::nProcs();
+
+        if (maxLoad > dlbThreshold_*avg + small)
+        {
+            dlbActive = true;
+
+            // 결정론 두-포인터 매칭: 잉여(donor) → 결핍(receiver)
+            List<scalar> excess(loads.size());
+            forAll(loads, r) { excess[r] = loads[r] - avg; }
+            const scalar minAmt = 0.02*avg + small;
+            label d = 0, rv = 0;
+            const label nP = Pstream::nProcs();
+            const label me = Pstream::myProcNo();
+            DynamicList<scalar> myTgtCost;
+            while (true)
+            {
+                while (d < nP && excess[d] <= minAmt) { d++; }
+                while (rv < nP && excess[rv] >= -minAmt) { rv++; }
+                if (d >= nP || rv >= nP) { break; }
+                const scalar amt = min(excess[d], -excess[rv]);
+                if (amt >= minAmt)
+                {
+                    if (d == me) { sendTo.append(rv); myTgtCost.append(amt); }
+                    if (rv == me) { recvFromRank.append(d); }
+                }
+                excess[d] -= amt;
+                excess[rv] += amt;
+            }
+
+            // donor: 비용 내림차순으로 셀 배정 (stable — 결정론)
+            boolList exported(nc, false);
+            if (sendTo.size())
+            {
+                labelList order(nc);
+                forAll(order, i) { order[i] = i; }
+                std::stable_sort
+                (
+                    order.begin(), order.end(),
+                    [&](label a, label b)
+                    {
+                        return dlbCost_[a] > dlbCost_[b];
+                    }
+                );
+                DynamicList<label> ids(nc);
+                sendCnt.setSize(sendTo.size());
+                label cur = 0;
+                forAll(sendTo, t)
+                {
+                    scalar acc = 0;
+                    label cnt = 0;
+                    while (cur < nc - 1 && acc < myTgtCost[t])
+                    {
+                        const label id = order[cur++];
+                        ids.append(id);
+                        exported[id] = true;
+                        acc += scalar(dlbCost_[id]);
+                        cnt++;
+                    }
+                    sendCnt[t] = cnt;
+                }
+                expIds.transfer(ids);
+            }
+
+            // 전송: [p,T,dt,c*n]/셀 — 수신은 매칭 순서로 처리(결정론)
+            PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
+            {
+                label off = 0;
+                forAll(sendTo, t)
+                {
+                    List<scalar> pay(sendCnt[t]*(n + 3));
+                    for (label k = 0; k < sendCnt[t]; k++)
+                    {
+                        const label id = expIds[off + k];
+                        scalar* q = pay.begin() + k*(n + 3);
+                        q[0] = pB_[id];
+                        q[1] = TB_[id];
+                        q[2] = dtB_[id];
+                        for (int m = 0; m < n; m++)
+                        {
+                            q[3 + m] = cB_[id*n + m];
+                        }
+                    }
+                    UOPstream toR(sendTo[t], pBufs);
+                    toR << pay;
+                    off += sendCnt[t];
+                }
+            }
+            pBufs.finishedSends();
+
+            // 잔류 로컬 셀
+            {
+                DynamicList<label> ret(nc);
+                for (label i = 0; i < nc; i++)
+                {
+                    if (!exported[i]) { ret.append(i); }
+                }
+                retained.transfer(ret);
+            }
+
+            // 수입 페이로드 수신 → 컴팩트 배치 [retained | imported]
+            List<List<scalar>> impPay(recvFromRank.size());
+            impFromCnt.setSize(recvFromRank.size(), 0);
+            forAll(recvFromRank, t)
+            {
+                UIPstream fromR(recvFromRank[t], pBufs);
+                fromR >> impPay[t];
+                impFromCnt[t] = impPay[t].size()/(n + 3);
+                nImp += impFromCnt[t];
+            }
+
+            const label nBatch = retained.size() + nImp;
+            if (pC_.size() < nBatch)
+            {
+                pC_.setSize(nBatch); TC_.setSize(nBatch);
+                dtC_.setSize(nBatch); cC_.setSize(nBatch*n);
+            }
+            forAll(retained, k)
+            {
+                const label id = retained[k];
+                pC_[k] = pB_[id];
+                TC_[k] = TB_[id];
+                dtC_[k] = dtB_[id];
+                for (int m = 0; m < n; m++)
+                {
+                    cC_[k*n + m] = cB_[id*n + m];
+                }
+            }
+            label k = retained.size();
+            forAll(recvFromRank, t)
+            {
+                const scalar* q0 = impPay[t].begin();
+                for (label j = 0; j < impFromCnt[t]; j++)
+                {
+                    const scalar* q = q0 + j*(n + 3);
+                    pC_[k] = q[0];
+                    TC_[k] = q[1];
+                    dtC_[k] = q[2];
+                    for (int m = 0; m < n; m++)
+                    {
+                        cC_[k*n + m] = q[3 + m];
+                    }
+                    k++;
+                }
+            }
+
+            Info<< "gpuChemistry DLB: load " << label(myLoad)
+                << " (avg " << label(avg) << ", max " << label(maxLoad)
+                << ") -- exported " << expIds.size()
+                << ", imported " << nImp << " cells" << endl;
+        }
+    }
+
+    long long stats[2] = {0, 0};
+    if (!dlbActive)
+    {
+        if (rgpChemIntegrate
+            (
+                nc, dtB_.begin(), relTol_, absTol_,
+                pB_.begin(), TB_.begin(), cB_.begin(), stats
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpChemIntegrate: " << rgpChemLastError()
+                << exit(FatalError);
+        }
+        if (doDlb)
+        {
+            dlbCost_.setSize(nc);
+            if (rgpChemLastSteps(dlbCost_.begin(), nc))
+            {
+                forAll(dlbCost_, i) { dlbCost_[i] = 1; }
+            }
+        }
+    }
+    else
+    {
+        const label nBatch = retained.size() + nImp;
+        if (nBatch > 0 && rgpChemIntegrate
+            (
+                nBatch, dtC_.begin(), relTol_, absTol_,
+                pC_.begin(), TC_.begin(), cC_.begin(), stats
+            ))
+        {
+            FatalErrorInFunction
+                << "rgpChemIntegrate: " << rgpChemLastError()
+                << exit(FatalError);
+        }
+
+        List<long long> steps(max(nBatch, label(1)), (long long)1);
+        if (nBatch > 0) { rgpChemLastSteps(steps.begin(), nBatch); }
+
+        // 잔류 셀 결과·비용을 원래 레이아웃으로 산포
+        dlbCost_.setSize(nc);
+        forAll(retained, k)
+        {
+            const label id = retained[k];
+            TB_[id] = TC_[k];
+            for (int m = 0; m < n; m++)
+            {
+                cB_[id*n + m] = cC_[k*n + m];
+            }
+            dlbCost_[id] = steps[k];
+        }
+
+        // 수입 셀 결과 반송: [c*n, steps]/셀 (수신 순서 보존)
+        PstreamBuffers rBufs(Pstream::commsTypes::nonBlocking);
+        {
+            label k = retained.size();
+            forAll(recvFromRank, t)
+            {
+                List<scalar> pay(impFromCnt[t]*(n + 1));
+                for (label j = 0; j < impFromCnt[t]; j++)
+                {
+                    scalar* q = pay.begin() + j*(n + 1);
+                    for (int m = 0; m < n; m++)
+                    {
+                        q[m] = cC_[k*n + m];
+                    }
+                    q[n] = scalar(steps[k]);
+                    k++;
+                }
+                UOPstream toR(recvFromRank[t], rBufs);
+                toR << pay;
+            }
+        }
+        rBufs.finishedSends();
+        {
+            label off = 0;
+            forAll(sendTo, t)
+            {
+                List<scalar> pay;
+                UIPstream fromR(sendTo[t], rBufs);
+                fromR >> pay;
+                for (label j = 0; j < sendCnt[t]; j++)
+                {
+                    const label id = expIds[off + j];
+                    const scalar* q = pay.begin() + j*(n + 1);
+                    for (int m = 0; m < n; m++)
+                    {
+                        cB_[id*n + m] = q[m];
+                    }
+                    dlbCost_[id] = (long long)q[n];
+                }
+                off += sendCnt[t];
+            }
+        }
     }
 
     if (retrieveTol_ > 0)

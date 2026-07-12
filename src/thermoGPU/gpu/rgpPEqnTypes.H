@@ -98,6 +98,31 @@ void* rgpPEqnDevValues(void);        /* [nnz] 디바이스 */
 void* rgpPEqnDevB(void);             /* [nCells] 디바이스 */
 void* rgpPEqnDevX(void);             /* [nCells] 디바이스 (x0=p, 솔브 후 p) */
 
+/*  분산(멀티랭크) CSR — AmgX AMGX_matrix_upload_distributed용:
+    행 = [lower|diag|upper(전역 열)] + [인터페이스(-bC, 이웃 전역 열)].
+    ifaceCol = [gPar.totF] 이웃 셀 전역 인덱스(호스트가 processor-면
+    순서로 교환·구축), rowOffset = 이 랭크의 전역 셀 오프셋.
+    AssembleCsrDist는 rgpPEqnParCoeffs로 올린 인터페이스 계수를 값에
+    산포하고 OF 규약 normFactor/초기잔차를 전역 리덕션으로 계산.       */
+int rgpPEqnCsrPrepareDist
+(
+    const long long* ifaceCol, long long rowOffset, int* nnzOut
+);
+int rgpPEqnAssembleCsrDist
+(
+    double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
+    const double* rAUfInt,
+    const double* psis, const double* pOld, const double* p0,
+    const double* phiInt, const double* phiB,
+    const double* bDiag, const double* bSrc,
+    int needRef, int refCell, double refValue,
+    double* normFactor, double* initRes
+);
+const int* rgpPEqnCsrDistRowPtr(void);        /* [nCells+1] 호스트 */
+const long long* rgpPEqnCsrDistColInd(void);  /* [nnzD] 호스트 */
+void* rgpPEqnDevValuesDist(void);             /* [nnzD] 디바이스 */
+
 int rgpPEqnAssembleCsr
 (
     double dtInv, const double* rdtCell,

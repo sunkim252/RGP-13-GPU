@@ -246,6 +246,9 @@ protected:
         //- pEqnGPU CSR nnz (amgx 경로, 아밍 시 설정)
         mutable label gpuPEqnNnz_;
 
+        //- amgx 분산: 파티션 오프셋 [nProcs+1] (전역 셀 번호 경계)
+        mutable List<long long> gpuPEqnPartOff_;
+
         //- ZCGPU: Z/C 수송 방정식(ddt+multivariate limitedLinear div+Sp+
         //  laplacian)을 GPU 조립+Jacobi-BiCGStab로. 'gpuZC on;'
         //  (fgmProperties). gpuPEqn과 동일한 v1 제약(비커플드/Euler/직교).

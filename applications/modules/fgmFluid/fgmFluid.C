@@ -192,13 +192,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     // halo 교환 + 전역 리덕션으로 지원. devChain(디바이스 상주 pCorr
     // 체인)만 직렬 전용(v1) — 병렬은 rgpUEqnAH 호스트 회수 + CPU fvc
     // 준비체인으로 자동 전환된다 (pressureCorrector의 devChain 게이트).
-    if (Pstream::parRun() && gpuPEqn_ && gpuPEqnSolver_ != "pcg")
-    {
-        WarningInFunction
-            << "parallel gpuPEqn supports the pcg solver only -- "
-            << "switching gpuPEqnSolver amgx -> pcg" << endl;
-        gpuPEqnSolver_ = "pcg";
-    }
+    // 병렬 amgx: 분산 CSR(AMGX_matrix_upload_distributed) 경로 지원 —
+    // 이전의 pcg 강제 강등은 제거 (직렬/병렬 모두 amgx 선택 가능)
 
     Info<< "fgmFluid: " << tabSpecieIDs_.size() << " of " << Y_.size()
         << " species tabulated; Cv = " << Cv_ << ", Sct = " << Sct_ << nl

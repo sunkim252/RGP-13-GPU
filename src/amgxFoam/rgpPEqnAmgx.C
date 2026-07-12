@@ -13,6 +13,10 @@
 \*---------------------------------------------------------------------------*/
 
 #include <amgx_c.h>
+// OpenFOAM 규약: MPI C++ 바인딩 제외 (미정의 심볼 방지)
+#define OMPI_SKIP_MPICXX
+#define MPICH_SKIP_MPICXX
+#include <mpi.h>
 
 #include <cstdio>
 #include <cstring>
@@ -33,6 +37,19 @@ namespace
         int nCells = -1, nnz = -1;
         long solveCount = 0;
     } gS;
+
+    //- 분산(멀티랭크) 상태 — 직렬 gS와 독립 (혼용 없음)
+    struct DistState
+    {
+        AMGX_config_handle cfg = nullptr;
+        AMGX_resources_handle rsrc = nullptr;
+        AMGX_solver_handle solver = nullptr;
+        AMGX_matrix_handle A = nullptr;
+        AMGX_vector_handle x = nullptr, b = nullptr;
+        MPI_Comm comm = MPI_COMM_NULL;
+        int nLocal = -1, nnz = -1;
+        long solveCount = 0;
+    } gSD;
 
     const char* kJson =
         "{\"config_version\":2,\"solver\":{"
@@ -165,6 +182,135 @@ int rgpPEqnAmgxSolve
 
     int it = 0;
     AMGX_solver_get_iterations_number(gS.solver, &it);
+    *nIters = it;
+
+    return 0;
+}
+
+//- 분산(멀티랭크) AmgX 솔브: 로컬 CSR + 64-bit 전역 열 인덱스(호스트가
+//  인터페이스 열을 포함해 구축) + 파티션 오프셋으로
+//  AMGX_matrix_upload_distributed 1회 바인딩, 이후 replace_coefficients
+//  (comm 플랜·구조 유지). 수렴 판정은 직렬과 동일하게 호출자가 4-iter
+//  블록 사이에서 OF 규약 전역 잔차로 수행한다.
+int rgpPEqnAmgxSolveDist
+(
+    long long nGlobal, int nLocal, int nnz,
+    const int* rowPtrHost, const long long* colIndHost,
+    void* dValues, void* dB, void* dX,
+    const long long* partOffsets, int nParts, int myDevice,
+    int newSolve, int setupInterval, int* nIters
+)
+{
+    if (!gS.globalInit)
+    {
+        CHK(AMGX_initialize(), "initialize");
+        gS.globalInit = true;
+    }
+
+    const bool rebuild = (gSD.nLocal != nLocal || gSD.nnz != nnz);
+    if (rebuild)
+    {
+        gSD.nLocal = -1;
+        gSD.nnz = -1;
+
+        if (gSD.solver)
+        {
+            AMGX_solver_destroy(gSD.solver);
+            AMGX_matrix_destroy(gSD.A);
+            AMGX_vector_destroy(gSD.x);
+            AMGX_vector_destroy(gSD.b);
+            AMGX_resources_destroy(gSD.rsrc);
+            AMGX_config_destroy(gSD.cfg);
+            gSD.solver = nullptr;
+            gSD.A = nullptr;
+            gSD.x = nullptr;
+            gSD.b = nullptr;
+            gSD.rsrc = nullptr;
+            gSD.cfg = nullptr;
+        }
+
+        gSD.comm = MPI_COMM_WORLD;
+
+        CHK(AMGX_config_create(&gSD.cfg, kJson), "dist config_create");
+        CHK(AMGX_resources_create
+            (
+                &gSD.rsrc, gSD.cfg, &gSD.comm, 1, &myDevice
+            ), "dist resources_create");
+        CHK(AMGX_matrix_create(&gSD.A, gSD.rsrc, AMGX_mode_dDDI),
+            "dist matrix_create");
+        CHK(AMGX_vector_create(&gSD.x, gSD.rsrc, AMGX_mode_dDDI),
+            "dist vector_create x");
+        CHK(AMGX_vector_create(&gSD.b, gSD.rsrc, AMGX_mode_dDDI),
+            "dist vector_create b");
+        CHK(AMGX_solver_create
+            (
+                &gSD.solver, gSD.rsrc, AMGX_mode_dDDI, gSD.cfg
+            ), "dist solver_create");
+
+        AMGX_distribution_handle dist = nullptr;
+        CHK(AMGX_distribution_create(&dist, gSD.cfg),
+            "dist distribution_create");
+        CHK(AMGX_distribution_set_partition_data
+            (
+                dist, AMGX_DIST_PARTITION_OFFSETS, partOffsets
+            ), "dist set_partition_data");
+        // 64-bit 전역 열 인덱스 (기본값 — 명시)
+        CHK(AMGX_distribution_set_32bit_colindices(dist, 0),
+            "dist set_colindices");
+
+        AMGX_RC rcU = AMGX_matrix_upload_distributed
+        (
+            gSD.A, (int)nGlobal, nLocal, nnz, 1, 1,
+            rowPtrHost, colIndHost, dValues, nullptr, dist
+        );
+        AMGX_distribution_destroy(dist);
+        if (rcU != AMGX_RC_OK)
+        {
+            char msg_[400];
+            AMGX_get_error_string(rcU, msg_, 400);
+            snprintf(gErr, sizeof(gErr),
+                     "dist upload_distributed: %s", msg_);
+            return -1;
+        }
+
+        // 벡터를 행렬의 통신 플랜에 바인딩 (halo 갱신을 AmgX가 수행)
+        CHK(AMGX_vector_bind(gSD.x, gSD.A), "dist vector_bind x");
+        CHK(AMGX_vector_bind(gSD.b, gSD.A), "dist vector_bind b");
+    }
+    else
+    {
+        CHK(AMGX_matrix_replace_coefficients
+            (
+                gSD.A, nLocal, nnz, dValues, nullptr
+            ), "dist replace_coefficients");
+    }
+
+    if (rebuild)
+    {
+        CHK(AMGX_solver_setup(gSD.solver, gSD.A), "dist solver_setup");
+        gSD.nLocal = nLocal;
+        gSD.nnz = nnz;
+        gSD.solveCount = 1;
+    }
+    else if (newSolve)
+    {
+        if (setupInterval > 0 && (gSD.solveCount % setupInterval) == 0)
+        {
+            CHK(AMGX_solver_resetup(gSD.solver, gSD.A),
+                "dist solver_resetup");
+        }
+        gSD.solveCount++;
+    }
+
+    CHK(AMGX_vector_upload(gSD.x, nLocal, 1, dX), "dist upload x");
+    CHK(AMGX_vector_upload(gSD.b, nLocal, 1, dB), "dist upload b");
+
+    CHK(AMGX_solver_solve(gSD.solver, gSD.b, gSD.x), "dist solve");
+
+    CHK(AMGX_vector_download(gSD.x, dX), "dist download x");
+
+    int it = 0;
+    AMGX_solver_get_iterations_number(gSD.solver, &it);
     *nIters = it;
 
     return 0;

@@ -84,6 +84,10 @@ int rgpChemSetBalance(int mode);
 int rgpChemSetCacheTol(double relTol);
 long long rgpChemCacheHits(void);
 
+/*  직전 rgpChemIntegrate의 셀별 substep 수 [nCells] — 랭크 간 화학
+    부하균형(DLB)의 비용 지표. nCells가 직전 호출보다 크면 -1.        */
+int rgpChemLastSteps(long long* out, int nCells);
+
 void rgpChemFree(void);
 const char* rgpChemLastError(void);
 

@@ -672,6 +672,14 @@ int rgpChemSetCacheTol(double relTol)
 }
 
 
+int rgpChemLastSteps(long long* out, int nCells)
+{
+    if ((int)gHostSteps.size() < nCells) return -1;
+    for (int i = 0; i < nCells; i++) { out[i] = gHostSteps[i]; }
+    return 0;
+}
+
+
 long long rgpChemCacheHits(void)
 {
     return gCacheHits;

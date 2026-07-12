@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <vector>
+#include <algorithm>
 #include <mpi.h>
 
 namespace
@@ -44,6 +45,13 @@ namespace
         int *dDiagSlot = nullptr, *dUpSlot = nullptr, *dLoSlot = nullptr;
         int *dRowPtr = nullptr, *dColInd = nullptr;
         double *dVals = nullptr;
+        // 분산 CSR (AmgX 멀티랭크): 전역 64-bit 열 + 인터페이스 항 포함
+        std::vector<int> hRowPtrD;
+        std::vector<long long> hColIndD;
+        int nnzD = 0;
+        int *dDiagSlotD = nullptr, *dUpSlotD = nullptr,
+            *dLoSlotD = nullptr, *dIfSlotD = nullptr;
+        double *dValsD = nullptr;
     } gM;
 
     //- 스칼라 수송(Z/C) 확장: limitedLinear div + laplacian + ddt/Sp
@@ -164,6 +172,8 @@ namespace
         std::vector<int> off;       // [nP+1] 연접 오프셋
         int totF = 0;
         int* fc = nullptr;          // [totF] faceCells (디바이스)
+        std::vector<int> hFc;       // [totF] faceCells 호스트 사본
+                                    // (분산 CSR 구조 구축용)
         double* bC = nullptr;       // [totF] 인터페이스 계수 (디바이스)
         double* dSend = nullptr;    // [totF]
         double* dRecv = nullptr;
@@ -176,17 +186,23 @@ namespace
         int* ip[] = {gM.own, gM.nei, gM.bfc,
                      gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot,
                      gM.dRowPtr, gM.dColInd,
+                     gM.dDiagSlotD, gM.dUpSlotD, gM.dLoSlotD,
+                     gM.dIfSlotD,
                      gSTM.cfPtr, gSTM.cfIdx};
         for (auto p : ip) { if (p) cudaFree(p); }
         gM.own = gM.nei = gM.bfc = nullptr;
         gM.dDiagSlot = gM.dUpSlot = gM.dLoSlot = nullptr;
         gM.dRowPtr = gM.dColInd = nullptr;
+        gM.dDiagSlotD = gM.dUpSlotD = gM.dLoSlotD = gM.dIfSlotD = nullptr;
         gSTM.cfPtr = gSTM.cfIdx = nullptr;
         if (gM.dVals) { cudaFree(gM.dVals); gM.dVals = nullptr; }
+        if (gM.dValsD) { cudaFree(gM.dValsD); gM.dValsD = nullptr; }
         gM.hOwn.clear(); gM.hNei.clear();
         gM.hRowPtr.clear(); gM.hColInd.clear();
+        gM.hRowPtrD.clear(); gM.hColIndD.clear();
         gM.hBfc.clear();
         gM.nnz = 0;
+        gM.nnzD = 0;
 
         double** dp[] =
         {
@@ -612,6 +628,20 @@ __global__ void csrScatterFace
     if (f >= nf) return;
     vals[upSlot[f]] = upper[f];   // 대칭: lower == upper
     vals[loSlot[f]] = upper[f];
+}
+
+//- 분산 CSR: processor-인터페이스 오프대각 산포 — SpMV 규약
+//  y[fc] -= bC·x_nbr 이므로 행렬 항은 A[fc, nbrGlobal] = -bC
+__global__ void csrScatterIface
+(
+    const int totF,
+    const int* __restrict__ ifSlot, const double* __restrict__ bC,
+    double* __restrict__ vals
+)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= totF) return;
+    vals[ifSlot[k]] = -bC[k];
 }
 
 
@@ -2385,6 +2415,7 @@ int rgpPEqnParArm
         gPar.off[i + 1] = gPar.off[i] + nFaces[i];
     }
     gPar.totF = gPar.off[nProcPatches];
+    gPar.hFc.assign(faceCells, faceCells + gPar.totF);
     gPar.hSend.resize(gPar.totF);
     gPar.hRecv.resize(gPar.totF);
 
@@ -2621,13 +2652,18 @@ int rgpPEqnAssembleDump
 static void csrFreeAll()
 {
     int* ip[] = {gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot,
-                 gM.dRowPtr, gM.dColInd};
+                 gM.dRowPtr, gM.dColInd,
+                 gM.dDiagSlotD, gM.dUpSlotD, gM.dLoSlotD, gM.dIfSlotD};
     for (auto p : ip) { if (p) cudaFree(p); }
     gM.dDiagSlot = gM.dUpSlot = gM.dLoSlot = nullptr;
     gM.dRowPtr = gM.dColInd = nullptr;
+    gM.dDiagSlotD = gM.dUpSlotD = gM.dLoSlotD = gM.dIfSlotD = nullptr;
     if (gM.dVals) { cudaFree(gM.dVals); gM.dVals = nullptr; }
+    if (gM.dValsD) { cudaFree(gM.dValsD); gM.dValsD = nullptr; }
     gM.hRowPtr.clear(); gM.hColInd.clear();
+    gM.hRowPtrD.clear(); gM.hColIndD.clear();
     gM.nnz = 0;
+    gM.nnzD = 0;
     cudaGetLastError();   // OOM sticky 오류 상태 소거
 }
 
@@ -2733,6 +2769,140 @@ void* rgpPEqnDevB(void) { return gB.b; }
 void* rgpPEqnDevX(void) { return gB.x; }
 
 
+//- 분산(멀티랭크) CSR: 행 = [lower(전역) | diag | upper(전역) |
+//  인터페이스(이웃 랭크 전역 열)] — ifaceCol[k]는 호스트가
+//  processor-면 순서(gPar 연접 순서)로 교환·구축한 이웃 셀의 전역
+//  인덱스, rowOffset = 이 랭크의 전역 셀 오프셋. 슬롯맵과 64-bit
+//  열 구조를 만들고 nnzD를 돌려준다.
+int rgpPEqnCsrPrepareDist
+(
+    const long long* ifaceCol, long long rowOffset, int* nnzOut
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    if (nc <= 0)
+    {
+        snprintf(gPErr, sizeof(gPErr), "peqn/csrD: mesh not uploaded");
+        return -1;
+    }
+    const int totF = gPar.totF;
+    if (totF > 0 && (int)gPar.hFc.size() != totF)
+    {
+        snprintf(gPErr, sizeof(gPErr), "peqn/csrD: par not armed");
+        return -1;
+    }
+
+    const int nnz = nc + 2*nf + totF;
+    gM.hRowPtrD.assign(nc + 1, 0);
+    for (int f = 0; f < nf; f++)
+    {
+        gM.hRowPtrD[gM.hNei[f] + 1]++;
+        gM.hRowPtrD[gM.hOwn[f] + 1]++;
+    }
+    for (int k = 0; k < totF; k++)
+    {
+        gM.hRowPtrD[gPar.hFc[k] + 1]++;
+    }
+    for (int r = 0; r < nc; r++)
+    {
+        gM.hRowPtrD[r + 1] += gM.hRowPtrD[r] + 1;
+    }
+
+    // 행 내 전역 열 오름차순 정렬 (AmgX 분산 업로드 요건) — 슬롯맵은
+    // 정렬 후 위치로 기록. 태그: 0=lower(f), 1=diag, 2=upper(f),
+    // 3=iface(k)
+    gM.hColIndD.assign(nnz, -1);
+    std::vector<int> diagSlot(nc), upSlot(nf), loSlot(nf),
+                     ifSlot(totF > 0 ? totF : 1), fill(nc, 0);
+    {
+        struct Ent { long long col; int tag; int idx; };
+        std::vector<Ent> ents(nnz);
+        std::vector<int> pos(nc, 0);
+        for (int r = 0; r < nc; r++) { pos[r] = gM.hRowPtrD[r]; }
+
+        for (int f = 0; f < nf; f++)      // lower: row=nei, col=own
+        {
+            const int r = gM.hNei[f];
+            ents[pos[r]++] = {rowOffset + gM.hOwn[f], 0, f};
+        }
+        for (int r = 0; r < nc; r++)      // diag
+        {
+            ents[pos[r]++] = {rowOffset + r, 1, r};
+        }
+        for (int f = 0; f < nf; f++)      // upper: row=own, col=nei
+        {
+            const int r = gM.hOwn[f];
+            ents[pos[r]++] = {rowOffset + gM.hNei[f], 2, f};
+        }
+        for (int k2 = 0; k2 < totF; k2++) // 인터페이스: 이웃 전역 열
+        {
+            const int r = gPar.hFc[k2];
+            ents[pos[r]++] = {ifaceCol[k2], 3, k2};
+        }
+
+        for (int r = 0; r < nc; r++)
+        {
+            std::sort
+            (
+                ents.begin() + gM.hRowPtrD[r],
+                ents.begin() + gM.hRowPtrD[r + 1],
+                [](const Ent& a, const Ent& b)
+                {
+                    return a.col < b.col;
+                }
+            );
+            for (int k = gM.hRowPtrD[r]; k < gM.hRowPtrD[r + 1]; k++)
+            {
+                gM.hColIndD[k] = ents[k].col;
+                switch (ents[k].tag)
+                {
+                    case 0: loSlot[ents[k].idx] = k; break;
+                    case 1: diagSlot[ents[k].idx] = k; break;
+                    case 2: upSlot[ents[k].idx] = k; break;
+                    default: ifSlot[ents[k].idx] = k; break;
+                }
+            }
+        }
+        (void)fill;
+    }
+
+    cudaError_t e;
+    struct { int** d; const int* s; size_t n; } it[] =
+    {
+        {&gM.dDiagSlotD, diagSlot.data(), (size_t)nc},
+        {&gM.dUpSlotD, upSlot.data(), (size_t)nf},
+        {&gM.dLoSlotD, loSlot.data(), (size_t)nf},
+        {&gM.dIfSlotD, ifSlot.data(), (size_t)(totF > 0 ? totF : 1)}
+    };
+    for (auto& i : it)
+    {
+        if (!*i.d)
+        {
+            if ((e = cudaMalloc(i.d, i.n*sizeof(int))) != cudaSuccess)
+                { int r = pfail(e, "peqn/csrD malloc"); csrFreeAll(); return r; }
+        }
+        if ((e = cudaMemcpy(*i.d, i.s, i.n*sizeof(int),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            { int r = pfail(e, "peqn/csrD H2D"); csrFreeAll(); return r; }
+    }
+    if (!gM.dValsD)
+    {
+        if ((e = cudaMalloc(&gM.dValsD, (size_t)nnz*sizeof(double)))
+            != cudaSuccess)
+            { int r = pfail(e, "peqn/csrD vals malloc"); csrFreeAll(); return r; }
+    }
+
+    gM.nnzD = nnz;
+    *nnzOut = nnz;
+    return 0;
+}
+
+
+const int* rgpPEqnCsrDistRowPtr(void) { return gM.hRowPtrD.data(); }
+const long long* rgpPEqnCsrDistColInd(void) { return gM.hColIndD.data(); }
+void* rgpPEqnDevValuesDist(void) { return gM.dValsD; }
+
+
 int rgpPEqnAssembleCsr
 (
     double dtInv, const double* rdtCell,
@@ -2800,6 +2970,89 @@ int rgpPEqnAssembleCsr
 }
 
 
+//- 분산 CSR 조립: LDU 조립 → dValsD 산포(diag/up/lo + 인터페이스 -bC)
+//  → OF 규약 normFactor/초기잔차 (전역 리덕션 — 병렬 pcg 경로와 동일).
+//  인터페이스 계수는 호출자가 rgpPEqnParCoeffs로 직전 업로드.
+int rgpPEqnAssembleCsrDist
+(
+    double dtInv, const double* rdtCell,
+    const double* srcCellExtra,
+    const double* rAUfInt,
+    const double* psis, const double* pOld, const double* p0,
+    const double* phiInt, const double* phiB,
+    const double* bDiag, const double* bSrc,
+    int needRef, int refCell, double refValue,
+    double* normFactor, double* initRes
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    if (gM.nnzD <= 0)
+    {
+        snprintf(gPErr, sizeof(gPErr), "peqn/csrD: not prepared");
+        return -1;
+    }
+
+    int rc = assemble(dtInv, rdtCell, rAUfInt, psis, pOld, phiInt, phiB,
+                      bDiag, bSrc, srcCellExtra, needRef, refCell,
+                      refValue);
+    if (rc) return rc;
+
+    // LDU → 분산 CSR 값 산포 (+ 인터페이스 오프대각)
+    rgppeqn::csrScatterDiag<<<nb(nc), BS>>>(nc, gM.dDiagSlotD, gB.diag,
+                                            gM.dValsD);
+    rgppeqn::csrScatterFace<<<nb(nf), BS>>>(nf, gM.dUpSlotD, gM.dLoSlotD,
+                                            gB.upper, gM.dValsD);
+    if (gPar.active && gPar.totF > 0)
+    {
+        rgppeqn::csrScatterIface<<<nb(gPar.totF), BS>>>
+            (gPar.totF, gM.dIfSlotD, gPar.bC, gM.dValsD);
+    }
+
+    cudaError_t e;
+    if ((e = cudaMemcpy(gB.x, p0, (size_t)nc*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "peqn/csrD H2D x0");
+
+    // OF normFactor + 초기 잔차 — rgpPEqnSolve의 병렬 규약 1:1
+    // (rowSum에 인터페이스 |bC| 포함, SpMV에 halo 기여, 전역 리덕션)
+    if ((e = cudaMemcpy(gB.rowSum, gB.diag, (size_t)nc*sizeof(double),
+                        cudaMemcpyDeviceToDevice)) != cudaSuccess)
+        return pfail(e, "peqn/csrD rowSum D2D");
+    rgppeqn::faceRowSum<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
+                                        gB.rowSum);
+    if (gPar.active && gPar.totF > 0)
+    {
+        rgppeqn::parRowSum<<<nb(gPar.totF), BS>>>
+            (gPar.totF, gPar.fc, gPar.bC, gB.rowSum);
+    }
+
+    if ((rc = pSpmv(nc, nf, gB.x, gB.wA))) return rc;
+    rgppeqn::residualInit<<<nb(nc), BS>>>(nc, gB.b, gB.wA, gB.rA);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "peqn/csrD launch");
+
+    double sumX = 0;
+    if ((rc = reduceHost(nc, 0, gB.x, nullptr, 0, nullptr, sumX))) return rc;
+    greduce(sumX);
+    const double xRef = sumX/(gPar.active ? gPar.gnCells : double(nc));
+    double nf1 = 0, nf2 = 0;
+    if ((rc = reduceHost(nc, 3, gB.wA, nullptr, xRef, gB.rowSum, nf1)))
+        return rc;
+    if ((rc = reduceHost(nc, 3, gB.b, nullptr, xRef, gB.rowSum, nf2)))
+        return rc;
+    greduce(nf1);
+    greduce(nf2);
+    *normFactor = nf1 + nf2 + 1e-20;
+
+    double res = 0;
+    if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res))) return rc;
+    greduce(res);
+    *initRes = res/(*normFactor);
+
+    return 0;
+}
+
+
 int rgpPEqnResidual(double normFactor, double* res)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
@@ -2814,6 +3067,7 @@ int rgpPEqnResidual(double normFactor, double* res)
     double r = 0;
     int rc;
     if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, r))) return rc;
+    greduce(r);
     *res = r/normFactor;
     return 0;
 }

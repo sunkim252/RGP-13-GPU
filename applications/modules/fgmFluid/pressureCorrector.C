@@ -61,6 +61,7 @@ Description
 #include "PstreamBuffers.H"
 #include "PstreamReduceOps.H"
 #include "gpu/rgpPEqnTypes.H"
+#include "gpu/rgpKernelTypes.H"
 
 #include <chrono>
 #include <dlfcn.h>
@@ -336,22 +337,6 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
             }
         }
     }
-    // CSR 구조는 amgx 직결 전용 — pcg의 무-atomics CSR SpMV는 이득 0으로
-    // 실측(e12d61a)돼 nnz(≈nc+2nf)×(8+4)B가 순수 VRAM 낭비(2.6M에서
-    // ~385MB; 6GB 카드 풀스택의 OOM 요인). pcg는 LDU 경로 사용.
-    gpuPEqnNnz_ = 0;
-    if (gpuPEqnSolver_ == "amgx")
-    {
-        int nnz = 0;
-        if (rgpPEqnCsrPrepare(&nnz))
-        {
-            FatalErrorInFunction
-                << "rgpPEqnCsrPrepare: " << rgpPEqnLastError()
-                << exit(FatalError);
-        }
-        gpuPEqnNnz_ = nnz;
-    }
-
     // ── 병렬: processor 패치 구조 아밍 (halo 교환 + 전역 리덕션) ──
     if (Pstream::parRun())
     {
@@ -388,6 +373,119 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
         gpuPEqnParB_.setSize(max(pFc.size(), label(1)));
         gpuPEqnParPhb_.setSize(max(pFc.size(), label(1)));
         gpuPEqnParRhof_.setSize(max(pFc.size(), label(1)));
+    }
+
+    // CSR 구조는 amgx 직결 전용 — pcg의 무-atomics CSR SpMV는 이득 0으로
+    // 실측(e12d61a)돼 nnz(≈nc+2nf)×(8+4)B가 순수 VRAM 낭비(2.6M에서
+    // ~385MB; 6GB 카드 풀스택의 OOM 요인). pcg는 LDU 경로 사용.
+    // 병렬은 분산 CSR: 전역 열(랭크 오프셋) + 인터페이스 오프대각 —
+    // 이웃 셀 전역 인덱스는 processor-면 순서로 교환 (ParArm 순서와
+    // 동일한 패치 순회).
+    gpuPEqnNnz_ = 0;
+    if (gpuPEqnSolver_ == "amgx")
+    {
+        int nnz = 0;
+        if (!Pstream::parRun())
+        {
+            if (rgpPEqnCsrPrepare(&nnz))
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnCsrPrepare: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+        }
+        else
+        {
+            // 파티션 오프셋 (전 랭크 셀 수 allgather)
+            List<label> allN(Pstream::nProcs(), label(0));
+            allN[Pstream::myProcNo()] = nc;
+            Pstream::gatherList(allN);
+            Pstream::scatterList(allN);
+            gpuPEqnPartOff_.setSize(Pstream::nProcs() + 1);
+            gpuPEqnPartOff_[0] = 0;
+            forAll(allN, r)
+            {
+                gpuPEqnPartOff_[r + 1] =
+                    gpuPEqnPartOff_[r] + allN[r];
+            }
+            const long long myOff =
+                gpuPEqnPartOff_[Pstream::myProcNo()];
+
+            // 이웃 셀 전역 열: 내 faceCells+오프셋을 보내고 상대 것을
+            // 받는다 (processor 패치 면 순서는 양측 일치)
+            label totF = 0;
+            forAll(p_.boundaryField(), patchi)
+            {
+                if (p_.boundaryField()[patchi].coupled())
+                {
+                    totF += p_.boundaryField()[patchi].size();
+                }
+            }
+            // 전역 인덱스는 scalar(double)로 교환 — OF 스트림에
+            // long long IO가 없고, 2^53 미만 정수는 double이 정확
+            List<long long> ifaceCol
+            (
+                max(totF, label(1)), static_cast<long long>(0)
+            );
+            if (totF > 0)
+            {
+                PstreamBuffers pBufs
+                (
+                    Pstream::commsTypes::nonBlocking
+                );
+                forAll(p_.boundaryField(), patchi)
+                {
+                    if (!p_.boundaryField()[patchi].coupled())
+                    {
+                        continue;
+                    }
+                    const processorFvPatch& pp =
+                        refCast<const processorFvPatch>
+                        (
+                            mesh.boundary()[patchi]
+                        );
+                    const labelUList& fc = pp.faceCells();
+                    List<scalar> sv(fc.size());
+                    forAll(fc, k)
+                    {
+                        sv[k] = scalar(myOff + fc[k]);
+                    }
+                    UOPstream toNbr(pp.neighbProcNo(), pBufs);
+                    toNbr << sv;
+                }
+                pBufs.finishedSends();
+                label offp = 0;
+                forAll(p_.boundaryField(), patchi)
+                {
+                    if (!p_.boundaryField()[patchi].coupled())
+                    {
+                        continue;
+                    }
+                    const processorFvPatch& pp =
+                        refCast<const processorFvPatch>
+                        (
+                            mesh.boundary()[patchi]
+                        );
+                    List<scalar> rv;
+                    UIPstream fromNbr(pp.neighbProcNo(), pBufs);
+                    fromNbr >> rv;
+                    forAll(rv, k)
+                    {
+                        ifaceCol[offp + k] =
+                            static_cast<long long>(rv[k]);
+                    }
+                    offp += rv.size();
+                }
+            }
+
+            if (rgpPEqnCsrPrepareDist(ifaceCol.begin(), myOff, &nnz))
+            {
+                FatalErrorInFunction
+                    << "rgpPEqnCsrPrepareDist: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+        }
+        gpuPEqnNnz_ = nnz;
     }
 
     gpuPEqnArmed_ = true;
@@ -955,12 +1053,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
 
         if (Pstream::parRun())
         {
-            if (gpuPEqnSolver_ != "pcg")
-            {
-                FatalErrorInFunction
-                    << "parallel gpuPEqn supports the pcg solver only"
-                    << exit(FatalError);
-            }
+            // amgx도 병렬 지원 (분산 CSR) — pcg 강제 가드 제거
             if (gpuPEqnCheck_)
             {
                 FatalErrorInFunction
@@ -1682,16 +1775,26 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 int, int, const int*, const int*,
                 void*, void*, void*, int, int, int*
             );
+            typedef int (*AmgxFnD)
+            (
+                long long, int, int, const int*, const long long*,
+                void*, void*, void*, const long long*, int, int,
+                int, int, int*
+            );
             typedef const char* (*AmgxErrFn)(void);
             static AmgxFn amgxFn = nullptr;
+            static AmgxFnD amgxFnD = nullptr;
             static AmgxErrFn amgxErrFn = nullptr;
-            if (!amgxFn)
+            const bool par = Pstream::parRun();
+            if (!amgxErrFn)
             {
                 amgxFn = reinterpret_cast<AmgxFn>
                     (dlsym(RTLD_DEFAULT, "rgpPEqnAmgxSolve"));
+                amgxFnD = reinterpret_cast<AmgxFnD>
+                    (dlsym(RTLD_DEFAULT, "rgpPEqnAmgxSolveDist"));
                 amgxErrFn = reinterpret_cast<AmgxErrFn>
                     (dlsym(RTLD_DEFAULT, "rgpPEqnAmgxErr"));
-                if (!amgxFn || !amgxErrFn)
+                if (!amgxErrFn || (!par && !amgxFn) || (par && !amgxFnD))
                 {
                     FatalErrorInFunction
                         << "gpuPEqnSolver amgx requires libRGP13amgx.so "
@@ -1701,22 +1804,44 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             }
 
             double normFactor = 0;
-            int rc = rgpPEqnAssembleCsr
+            int rc =
             (
-                dtInv, rdtCell, srcExtraArg,
-                devChain ? nullptr : trAUf().primitiveField().begin(),
-                devChain ? nullptr : tpsis().primitiveField().begin(),
-                p.oldTime().primitiveField().begin(),
-                p.primitiveField().begin(),
-                devChain ? nullptr : tphiHbyAv().primitiveField().begin(),
-                phiBA, bDiagA, bSrcA,
-                needRef, refCell, refValue,
-                &normFactor, &res0
+                par
+              ? rgpPEqnAssembleCsrDist
+                (
+                    dtInv, rdtCell, srcExtraArg,
+                    devChain ? nullptr
+                  : trAUf().primitiveField().begin(),
+                    devChain ? nullptr
+                  : tpsis().primitiveField().begin(),
+                    p.oldTime().primitiveField().begin(),
+                    p.primitiveField().begin(),
+                    devChain ? nullptr
+                  : tphiHbyAv().primitiveField().begin(),
+                    phiBA, bDiagA, bSrcA,
+                    needRef, refCell, refValue,
+                    &normFactor, &res0
+                )
+              : rgpPEqnAssembleCsr
+                (
+                    dtInv, rdtCell, srcExtraArg,
+                    devChain ? nullptr
+                  : trAUf().primitiveField().begin(),
+                    devChain ? nullptr
+                  : tpsis().primitiveField().begin(),
+                    p.oldTime().primitiveField().begin(),
+                    p.primitiveField().begin(),
+                    devChain ? nullptr
+                  : tphiHbyAv().primitiveField().begin(),
+                    phiBA, bDiagA, bSrcA,
+                    needRef, refCell, refValue,
+                    &normFactor, &res0
+                )
             );
             if (rc)
             {
                 FatalErrorInFunction
-                    << "rgpPEqnAssembleCsr: " << rgpPEqnLastError()
+                    << "rgpPEqnAssembleCsr(Dist): " << rgpPEqnLastError()
                     << exit(FatalError);
             }
 
@@ -1737,6 +1862,29 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             for (int round = 0; round < maxRounds && resF >= target; round++)
             {
                 int it = 0;
+                if (par)
+                {
+                    // 분산: 랭크→디바이스 매핑은 thermo 아밍과 동일
+                    const int nDev = max(rgpGpuDeviceCount(), 1);
+                    rc = amgxFnD
+                    (
+                        (long long)
+                        gpuPEqnPartOff_[Pstream::nProcs()],
+                        nc, gpuPEqnNnz_,
+                        rgpPEqnCsrDistRowPtr(),
+                        rgpPEqnCsrDistColInd(),
+                        rgpPEqnDevValuesDist(),
+                        rgpPEqnDevB(), rgpPEqnDevX(),
+                        gpuPEqnPartOff_.begin(),
+                        Pstream::nProcs(),
+                        Pstream::myProcNo() % nDev,
+                        round == 0 ? 1 : 0,
+                        setupInterval,
+                        &it
+                    );
+                }
+                else
+                {
                 rc = amgxFn
                 (
                     nc, gpuPEqnNnz_,
@@ -1746,6 +1894,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     setupInterval,        // 압력 솔브 횟수 기준으로 센다
                     &it
                 );
+                }
                 if (rc)
                 {
                     FatalErrorInFunction

@@ -55,6 +55,17 @@ class gpuChemistryModel
         //- grow-only 호스트 gather/scatter 버퍼
         mutable List<double> pB_, TB_, cB_, dtB_;
 
+        //- 랭크 간 화학 부하균형(DLB): 직전 스텝 셀별 substep 비용으로
+        //  과부하 랭크의 최고비용 셀을 저부하 랭크로 이송·적분·회수.
+        //  셀별 적분은 독립·결정론이라 결과 비트-보존. (gpuCoeffs:
+        //  dlb on/off, dlbThreshold — maxLoad > thr*avg일 때만 발동)
+        bool dlb_;
+        scalar dlbThreshold_;
+        mutable List<long long> dlbCost_;
+
+        //- DLB 배치 스테이징 (컴팩트 [retained|imported] 레이아웃)
+        mutable List<double> pC_, TC_, cC_, dtC_;
+
 
     // Private Member Functions
 
