@@ -17,6 +17,7 @@
 #include "fvcGrad.H"
 #include "snGradScheme.H"
 #include "surfaceInterpolate.H"
+#include "surfaceInterpolationScheme.H"
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
 #include "processorFvPatch.H"
@@ -130,6 +131,23 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
     // CPU 규약: fvMatrix 생성자의 BC updateCoeffs() 상응 (phi 의존
     // BC의 valueFraction 갱신 — 직접 조립 경로 필수)
     U.boundaryFieldRef().updateCoeffs();
+
+    // ── div(phi,U) 가중치: CPU 스킴(limitedLinearV) 자체로 계산해
+    //    업로드 — 디바이스 자체 계산은 컴파일러 FMA 축약의 ULP 차이로
+    //    평탄 필드에서 리미터의 이산 결정이 뒤집힐 수 있다(h-수송
+    //    ULP-플립과 동일 클래스) — 호스트 계산이 유일한 비트-일치
+    //    경로. coupled proc-면 가중치도 스킴이 함께 산출 ──
+    tmp<surfaceScalarField> twU;
+    {
+        ITstream& is = mesh.schemes().div("div(phi,U)");
+        is.rewind();
+        const word gaussName(is);   // "Gauss" 소비
+        twU = surfaceInterpolationScheme<vector>::New
+        (
+            mesh, phi, is
+        )().weights(U);
+    }
+    const surfaceScalarField& wU = twU();
 
     const volScalarField muEff(rho*momentumTransport->nuEff());
 
@@ -277,53 +295,12 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
                     }
                 }
 
-                const scalarField cdw
-                (
-                    mesh.surfaceInterpolation::weights()
-                        .boundaryField()[patchi]
-                );
-                const scalarField& phb = phi.boundaryField()[patchi];
-                const vectorField pd(mesh.boundary()[patchi].delta());
-                const vectorField Uo(pp.patchInternalField());
-
+                // proc-면 가중치: CPU 스킴이 산출한 coupled 면 가중치
+                // 그대로 (수제 리미터 재현 은퇴 — ULP 방어)
+                const scalarField& wUb = wU.boundaryField()[patchi];
                 for (label f = 0; f < np; f++)
                 {
-                    const label j = offp + f;
-                    vector gfv;
-                    scalar gradf = 0;
-                    for (label k = 0; k < 3; k++)
-                    {
-                        gfv[k] = pp[f][k] - Uo[f][k];
-                        gradf += gfv[k]*gfv[k];
-                    }
-                    scalar gradcf = 0;
-                    for (label k = 0; k < 3; k++)
-                    {
-                        scalar gcfk = 0;
-                        for (label i = 0; i < 3; i++)
-                        {
-                            const scalar g =
-                                (phb[f] > 0)
-                              ? bGrad9[(3*i + k)*nbf + off + f]
-                              : gradN9[(3*i + k)*nPar + j];
-                            gcfk += pd[f][i]*g;
-                        }
-                        gradcf += gfv[k]*gcfk;
-                    }
-                    scalar r;
-                    if (mag(gradcf) >= 1000.0*mag(gradf))
-                    {
-                        r = 2.0*1000.0*sign(gradcf)*sign(gradf) - 1.0;
-                    }
-                    else
-                    {
-                        r = 2.0*(gradcf/gradf) - 1.0;
-                    }
-                    const scalar lim =
-                        max(min(2.0*r, scalar(1)), scalar(0));
-                    wPar[j] =
-                        lim*cdw[f]
-                      + (1.0 - lim)*((phb[f] >= 0) ? 1.0 : 0.0);
+                    wPar[offp + f] = wUb[f];
                 }
                 offp += np;
             }
@@ -639,8 +616,10 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
           : nullptr,
             rho.primitiveField().begin(),
             rho.oldTime().primitiveField().begin(),
-            U3old, nullptr, nullptr, nullptr, nullptr,
-            nullptr,
+            U3old, nullptr /*U3: 디바이스 상주*/,
+            nullptr /*phi*/,
+            wU.primitiveField().begin() /*w: 호스트 CPU-스킴 가중치*/,
+            nullptr /*mu*/, nullptr /*srcExp3*/,
             useSrcX ? srcX3 : nullptr,
             buoyancy.valid() ? nF3 : nullptr,
             bDiag3, bSrc3, solveCmpt,
