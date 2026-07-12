@@ -30,6 +30,8 @@
 #include "solutionControl.H"
 #include "localEulerDdtScheme.H"
 #include "processorFvPatchFields.H"
+#include "processorFvPatch.H"
+#include "PstreamBuffers.H"
 #include "gpu/rgpPEqnTypes.H"
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
@@ -449,14 +451,40 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
         // 디바이스 패스트패스 (fgmFluid 1:1 — 경계만 호스트)
         const surfaceScalarField A(rhorAUf*mesh.magSf());
 
+        // 경계 배열 (fgmFluid 1:1): pBF = 면 보간값(coupled: λ·pI +
+        // (1−λ)·pN), pBN = 패치값(MD min/max용, 병렬만)
+        const bool par = Pstream::parRun();
         List<double> pBF(max(nbf, label(1)), 0.0);
+        List<double> pBN(par ? max(nbf, label(1)) : 0, 0.0);
         {
             label off = 0;
             forAll(solveP.boundaryField(), patchi)
             {
                 const fvPatchScalarField& pp =
                     solveP.boundaryField()[patchi];
-                forAll(pp, k) { pBF[off + k] = pp[k]; }
+                if (pp.coupled())
+                {
+                    const scalarField lam
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField pI(pp.patchInternalField());
+                    forAll(pp, k)
+                    {
+                        pBF[off + k] =
+                            lam[k]*pI[k] + (1.0 - lam[k])*pp[k];
+                        if (par) { pBN[off + k] = pp[k]; }
+                    }
+                }
+                else
+                {
+                    forAll(pp, k)
+                    {
+                        pBF[off + k] = pp[k];
+                        if (par) { pBN[off + k] = pp[k]; }
+                    }
+                }
                 off += pp.size();
             }
         }
@@ -465,6 +493,7 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
         const int rcP = rgpPEqnNOCorrPrep
         (
             solveP.primitiveField().begin(), pBF.begin(),
+            par ? pBN.begin() : nullptr,
             A.primitiveField().begin(),
             gpuNOKf3_.begin(),
             gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
@@ -486,47 +515,171 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
         if (gpuNOSrcDev_)
         {
 
-        List<double> cfB(max(nbf, label(1)), 0.0);
-        const surfaceVectorField& kf = mesh.nonOrthCorrectionVectors();
+        // 병렬: coupled 면 interp(grad)용 이웃 경계셀 grad halo 교환
+        label nParF = 0;
+        if (par)
         {
+            forAll(solveP.boundaryField(), patchi)
+            {
+                if (solveP.boundaryField()[patchi].coupled())
+                {
+                    nParF += solveP.boundaryField()[patchi].size();
+                }
+            }
+        }
+        List<vector> gradN(max(nParF, label(1)), Zero);
+        if (nParF > 0)
+        {
+            PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
             label off = 0;
             forAll(solveP.boundaryField(), patchi)
             {
                 const fvPatchScalarField& pp =
                     solveP.boundaryField()[patchi];
                 const label np = pp.size();
-                if (np == 0) continue;
-                const vectorField nHat(mesh.boundary()[patchi].nf());
-                const scalarField snG(pp.snGrad());
-                const vectorField& kfb = kf.boundaryField()[patchi];
-                const scalarField& Ab = A.boundaryField()[patchi];
-                for (label k = 0; k < np; k++)
+                if (pp.coupled())
                 {
-                    const vector gI
-                    (
-                        bG3[off + k],
-                        bG3[nbf + off + k],
-                        bG3[2*nbf + off + k]
-                    );
-                    const vector gradB
-                    (
-                        gI + nHat[k]*(snG[k] - (nHat[k] & gI))
-                    );
-                    const scalar corrB = kfb[k] & gradB;
-                    scalar lim = 1.0;
-                    if (gpuNOLimitCoeff_ >= 0)
-                    {
-                        lim = min
+                    const processorFvPatch& prp =
+                        refCast<const processorFvPatch>
                         (
-                            gpuNOLimitCoeff_*mag(snG[k])
-                           /(
-                                (1.0 - gpuNOLimitCoeff_)*mag(corrB)
-                              + small
-                            ),
-                            scalar(1)
+                            mesh.boundary()[patchi]
+                        );
+                    List<vector> sv(np);
+                    for (label k = 0; k < np; k++)
+                    {
+                        sv[k] = vector
+                        (
+                            bG3[off + k],
+                            bG3[nbf + off + k],
+                            bG3[2*nbf + off + k]
                         );
                     }
-                    cfB[off + k] = Ab[k]*(lim*corrB);
+                    UOPstream toNbr(prp.neighbProcNo(), pBufs);
+                    toNbr << sv;
+                }
+                off += np;
+            }
+            pBufs.finishedSends();
+            off = 0;
+            label offp = 0;
+            forAll(solveP.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pp =
+                    solveP.boundaryField()[patchi];
+                const label np = pp.size();
+                if (pp.coupled())
+                {
+                    const processorFvPatch& prp =
+                        refCast<const processorFvPatch>
+                        (
+                            mesh.boundary()[patchi]
+                        );
+                    List<vector> rv;
+                    UIPstream fromNbr(prp.neighbProcNo(), pBufs);
+                    fromNbr >> rv;
+                    for (label k = 0; k < np; k++)
+                    {
+                        gradN[offp + k] = rv[k];
+                    }
+                    offp += np;
+                }
+                off += np;
+            }
+        }
+
+        List<double> cfB(max(nbf, label(1)), 0.0);
+        const surfaceVectorField& kf = mesh.nonOrthCorrectionVectors();
+        {
+            label off = 0;
+            label offp = 0;
+            forAll(solveP.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pp =
+                    solveP.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+                const vectorField& kfb = kf.boundaryField()[patchi];
+                const scalarField& Ab = A.boundaryField()[patchi];
+
+                if (pp.coupled())
+                {
+                    const scalarField lam
+                    (
+                        mesh.surfaceInterpolation::weights()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField pdcb
+                    (
+                        mesh.nonOrthDeltaCoeffs()
+                            .boundaryField()[patchi]
+                    );
+                    const scalarField pI(pp.patchInternalField());
+                    for (label k = 0; k < np; k++)
+                    {
+                        const vector gI
+                        (
+                            bG3[off + k],
+                            bG3[nbf + off + k],
+                            bG3[2*nbf + off + k]
+                        );
+                        const vector gradF
+                        (
+                            lam[k]*gI + (1.0 - lam[k])*gradN[offp + k]
+                        );
+                        const scalar corrB = kfb[k] & gradF;
+                        const scalar snGb = pdcb[k]*(pp[k] - pI[k]);
+                        scalar lim = 1.0;
+                        if (gpuNOLimitCoeff_ >= 0)
+                        {
+                            lim = min
+                            (
+                                gpuNOLimitCoeff_*mag(snGb)
+                               /(
+                                    (1.0 - gpuNOLimitCoeff_)
+                                   *mag(corrB) + small
+                                ),
+                                scalar(1)
+                            );
+                        }
+                        cfB[off + k] = Ab[k]*(lim*corrB);
+                    }
+                    offp += np;
+                }
+                else
+                {
+                    const vectorField nHat
+                    (
+                        mesh.boundary()[patchi].nf()
+                    );
+                    const scalarField snG(pp.snGrad());
+                    for (label k = 0; k < np; k++)
+                    {
+                        const vector gI
+                        (
+                            bG3[off + k],
+                            bG3[nbf + off + k],
+                            bG3[2*nbf + off + k]
+                        );
+                        const vector gradB
+                        (
+                            gI + nHat[k]*(snG[k] - (nHat[k] & gI))
+                        );
+                        const scalar corrB = kfb[k] & gradB;
+                        scalar lim = 1.0;
+                        if (gpuNOLimitCoeff_ >= 0)
+                        {
+                            lim = min
+                            (
+                                gpuNOLimitCoeff_*mag(snG[k])
+                               /(
+                                    (1.0 - gpuNOLimitCoeff_)
+                                   *mag(corrB) + small
+                                ),
+                                scalar(1)
+                            );
+                        }
+                        cfB[off + k] = Ab[k]*(lim*corrB);
+                    }
                 }
                 off += np;
             }

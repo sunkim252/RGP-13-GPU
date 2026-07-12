@@ -283,7 +283,13 @@ int rgpPEqnNOArm
 int rgpSTDvecRelease(void);
 int rgpPEqnNOCorrPrep
 (
-    const double* pCell, const double* pBFace, const double* gMsf,
+    const double* pCell,
+    const double* pBFace,       /* [nbf] 경계 면 보간값 (coupled =
+                                   λ·pI+(1−λ)·pN — interpolate 규약) */
+    const double* pBNei,        /* [nbf] 경계 패치값 (coupled = 이웃
+                                   셀값) — MD min/max용. null = 직렬
+                                   (pBFace와 동일)                    */
+    const double* gMsf,
     const double* kf3,          /* [3*nf] 비직교 보정 벡터 (매 패스) */
     const double* Cf3,          /* [3*nf] 면 중심 (mdK>=0일 때 필수) */
     double limitCoeff, double* bGrad3Out

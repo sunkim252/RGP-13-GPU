@@ -1572,7 +1572,10 @@ __global__ void noMDMinMax
     const int nc, const int nf,
     const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
     const int* __restrict__ own, const int* __restrict__ nei,
-    const double* __restrict__ x, const double* __restrict__ pBF,
+    const double* __restrict__ x,
+    const double* __restrict__ pBF,   // 경계 min/max 기여: 패치값
+                                      // (coupled=이웃 셀값 — 면 보간값
+                                      // 아님; CPU cellLimitedGrad 1:1)
     const double rk,   // (1/k − 1); k>=1이면 0
     double* __restrict__ maxV, double* __restrict__ minV
 )
@@ -3367,7 +3370,8 @@ int rgpSTDvecRelease(void)
 //  경계셀 grad D2H (호스트가 gaussGrad 경계보정·corr_b·limiter_b 계산)
 int rgpPEqnNOCorrPrep
 (
-    const double* pCell, const double* pBFace, const double* gMsf,
+    const double* pCell, const double* pBFace, const double* pBNei,
+    const double* gMsf,
     const double* kf3, const double* Cf3,
     double limitCoeff, double* bGrad3Out
 )
@@ -3387,6 +3391,16 @@ int rgpPEqnNOCorrPrep
     const double* dPBF = nbf > 0
         ? rgpInPtr(pBFace, gST.bPsi, (size_t)nbf, &e) : gST.bPsi;
     if (e != cudaSuccess) return pfail(e, "noCorr/H2D pBF");
+    // 병렬: min/max 경계 기여는 면 보간값이 아니라 패치값(coupled=이웃
+    // 셀값) — 별도 배열. null이면 직렬(둘이 동일) → dPBF 재사용.
+    // 스테이지는 gNO.bCorr (Finish의 bCorr 업로드가 minmax 소비 후라
+    // 안전)
+    const double* dPBN = dPBF;
+    if (pBNei && nbf > 0)
+    {
+        dPBN = rgpInPtr(pBNei, gNO.bCorr, (size_t)nbf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/H2D pBN");
+    }
     const double* dGMsf = rgpInPtr(gMsf, gB.rAUf, (size_t)nf, &e);
     if (e != cudaSuccess) return pfail(e, "noCorr/H2D gMsf");
 
@@ -3446,7 +3460,7 @@ int rgpPEqnNOCorrPrep
         const double rk = (gNO.mdK < 1.0) ? (1.0/gNO.mdK - 1.0) : 0.0;
         rgppeqn::noMDMinMax<<<nb(nc), BS>>>
             (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gM.own, gM.nei,
-             dP2, dPBF, rk, gST.rA0, gST.sA);
+             dP2, dPBN, rk, gST.rA0, gST.sA);
         rgppeqn::noMDLimit<<<nb(nc), BS>>>
             (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
              dCfx, dCfy, dCfz, dC3, gNO.CfB3, gST.rA0, gST.sA,

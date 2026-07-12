@@ -227,7 +227,7 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
     // corrected/limited-corrected snGrad + Gauss linear grad(p) + 직렬;
     // 부적격/VRAM 부족이면 호스트 fvc 경로 유지)
     gpuNOSrcDev_ = false;
-    if (gpuNonOrtho_ && !Pstream::parRun())
+    if (gpuNonOrtho_)
     {
         scalar lc = -1;
         bool devOK = false;
