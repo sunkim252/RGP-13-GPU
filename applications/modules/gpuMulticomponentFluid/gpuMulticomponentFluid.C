@@ -304,16 +304,7 @@ void Foam::solvers::gpuMulticomponentFluid::checkGpuGuards
     const volScalarField& f
 ) const
 {
-    if
-    (
-        mesh.solution().relaxEquation(f.name())
-     && mesh.solution().equationRelaxationFactor(f.name()) != 1
-    )
-    {
-        FatalErrorInFunction
-            << "gpuYEqn/gpuEEqn (v1) do not support equation relaxation "
-            << "on " << f.name() << exit(FatalError);
-    }
+    // 방정식 완화는 지원 (rgpSTEqnSolve의 디바이스 fvMatrix::relax 1:1)
     if (fvModels().addsSupToField(f.name()))
     {
         FatalErrorInFunction

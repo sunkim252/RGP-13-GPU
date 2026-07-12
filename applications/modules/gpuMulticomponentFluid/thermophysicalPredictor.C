@@ -82,15 +82,40 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
         srcEff += tCorrDiv().primitiveField();
     }
 
+    // 방정식 완화 (fvMatrix::relaxationFactor() 1:1): final 이터레이션에
+    // "<name>Final" 항목이 있으면 그것, 없으면 평이름으로 fallback,
+    // 둘 다 없으면 완화 없음 — UEqn과 동일하게 α==1은 스킵
+    // (relax(1)의 대각지배 클램프까지는 재현하지 않음)
+    scalar relaxAlpha = -1;
+    {
+        const word fname(psiF.name() + "Final");
+        if
+        (
+            solutionControl::finalIteration(mesh)
+         && mesh.solution().relaxEquation(fname)
+        )
+        {
+            relaxAlpha = mesh.solution().equationRelaxationFactor(fname);
+        }
+        else if (mesh.solution().relaxEquation(psiF.name()))
+        {
+            relaxAlpha =
+                mesh.solution().equationRelaxationFactor(psiF.name());
+        }
+        if (relaxAlpha == 1) { relaxAlpha = -1; }
+    }
+
     label nbf = 0;
     forAll(psiF.boundaryField(), patchi)
     {
         nbf += psiF.boundaryField()[patchi].size();
     }
-    gpuBuf_.setSize(3*nbf);
+    gpuBuf_.setSize(relaxAlpha > 0 ? 6*nbf : 3*nbf);
     double* bDiagA = gpuBuf_.begin();
     double* bSrcA = bDiagA + nbf;
     double* bPsiA = bSrcA + nbf;
+    // relax 경계 배열 [add|rem|soff] (fvMatrix::relax 경계 취급 1:1)
+    double* bRelaxA = relaxAlpha > 0 ? bPsiA + nbf : nullptr;
 
     label off = 0;
     label offPar = 0;
@@ -229,6 +254,45 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
             << exit(FatalError);
     }
 
+    // relax 경계 배열: uncoupled add=|iC|/rem=iC, coupled add=rem=iC·
+    // soff=|bC| (fvMatrix::relax의 cmptMax(cmptMag)/cmptMin/component
+    // 스칼라 특수화)
+    if (relaxAlpha > 0)
+    {
+        label off2 = 0;
+        label offp2 = 0;
+        forAll(psiF.boundaryField(), patchi)
+        {
+            const fvPatchScalarField& pp = psiF.boundaryField()[patchi];
+            const label np = pp.size();
+            if (np == 0) continue;
+
+            if (pp.coupled())
+            {
+                for (label k = 0; k < np; k++)
+                {
+                    const scalar iC = bDiagA[off2 + k];
+                    bRelaxA[off2 + k] = iC;
+                    bRelaxA[nbf + off2 + k] = iC;
+                    bRelaxA[2*nbf + off2 + k] =
+                        mag(gpuParB_[offp2 + k]);
+                }
+                offp2 += np;
+            }
+            else
+            {
+                for (label k = 0; k < np; k++)
+                {
+                    const scalar iC = bDiagA[off2 + k];
+                    bRelaxA[off2 + k] = mag(iC);
+                    bRelaxA[nbf + off2 + k] = iC;
+                    bRelaxA[2*nbf + off2 + k] = 0.0;
+                }
+            }
+            off2 += np;
+        }
+    }
+
     // fvMatrix::solve(word) 규약: transient 최종 이터레이션 → "Final"
     const dictionary& sd = mesh.solution().solverDict
     (
@@ -262,6 +326,7 @@ void Foam::solvers::gpuMulticomponentFluid::solveScalarGpu
             sp.begin(),
             srcEff.begin(),
             bPsiA, bDiagA, bSrcA,
+            relaxAlpha, bRelaxA,
             tol, rtol, maxIter,
             psiF.primitiveFieldRef().begin(),
             &res0, &resF, &nIter
@@ -366,6 +431,27 @@ void Foam::solvers::gpuMulticomponentFluid::thermophysicalPredictor()
 
     reaction->correct();
 
+    // 검증행렬용 완화 계수 (solveScalarGpu 내부와 동일 규약 —
+    // fvMatrix::relaxationFactor()의 Final→평이름 fallback)
+    auto eqRelax = [&](const volScalarField& f) -> scalar
+    {
+        scalar ra = -1;
+        const word fname(f.name() + "Final");
+        if
+        (
+            solutionControl::finalIteration(mesh)
+         && mesh.solution().relaxEquation(fname)
+        )
+        {
+            ra = mesh.solution().equationRelaxationFactor(fname);
+        }
+        else if (mesh.solution().relaxEquation(f.name()))
+        {
+            ra = mesh.solution().equationRelaxationFactor(f.name());
+        }
+        return ra == 1 ? -1 : ra;
+    };
+
     // ── Y 배치 ──────────────────────────────────────────────────────
     // unityLewis*: divj의 DEff = kappa/Cp (에너지 형식 무관),
     // divq의 alphahe = kappa/Cpv (h→Cp, e→Cv) — 모델 구현 1:1.
@@ -439,6 +525,9 @@ void Foam::solvers::gpuMulticomponentFluid::thermophysicalPredictor()
                   - tR()
                 )
             );
+            // 디바이스 relax는 솔브-전 ψ 기준 — CPU도 같은 시점에 적용
+            const scalar ra = eqRelax(Yi);
+            if (ra > 0) { tChk.ref().relax(ra); }
         }
 
         solveScalarGpu
@@ -642,6 +731,8 @@ void Foam::solvers::gpuMulticomponentFluid::thermophysicalPredictor()
                   + thermophysicalTransport->divq(he)
                 )
             );
+            const scalar ra = eqRelax(he);
+            if (ra > 0) { tChkE.ref().relax(ra); }
         }
 
         solveScalarGpu

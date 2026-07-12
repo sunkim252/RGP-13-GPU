@@ -244,6 +244,13 @@ int rgpSTEqnSolve
     const double* spCell,
     const double* srcCell, const double* bPsi,
     const double* bDiag, const double* bSrc,
+    double relaxAlpha,         /* >0 이면 fvMatrix::relax(alpha) 1:1을
+                                  경계 폴드 전(=CPU의 iC 분리 상태)에
+                                  디바이스 수행. bRelaxA = [add|rem|soff]
+                                  각 [nbf] 연접 — uncoupled: |iC|/iC/0,
+                                  coupled: iC/iC/|bC| (호스트 계산).
+                                  S += (D−D0)·ψ현재(p0).               */
+    const double* bRelaxA,
     double tol, double relTol, int maxIter,
     double* psiOut,
     double* initRes, double* finalRes, int* nIters

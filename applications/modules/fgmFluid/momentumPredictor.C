@@ -124,16 +124,26 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         // no-op relax, 다른 필드의 모델, 필드-레벨 제약은 무해하므로 허용)
         // 방정식 완화: fvMatrix::relax(alpha) 1:1을 디바이스에서 수행
         // (rgpUEqnSolve relaxAlpha/bRelax3 — 완화된 행렬이 pCorr의
-        // rAU/H에도 그대로 흘러가는 CPU 규약 유지)
+        // rAU/H에도 그대로 흘러가는 CPU 규약 유지). 계수는
+        // relaxationFactor()의 "<name>Final"→평이름 fallback (α==1 스킵)
         scalar relaxAlpha = -1;
-        if
-        (
-            mesh.solution().relaxEquation(U.name())
-         && mesh.solution().equationRelaxationFactor(U.name()) != 1
-        )
         {
-            relaxAlpha =
-                mesh.solution().equationRelaxationFactor(U.name());
+            const word fname(U.name() + "Final");
+            if
+            (
+                solutionControl::finalIteration(mesh)
+             && mesh.solution().relaxEquation(fname)
+            )
+            {
+                relaxAlpha =
+                    mesh.solution().equationRelaxationFactor(fname);
+            }
+            else if (mesh.solution().relaxEquation(U.name()))
+            {
+                relaxAlpha =
+                    mesh.solution().equationRelaxationFactor(U.name());
+            }
+            if (relaxAlpha == 1) { relaxAlpha = -1; }
         }
         if (fvModels().addsSupToField(U.name()))
         {

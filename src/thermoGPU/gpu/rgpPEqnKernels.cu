@@ -1404,6 +1404,52 @@ __global__ void uRelaxCell
     }
 }
 
+//- ③' 스칼라판 relax (fvMatrix::relax 1:1, 결정론적 게더판): ST 수송
+//  방정식용 — 경계 폴드 전 diag에 적용, b += (D−D0)·ψ현재.
+//  셀-면 CSR로 셀별 누적 순서가 CPU(sumMagOffDiag 내부면 오름차순 →
+//  패치 순 경계 기여)와 동일해 비트 재현 — atomicAdd판은 ±1ulp
+//  순서 노이즈가 솔버 이터레이트 드리프트로 증폭된다(SandiaD 실측).
+//  brA = [add|rem|soff] 각 [nbf]: uncoupled |iC|/iC/0, coupled
+//  iC/iC/|bC|; CSR 경계 코드 k = 연접 경계면 인덱스 = brA 인덱스.
+__global__ void stRelaxCellGather
+(
+    const int nc, const int nf, const int nbf,
+    const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
+    const double* __restrict__ upper, const double* __restrict__ lower,
+    const double* __restrict__ brA,
+    const double alpha, const double* __restrict__ psi,
+    double* __restrict__ diag, double* __restrict__ b
+)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    double sumOff = 0.0, bAdd = 0.0, bRem = 0.0;
+    for (int j = cfPtr[c]; j < cfPtr[c + 1]; j++)
+    {
+        const int code = cfIdx[j];
+        const int idx = code >> 1;
+        if (idx < nf)
+        {
+            // CPU sumMagOffDiag: owner += |upper|, neighbour += |lower|
+            sumOff += (code & 1) ? fabs(lower[idx]) : fabs(upper[idx]);
+        }
+        else
+        {
+            const int k = idx - nf;
+            bAdd += brA[k];
+            bRem += brA[(size_t)nbf + k];
+            sumOff += brA[(size_t)2*nbf + k];
+        }
+    }
+    const double D0 = diag[c];
+    double D = D0 + bAdd;
+    D = fmax(fabs(D), sumOff);
+    D /= alpha;
+    D -= bRem;
+    diag[c] = D;
+    b[c] += (D - D0)*psi[c];
+}
+
 //- 솔브 전용 소스: workB += s*g*V (grad p는 저장 소스가 아니라
 //  solve(UEqn == -grad p)의 임시 소스 — H()에 포함되면 안 됨)
 __global__ void uAddVolSrc
@@ -2781,6 +2827,7 @@ int rgpSTEqnSolve
     const double* gammaFace, const double* spCell,
     const double* srcCell, const double* bPsi,
     const double* bDiag, const double* bSrc,
+    double relaxAlpha, const double* bRelaxA,
     double tol, double relTol, int maxIter,
     double* psiOut,
     double* initRes, double* finalRes, int* nIters
@@ -2828,6 +2875,40 @@ int rgpSTEqnSolve
         (nf, gM.own, gM.nei, gST.phi, gST.wLim, gSTM.wLin, gST.gamma,
          gammaFace ? gB.rAUf : nullptr,
          gM.gg, gB.diag, gB.upper, gST.lower);
+
+    // ── fvMatrix::relax(alpha) 1:1 — CPU 규약대로 경계 폴드 전
+    //    (iC 분리 상태의 diag)에서 수행. ψ현재 = gB.x(p0 업로드본).
+    //    셀-면 CSR 결정론적 게더(비트 재현). rlxB 버퍼는 UEqn relax와
+    //    공유 (ST와 UEqn 솔브는 동시 진행되지 않음) ──
+    if (relaxAlpha > 0.0 && bRelaxA)
+    {
+        if (!gSTM.cfPtr)
+        {
+            snprintf(gPErr, sizeof(gPErr),
+                     "steqn: gather CSR unavailable for relax");
+            return -1;
+        }
+        if (!gU.rlxB && nbf > 0)
+        {
+            if ((e = cudaMalloc(&gU.rlxB,
+                                (size_t)3*nbf*sizeof(double)))
+                != cudaSuccess) return pfail(e, "steqn/relaxB malloc");
+        }
+        if (nbf > 0)
+        {
+            if ((e = cudaMemcpy(gU.rlxB, bRelaxA,
+                                (size_t)3*nbf*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "steqn/relaxB H2D");
+        }
+        rgppeqn::stRelaxCellGather<<<nb(nc), BS>>>
+            (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
+             gB.upper, gST.lower, gU.rlxB,
+             relaxAlpha, gB.x, gB.diag, gB.b);
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return pfail(e, "steqn/relax launch");
+    }
+
     if (nbf > 0)
     {
         rgppeqn::stBFaceAssemble<<<nb(nbf), BS>>>

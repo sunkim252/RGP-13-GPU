@@ -35,15 +35,25 @@ void Foam::solvers::gpuMulticomponentFluid::momentumPredictor()
 
     volVectorField& U(U_);
 
-    // 방정식 완화: fvMatrix::relax(alpha) 1:1 디바이스 수행
+    // 방정식 완화: fvMatrix::relax(alpha) 1:1 디바이스 수행 — 계수는
+    // relaxationFactor()의 "<name>Final"→평이름 fallback 규약 (α==1 스킵)
     scalar relaxAlpha = -1;
-    if
-    (
-        mesh.solution().relaxEquation(U.name())
-     && mesh.solution().equationRelaxationFactor(U.name()) != 1
-    )
     {
-        relaxAlpha = mesh.solution().equationRelaxationFactor(U.name());
+        const word fname(U.name() + "Final");
+        if
+        (
+            solutionControl::finalIteration(mesh)
+         && mesh.solution().relaxEquation(fname)
+        )
+        {
+            relaxAlpha = mesh.solution().equationRelaxationFactor(fname);
+        }
+        else if (mesh.solution().relaxEquation(U.name()))
+        {
+            relaxAlpha =
+                mesh.solution().equationRelaxationFactor(U.name());
+        }
+        if (relaxAlpha == 1) { relaxAlpha = -1; }
     }
     if (fvModels().addsSupToField(U.name()))
     {

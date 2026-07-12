@@ -322,15 +322,42 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                 fvc::div(gammaMagSf*tsnZC().correction(psiF));
         }
 
+        // 방정식 완화 (CPU ZEqn.relax()=fvMatrix::relaxationFactor()
+        // 1:1: final 이터레이션에 "<name>Final" 항목이 있으면 그것,
+        // 없으면 평이름 fallback; α==1 스킵은 UEqn과 동일 규약)
+        scalar relaxAlpha = -1;
+        {
+            const word fname(psiF.name() + "Final");
+            if
+            (
+                solutionControl::finalIteration(mesh)
+             && mesh.solution().relaxEquation(fname)
+            )
+            {
+                relaxAlpha =
+                    mesh.solution().equationRelaxationFactor(fname);
+            }
+            else if (mesh.solution().relaxEquation(psiF.name()))
+            {
+                relaxAlpha =
+                    mesh.solution().equationRelaxationFactor
+                    (
+                        psiF.name()
+                    );
+            }
+            if (relaxAlpha == 1) { relaxAlpha = -1; }
+        }
+
         label nbf = 0;
         forAll(psiF.boundaryField(), patchi)
         {
             nbf += psiF.boundaryField()[patchi].size();
         }
-        gpuZCBuf_.setSize(3*nbf);
+        gpuZCBuf_.setSize(relaxAlpha > 0 ? 6*nbf : 3*nbf);
         double* bDiagA = gpuZCBuf_.begin();
         double* bSrcA = bDiagA + nbf;
         double* bPsiA = bSrcA + nbf;
+        double* bRelaxA = relaxAlpha > 0 ? bPsiA + nbf : nullptr;
 
         label off = 0;
         label offPar = 0;
@@ -438,6 +465,45 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                 << exit(FatalError);
         }
 
+        // relax 경계 배열 [add|rem|soff]: uncoupled |iC|/iC/0,
+        // coupled iC/iC/|bC| (fvMatrix::relax 스칼라 특수화)
+        if (relaxAlpha > 0)
+        {
+            label off2 = 0;
+            label offp2 = 0;
+            forAll(psiF.boundaryField(), patchi)
+            {
+                const fvPatchScalarField& pp =
+                    psiF.boundaryField()[patchi];
+                const label np = pp.size();
+                if (np == 0) continue;
+
+                if (pp.coupled())
+                {
+                    for (label k = 0; k < np; k++)
+                    {
+                        const scalar iC = bDiagA[off2 + k];
+                        bRelaxA[off2 + k] = iC;
+                        bRelaxA[nbf + off2 + k] = iC;
+                        bRelaxA[2*nbf + off2 + k] =
+                            mag(gpuPEqnParB_[offp2 + k]);
+                    }
+                    offp2 += np;
+                }
+                else
+                {
+                    for (label k = 0; k < np; k++)
+                    {
+                        const scalar iC = bDiagA[off2 + k];
+                        bRelaxA[off2 + k] = mag(iC);
+                        bRelaxA[nbf + off2 + k] = iC;
+                        bRelaxA[2*nbf + off2 + k] = 0.0;
+                    }
+                }
+                off2 += np;
+            }
+        }
+
         // fvMatrix::solve(word) 규약과 1:1 — transient 최종 이터레이션이면
         // "YiFinal" 딕셔너리 선택 (CPU 경로 ZEqn.solve("Yi")와 동일)
         // 명시 소스 결합 (반응 소스 + 비직교 보정)
@@ -483,6 +549,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             srcTot.size() ? srcTot.begin()
           : (srcPtr ? srcPtr->primitiveField().begin() : nullptr),
             bPsiA, bDiagA, bSrcA,
+            relaxAlpha, bRelaxA,
             tol, rtol, maxIter,
             psiF.primitiveFieldRef().begin(),
             &res0, &resF, &nIter
@@ -570,22 +637,53 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             << endl;
     };
 
+    // 검증행렬용 완화 계수 (solveScalarGpu 내부와 동일 규약 —
+    // relaxationFactor()의 Final→평이름 fallback). 디바이스 relax는
+    // 솔브-전 ψ 기준이므로 chk도 솔브 전에 조립·완화한다
+    auto eqRelax = [&](const volScalarField& f) -> scalar
+    {
+        scalar ra = -1;
+        const word fname(f.name() + "Final");
+        if
+        (
+            solutionControl::finalIteration(mesh)
+         && mesh.solution().relaxEquation(fname)
+        )
+        {
+            ra = mesh.solution().equationRelaxationFactor(fname);
+        }
+        else if (mesh.solution().relaxEquation(f.name()))
+        {
+            ra = mesh.solution().equationRelaxationFactor(f.name());
+        }
+        return ra == 1 ? -1 : ra;
+    };
+
     if (gpuZC_)
     {
         const volScalarField DZ("DZ", Deff("Z"));
         const volScalarField DZeff(DZ + Dart);
         const scalarField Z0(gpuPEqnCheck_ ? Z_.primitiveField() : scalarField());
+        tmp<fvScalarMatrix> tchk;
+        if (gpuPEqnCheck_)
+        {
+            tchk = tmp<fvScalarMatrix>
+            (
+                new fvScalarMatrix
+                (
+                    fvm::ddt(rho, Z_)
+                  + mvConvection->fvmDiv(phi, Z_)
+                  - fvm::Sp(contErr, Z_)
+                  - fvm::laplacian(DZeff, Z_)
+                )
+            );
+            const scalar ra = eqRelax(Z_);
+            if (ra > 0) { tchk.ref().relax(ra); }
+        }
         solveScalarGpu(Z_, DZeff, contErr, nullptr);
         if (gpuPEqnCheck_)
         {
-            fvScalarMatrix chk
-            (
-                fvm::ddt(rho, Z_)
-              + mvConvection->fvmDiv(phi, Z_)
-              - fvm::Sp(contErr, Z_)
-              - fvm::laplacian(DZeff, Z_)
-            );
-            checkSTMatrix(chk, Z_, Z0);
+            checkSTMatrix(tchk.ref(), Z_, Z0);
         }
         fvConstraints().constrain(Z_);
 
@@ -618,19 +716,28 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         const volScalarField DC("DC", Deff("C"));
         const volScalarField DCeff(DC + Dart);
         const scalarField C0(gpuPEqnCheck_ ? C_.primitiveField() : scalarField());
+        tmp<fvScalarMatrix> tchk;
+        if (gpuPEqnCheck_)
+        {
+            tchk = tmp<fvScalarMatrix>
+            (
+                new fvScalarMatrix
+                (
+                    fvm::ddt(rho, C_)
+                  + mvConvection->fvmDiv(phi, C_)
+                  - fvm::Sp(contErr, C_)
+                  - fvm::laplacian(DCeff, C_)
+                 ==
+                    sourcePV_
+                )
+            );
+            const scalar ra = eqRelax(C_);
+            if (ra > 0) { tchk.ref().relax(ra); }
+        }
         solveScalarGpu(C_, DCeff, contErr, &sourcePV_);
         if (gpuPEqnCheck_)
         {
-            fvScalarMatrix chk
-            (
-                fvm::ddt(rho, C_)
-              + mvConvection->fvmDiv(phi, C_)
-              - fvm::Sp(contErr, C_)
-              - fvm::laplacian(DCeff, C_)
-             ==
-                sourcePV_
-            );
-            checkSTMatrix(chk, C_, C0);
+            checkSTMatrix(tchk.ref(), C_, C0);
         }
         fvConstraints().constrain(C_);
 
@@ -711,17 +818,26 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             (
                 gpuPEqnCheck_ ? h.primitiveField() : scalarField()
             );
+            tmp<fvScalarMatrix> tchk;
+            if (gpuPEqnCheck_)
+            {
+                tchk = tmp<fvScalarMatrix>
+                (
+                    new fvScalarMatrix
+                    (
+                        fvm::ddt(rho, h)
+                      + mvConvection->fvmDiv(phi, h)
+                      - fvm::Sp(contErr, h)
+                      - fvm::laplacian(Dheff, h)
+                    )
+                );
+                const scalar ra = eqRelax(h);
+                if (ra > 0) { tchk.ref().relax(ra); }
+            }
             solveScalarGpu(h, Dheff, contErr, nullptr);
             if (gpuPEqnCheck_)
             {
-                fvScalarMatrix chk
-                (
-                    fvm::ddt(rho, h)
-                  + mvConvection->fvmDiv(phi, h)
-                  - fvm::Sp(contErr, h)
-                  - fvm::laplacian(Dheff, h)
-                );
-                checkSTMatrix(chk, h, h0);
+                checkSTMatrix(tchk.ref(), h, h0);
             }
             fvConstraints().constrain(h);
         }
@@ -790,17 +906,26 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             (
                 gpuPEqnCheck_ ? W.primitiveField() : scalarField()
             );
+            tmp<fvScalarMatrix> tchk;
+            if (gpuPEqnCheck_)
+            {
+                tchk = tmp<fvScalarMatrix>
+                (
+                    new fvScalarMatrix
+                    (
+                        fvm::ddt(rho, W)
+                      + mvConvection->fvmDiv(phi, W)
+                      - fvm::Sp(contErr, W)
+                      - fvm::laplacian(DWeff, W)
+                    )
+                );
+                const scalar ra = eqRelax(W);
+                if (ra > 0) { tchk.ref().relax(ra); }
+            }
             solveScalarGpu(W, DWeff, contErr, nullptr);
             if (gpuPEqnCheck_)
             {
-                fvScalarMatrix chk
-                (
-                    fvm::ddt(rho, W)
-                  + mvConvection->fvmDiv(phi, W)
-                  - fvm::Sp(contErr, W)
-                  - fvm::laplacian(DWeff, W)
-                );
-                checkSTMatrix(chk, W, W0);
+                checkSTMatrix(tchk.ref(), W, W0);
             }
             fvConstraints().constrain(W);
         }
