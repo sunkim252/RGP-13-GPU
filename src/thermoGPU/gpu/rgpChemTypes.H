@@ -8,8 +8,11 @@
 #ifndef rgpChemTypes_H
 #define rgpChemTypes_H
 
-#define RGP_CHEM_MAX_SPECIES   40
-#define RGP_CHEM_MAX_REACTIONS 256
+/* GRI-3.0(53종/325반응)급 대형 finite-rate 커버. Rosenbrock 작업공간이
+   런타임 크기 글로벌 풀로 빠져(rgpChemKernels.cu) MAX 상향의 스레드-
+   로컬 비용은 chemRHS 지역 배열(~3KB/스레드)뿐이다. */
+#define RGP_CHEM_MAX_SPECIES   60
+#define RGP_CHEM_MAX_REACTIONS 384
 #define RGP_CHEM_NEQ (RGP_CHEM_MAX_SPECIES + 1)   /* c[] + T */
 
 /* 3체/폴오프 유형 */

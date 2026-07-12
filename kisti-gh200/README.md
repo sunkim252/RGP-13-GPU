@@ -56,12 +56,17 @@ CUDA 룰(sm_90+PTX, -fmad=false) → RGP 스택 5개 libso → AmgX
 sbatch slurm/smoke1-serial.sh     # 내부: testCases/h2CounterFlow_gpuChem 축소판
 ```
 
-**확인 항목** (`log.smoke1`):
-1. `thermoGPU ARMED` 배너에 **`coherent HW: yes`** + **`unified-native`**
-   — rgpGpuInit이 `cudaDevAttrPageableMemoryAccessUsesHostPageTables`로 자동 감지.
-   `no`로 나오면 즉시 이슈 (드라이버/커널 ATS 설정 확인; 코드는 copy로 fallback해
-   결과는 정상이어야 함).
-2. 크래시 없이 endTime 도달.
+**확인 항목** (`log.smoke1`) — x86 4060에서 실측한 기대 배너(카피 모드):
+```
+gpuMulticomponentFluid: GPU transport mesh armed -- N cells; staging copy (discrete) [coherent HW: no]
+gpuChemistryModel: ARMED — 9 species / 22 reactions exported from the case mechanism ...
+```
+1. GH200에서는 첫 줄이 **`staging unified-native (coherent, zero-copy)
+   [coherent HW: yes]`** 로 나와야 함 — rgpGpuInit이
+   `cudaDevAttrPageableMemoryAccessUsesHostPageTables`로 자동 감지.
+   `no`면 즉시 이슈(드라이버/ATS 설정 확인; 코드는 copy로 fallback해
+   결과는 정상이어야 함 — 그 상태로 스모크 계속 진행 가능).
+2. `gpuChemistryModel: ARMED` 배너 + 크래시 없이 `End` 도달.
 
 ## 4. 스모크 #2 — native vs copy 비트-정합 (GPU 1장, 10분)
 
