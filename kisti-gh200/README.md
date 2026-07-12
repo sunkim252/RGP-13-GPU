@@ -100,6 +100,16 @@ sbatch slurm/smoke3-parallel.sh
 4. AmgX 분산: 케이스 dict의 `gpuPEqnSolver amgx;`(fgmProperties/모듈 dict)로
    재실행, 수렴 정상 여부 (성능은 pcg 우세가 기본값 — amgx는 동작 확인만)
 
+## 5.5 fgmFluid(SRK 리얼가스) 스택 검증
+
+스모크 1–3은 gpuMulticomponentFluid+gpu화학 스택을 커버한다.
+fgmFluid(FGM manifold + SRK/Chung 열물성) 스택은 케이스 준비 절차가
+달라(0/ 필드·FGM 테이블) 표준 스모크에 넣지 않았다 — **rd0110 케이스를
+이송**한 뒤 `local-gates.sh`의 G5(생존 게이트) 방식으로 확인하고,
+native 파리티는 `RGP_GPU_UNIFIED=0` 대조 실행으로 스모크2 Phase B와
+동일한 결정론-집합 판정을 적용할 것. (fgm 스택 자체의 mode0/1 정합은
+x86에서 검증 완료 — 실기에서는 coherent 시맨틱만 확인하면 된다.)
+
 ## 6. 성능 기준점 (여유 시)
 
 rd0110 2Mv2 (2.6M 셀) — x86 실측: 1660S 60.8 s/step, 4060 33.8 s/step.
