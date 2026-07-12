@@ -259,6 +259,10 @@ int rgpSTEqnSolve
 /*  비직교 보정 소스 디바이스화 (limited/corrected snGrad 전용, 직렬 v1;
     호출자는 스킴 파싱·경계 corr_b 계산·강등 폴백을 담당):
     Arm: kf3=[3*nf] 비직교 보정 벡터 SoA, dcsNO=[nf] nonOrthDeltaCoeffs.
+         mdK >= 0 이면 grad(p)에 cellMDLimited(k=mdK) 리미터를 결정론
+         CSR 재생으로 적용 — Cf3=[3*nf]·C3=[3*nc]·CfB3=[3*nbf] 지오메트리
+         상주 필요 (CPU 식 dcf=Cf−C 그대로 — 파생식은 ±ulp로 이산 분기
+         플립). mdK < 0 또는 k<small → 순수 Gauss linear.
          VRAM 부족 시 -2 (호스트 경로 강등).
     Prep: p 셀값·경계 면값(linear interp 규약)·gMsf=rAUf*magSf 업로드
          → grad(결정론 게더)·면 보정 플럭스 디바이스 계산, 경계셀
@@ -267,7 +271,15 @@ int rgpSTEqnSolve
     Finish: bCorr=[nbf] 합류 → src=div(A·lim·corr)/V [nc] D2H,
          corrFOut=[nf] 면 보정 플럭스(플럭스 재구성 차감용) D2H.
     limitCoeff < 0 → corrected(무리미터).                              */
-int rgpPEqnNOArm(const double* kf3, const double* dcsNO);
+int rgpPEqnNOArm
+(
+    const double* kf3, const double* dcsNO,
+    double mdK, const double* Cf3, const double* C3, const double* CfB3
+);
+
+/*  은퇴한 디바이스 U-리미터의 dvec [3*nf] 해제 (호스트 가중치 상시
+    전달 후 VRAM 회수). 해제 후 rgpUEqnSolve는 w 필수.               */
+int rgpSTDvecRelease(void);
 int rgpPEqnNOCorrPrep
 (
     const double* pCell, const double* pBFace, const double* gMsf,

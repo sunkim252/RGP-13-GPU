@@ -224,15 +224,34 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                 }
             }
         }
+        // grad(p) 스킴: Gauss linear (mdK<0) 또는 cellMDLimited Gauss
+        // linear k (결정론 CSR 재생으로 디바이스 리미팅)
+        scalar mdK = -1;
         if (devOK)
         {
             ITstream& isg =
                 mesh.schemes().grad("grad(" + p_.name() + ')');
             isg.rewind();
-            const word gd1(isg);
-            word gd2;
-            if (!isg.eof()) { gd2 = word(isg); }
-            devOK = (gd1 == "Gauss" && gd2 == "linear");
+            word gd1(isg);
+            if (gd1 == "cellMDLimited")
+            {
+                word gd2;
+                if (!isg.eof()) { gd2 = word(isg); }
+                word gd3;
+                if (!isg.eof()) { gd3 = word(isg); }
+                devOK = (gd2 == "Gauss" && gd3 == "linear");
+                if (devOK)
+                {
+                    mdK = readScalar(isg);
+                    if (mdK < small) { mdK = -1; }   // k~0 = 무리미팅
+                }
+            }
+            else
+            {
+                word gd2;
+                if (!isg.eof()) { gd2 = word(isg); }
+                devOK = (gd1 == "Gauss" && gd2 == "linear");
+            }
         }
         if (devOK)
         {
@@ -250,14 +269,61 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                     kf3[k*nif + f] = kf.primitiveField()[f][k];
                 }
             }
-            const int rcNO = rgpPEqnNOArm(kf3.begin(), dno.begin());
+            List<double> Cf3, C3, CfB3;
+            if (mdK >= 0)
+            {
+                const surfaceVectorField& Cf = mesh.Cf();
+                const volVectorField& C = mesh.C();
+                Cf3.setSize(3*nif);
+                C3.setSize(3*nc);
+                CfB3.setSize(3*max(nbf, label(1)), 0.0);
+                forAll(mesh.owner(), f)
+                {
+                    for (label k = 0; k < 3; k++)
+                    {
+                        Cf3[k*nif + f] = Cf.primitiveField()[f][k];
+                    }
+                }
+                for (label i = 0; i < nc; i++)
+                {
+                    for (label k = 0; k < 3; k++)
+                    {
+                        C3[k*nc + i] = C.primitiveField()[i][k];
+                    }
+                }
+                label off = 0;
+                forAll(mesh.boundary(), patchi)
+                {
+                    const vectorField& pCf =
+                        Cf.boundaryField()[patchi];
+                    forAll(pCf, k2)
+                    {
+                        for (label k = 0; k < 3; k++)
+                        {
+                            CfB3[k*nbf + off + k2] = pCf[k2][k];
+                        }
+                    }
+                    off += pCf.size();
+                }
+            }
+            const int rcNO = rgpPEqnNOArm
+            (
+                kf3.begin(), dno.begin(), mdK,
+                mdK >= 0 ? Cf3.begin() : nullptr,
+                mdK >= 0 ? C3.begin() : nullptr,
+                mdK >= 0 ? CfB3.begin() : nullptr
+            );
             if (rcNO == 0)
             {
                 gpuNOSrcDev_ = true;
                 gpuNOLimitCoeff_ = lc;
+                // 은퇴한 디바이스 U-리미터 dvec 회수 (호스트 가중치
+                // 상시 — 6GB 카드의 MD 지오메트리 상주 여유 확보)
+                rgpSTDvecRelease();
                 Info<< "fgmFluid: non-orthogonal correction source on "
                     << "the device (snGrad "
                     << (lc >= 0 ? "limited corrected" : "corrected")
+                    << (mdK >= 0 ? ", grad cellMDLimited" : "")
                     << ")" << nl << endl;
             }
             else

@@ -99,11 +99,15 @@ namespace
 
     //- 비직교 보정 소스 (limited/corrected snGrad의 correction(p)를
     //  디바이스에서 — grad는 결정론 CSR 게더, 면/셀 산술은 CPU FP 순서
-    //  1:1). kf/dcsNO는 아밍 시 상주, 나머지는 pass별 재사용
+    //  1:1). kf/dcsNO는 아밍 시 상주, 나머지는 pass별 재사용.
+    //  mdK >= 0 이면 grad에 cellMDLimited 리미터(결정론 CSR 재생)를
+    //  적용 — Cf/C/CfB 지오메트리 상주 필요.
     struct NOBuf
     {
         double *kf3 = nullptr, *dcs = nullptr;    // [3*nf], [nf] 상주
         double *corrF = nullptr, *bCorr = nullptr; // [nf], [nbf]
+        double *Cf3 = nullptr, *C3 = nullptr, *CfB3 = nullptr;
+        double mdK = -1;
         int armed = 0;
     } gNO;
 
@@ -193,10 +197,12 @@ namespace
             &gU.rAU, &gU.HbyA3, &gU.parB,
             &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld,
-            &gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr
+            &gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr,
+            &gNO.Cf3, &gNO.C3, &gNO.CfB3
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gNO.armed = 0;
+        gNO.mdK = -1;
 
         int* dic_i[] = {gDIC.colorOf, gDIC.colCells,
                         gDIC.fwdFace, gDIC.bwdFace};
@@ -1546,6 +1552,109 @@ __global__ void noSurfInt
         }
     }
     src[c] = s/V[c];
+}
+
+//- cellMDLimited 1:1 (결정론 CSR 재생): ① 셀별 min/max (자기값 시작,
+//  내부면 반대편 셀값·경계면 패치값; max/min은 순서-불변) + CPU와
+//  동일한 k-블렌딩 (maxV−=x; minV−=x; ±(1/k−1)(maxV−minV))
+__global__ void noMDMinMax
+(
+    const int nc, const int nf,
+    const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ x, const double* __restrict__ pBF,
+    const double rk,   // (1/k − 1); k>=1이면 0
+    double* __restrict__ maxV, double* __restrict__ minV
+)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    const double xc = x[c];
+    double mx = xc, mn = xc;
+    for (int j = cfPtr[c]; j < cfPtr[c + 1]; j++)
+    {
+        const int code = cfIdx[j];
+        const int idx = code >> 1;
+        double v;
+        if (idx < nf)
+        {
+            v = (code & 1) ? x[own[idx]] : x[nei[idx]];
+        }
+        else
+        {
+            v = pBF[idx - nf];
+        }
+        mx = (mx > v) ? mx : v;
+        mn = (mn < v) ? mn : v;
+    }
+    mx -= xc;
+    mn -= xc;
+    const double mm = rk*(mx - mn);
+    maxV[c] = mx + mm;
+    minV[c] = mn - mm;
+}
+
+//- cellMDLimited ②: 셀별 limitFace 순차 재생 — CPU의 전역 면 루프를
+//  셀에 투영하면 자기 면 오름차순(내부) → 경계 순서가 되고, g는 자기
+//  셀 것만 변형되므로 CSR 재생이 비트-동일. dcf = Cf−C[c] (CPU 식
+//  그대로 — 파생식은 ±ulp로 이산 분기가 갈릴 수 있음)
+__global__ void noMDLimit
+(
+    const int nc, const int nf, const int nbf,
+    const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
+    const double* __restrict__ Cf3, const double* __restrict__ C3,
+    const double* __restrict__ CfB3,
+    const double* __restrict__ maxV, const double* __restrict__ minV,
+    double* __restrict__ g3
+)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    double gx = g3[c];
+    double gy = g3[(size_t)nc + c];
+    double gz = g3[(size_t)2*nc + c];
+    const double cx = C3[c];
+    const double cy = C3[(size_t)nc + c];
+    const double cz = C3[(size_t)2*nc + c];
+    const double mx = maxV[c], mn = minV[c];
+
+    for (int j = cfPtr[c]; j < cfPtr[c + 1]; j++)
+    {
+        const int code = cfIdx[j];
+        const int idx = code >> 1;
+        double dx, dy, dz;
+        if (idx < nf)
+        {
+            dx = Cf3[idx] - cx;
+            dy = Cf3[(size_t)nf + idx] - cy;
+            dz = Cf3[(size_t)2*nf + idx] - cz;
+        }
+        else
+        {
+            const int k = idx - nf;
+            dx = CfB3[k] - cx;
+            dy = CfB3[(size_t)nbf + k] - cy;
+            dz = CfB3[(size_t)2*nbf + k] - cz;
+        }
+        const double extrap = dx*gx + dy*gy + dz*gz;
+        if (extrap > mx)
+        {
+            const double s = (mx - extrap)/(dx*dx + dy*dy + dz*dz);
+            gx = gx + dx*s;
+            gy = gy + dy*s;
+            gz = gz + dz*s;
+        }
+        else if (extrap < mn)
+        {
+            const double s = (mn - extrap)/(dx*dx + dy*dy + dz*dz);
+            gx = gx + dx*s;
+            gy = gy + dy*s;
+            gz = gz + dz*s;
+        }
+    }
+    g3[c] = gx;
+    g3[(size_t)nc + c] = gy;
+    g3[(size_t)2*nc + c] = gz;
 }
 
 //- 비직교 보정: 경계셀 grad 채집 (호스트 corr_b 계산용)
@@ -3128,25 +3237,38 @@ int rgpSTEqnDump
 //  nonOrthDeltaCoeffs를 상주 업로드(+작업 버퍼 지연 할당). VRAM 부족
 //  시 -2 반환 → 호출자는 호스트 fvc 경로로 영구 강등 (rgpPCorrEnsure
 //  강등 규약과 동일).
-int rgpPEqnNOArm(const double* kf3, const double* dcsNO)
+int rgpPEqnNOArm
+(
+    const double* kf3, const double* dcsNO,
+    double mdK, const double* Cf3, const double* C3, const double* CfB3
+)
 {
-    const int nf = gM.nIntFaces, nbf = gM.nBFaces;
-    cudaError_t e;
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    cudaError_t e = cudaSuccess;
+    const int useMD = (mdK >= 0 && Cf3 && C3);
     struct { double** d; const double* s; size_t n; } it[] =
     {
         {&gNO.kf3, kf3, (size_t)3*nf},
         {&gNO.dcs, dcsNO, (size_t)nf},
         {&gNO.corrF, nullptr, (size_t)nf},
-        {&gNO.bCorr, nullptr, (size_t)(nbf > 0 ? nbf : 1)}
+        {&gNO.bCorr, nullptr, (size_t)(nbf > 0 ? nbf : 1)},
+        {&gNO.Cf3, useMD ? Cf3 : nullptr, useMD ? (size_t)3*nf : 0},
+        {&gNO.C3, useMD ? C3 : nullptr, useMD ? (size_t)3*nc : 0},
+        {&gNO.CfB3, useMD ? CfB3 : nullptr,
+         useMD ? (size_t)3*(nbf > 0 ? nbf : 1) : 0}
     };
     for (auto& a : it)
     {
+        if (a.n == 0) continue;
         if (!*a.d)
         {
             if ((e = cudaMalloc(a.d, a.n*sizeof(double))) != cudaSuccess)
             {
                 double** ps[] =
-                    {&gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr};
+                {
+                    &gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr,
+                    &gNO.Cf3, &gNO.C3, &gNO.CfB3
+                };
                 for (auto p : ps)
                 {
                     if (*p) { cudaFree(*p); *p = nullptr; }
@@ -3164,7 +3286,18 @@ int rgpPEqnNOArm(const double* kf3, const double* dcsNO)
                 return pfail(e, "noArm/H2D");
         }
     }
+    gNO.mdK = useMD ? mdK : -1;
     gNO.armed = 1;
+    return 0;
+}
+
+
+//- 은퇴한 디바이스 U-리미터(uLimVWeights)의 dvec [3*nf] 해제 —
+//  호스트 가중치 전달이 상시가 된 뒤 VRAM 회수용 (6GB 카드의
+//  cellMDLimited 지오메트리 상주 여유 확보)
+int rgpSTDvecRelease(void)
+{
+    if (gSTM.dvec) { cudaFree(gSTM.dvec); gSTM.dvec = nullptr; }
     return 0;
 }
 
@@ -3205,6 +3338,18 @@ int rgpPEqnNOCorrPrep
     rgppeqn::stGradGather<<<nb(nc), BS>>>
         (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
          gB.flux, gST.bPsi, gM.V, gST.grad);
+    if (gNO.mdK >= 0)
+    {
+        // cellMDLimited (min/max 스크래치는 BiCG 작업 버퍼 재사용 —
+        // pEqn 솔브 전이라 유휴)
+        const double rk = (gNO.mdK < 1.0) ? (1.0/gNO.mdK - 1.0) : 0.0;
+        rgppeqn::noMDMinMax<<<nb(nc), BS>>>
+            (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gM.own, gM.nei,
+             gB.pA, gST.bPsi, rk, gST.rA0, gST.sA);
+        rgppeqn::noMDLimit<<<nb(nc), BS>>>
+            (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
+             gNO.Cf3, gNO.C3, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
+    }
     rgppeqn::noFaceCorr<<<nb(nf), BS>>>
         (nf, nc, gM.own, gM.nei, gSTM.wLin, gNO.kf3, gNO.dcs,
          gB.pA, gB.rAUf, gST.grad, limitCoeff, gNO.corrF);
@@ -3375,10 +3520,15 @@ int rgpUEqnPrep2
             return pfail(e, "ueqnPrep/H2D");
     }
 
-    // 가중치 (내부면; 경계 가중치는 BC 계수에서 미사용 — 호스트 참조)
-    rgppeqn::uLimVWeights<<<nb(nf), BS>>>
-        (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.dvec, gST.phi,
-         gU.U3, gU.grad9, gST.wLim);
+    // 가중치 (내부면; 경계 가중치는 BC 계수에서 미사용 — 호스트 참조).
+    // dvec이 해제됐으면(호스트 가중치 상시 — rgpSTDvecRelease) 스킵:
+    // 솔브가 업로드하는 호스트 가중치가 wLim을 덮는다
+    if (gSTM.dvec)
+    {
+        rgppeqn::uLimVWeights<<<nb(nf), BS>>>
+            (nf, nc, gM.own, gM.nei, gSTM.wLin, gSTM.dvec, gST.phi,
+             gU.U3, gU.grad9, gST.wLim);
+    }
 
     // 명시항: div(mu*dev2(T(gradU))) — 내부 플럭스 + 경계 기여 + /V
     if ((e = cudaMemset(gU.src3, 0, (size_t)3*nc*sizeof(double)))
@@ -3462,6 +3612,13 @@ int rgpUEqnSolve
 
     // 입력 업로드. w/srcExp3/gradP3가 null이면 rgpUEqnGrad/Prep2가
     // 준비한 디바이스 상주본(gST.wLim/gU.src3/gU.gradP) 사용.
+    if (!w && !gSTM.dvec)
+    {
+        snprintf(gPErr, sizeof(gPErr),
+                 "ueqn: device weights retired (dvec released) -- "
+                 "host weights required");
+        return -1;
+    }
     struct { double* d; const double* s; size_t n; } up[] =
     {
         {gST.rho, rho, (size_t)nc}, {gST.rhoOld, rhoOld, (size_t)nc},
