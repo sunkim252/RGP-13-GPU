@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <vector>
 
 namespace
 {
@@ -174,19 +175,33 @@ __global__ void fgmKernel
         }
     }
 
-    const size_t nTot = (size_t)nZ*nG*nC*nK;
+    // 테이블은 노드-우선 [node*nFields + f] (업로드 시 전치) — 코너당
+    // 전 필드가 연속이라 필드 루프가 16개의 국소-연속 스트림을 읽는다
+    // (필드-우선 산발 8B 게더의 캐시라인 낭비 제거; 값·산술 순서 동일
+    // → 비트-동일)
+    size_t base[16];
+    for (int m2 = 0; m2 < 16; m2++)
+    {
+        base[m2] = idx[m2]*(size_t)nFields;
+    }
     for (int f = 0; f < nFields; f++)
     {
-        const double* tb = tables + (size_t)f*nTot;
-
-        const double c0000 = tb[idx[0]],  c1000 = tb[idx[1]];
-        const double c0100 = tb[idx[2]],  c1100 = tb[idx[3]];
-        const double c0010 = tb[idx[4]],  c1010 = tb[idx[5]];
-        const double c0110 = tb[idx[6]],  c1110 = tb[idx[7]];
-        const double c0001 = tb[idx[8]],  c1001 = tb[idx[9]];
-        const double c0101 = tb[idx[10]], c1101 = tb[idx[11]];
-        const double c0011 = tb[idx[12]], c1011 = tb[idx[13]];
-        const double c0111 = tb[idx[14]], c1111 = tb[idx[15]];
+        const double c0000 = tables[base[0]  + f];
+        const double c1000 = tables[base[1]  + f];
+        const double c0100 = tables[base[2]  + f];
+        const double c1100 = tables[base[3]  + f];
+        const double c0010 = tables[base[4]  + f];
+        const double c1010 = tables[base[5]  + f];
+        const double c0110 = tables[base[6]  + f];
+        const double c1110 = tables[base[7]  + f];
+        const double c0001 = tables[base[8]  + f];
+        const double c1001 = tables[base[9]  + f];
+        const double c0101 = tables[base[10] + f];
+        const double c1101 = tables[base[11] + f];
+        const double c0011 = tables[base[12] + f];
+        const double c1011 = tables[base[13] + f];
+        const double c0111 = tables[base[14] + f];
+        const double c1111 = tables[base[15] + f];
 
         const double a00 = c0000*(1 - wZ) + c1000*wZ;
         const double a10 = c0100*(1 - wZ) + c1100*wZ;
@@ -232,11 +247,23 @@ int rgpFgmUpload
     gT.nZ = nZ; gT.nG = nG; gT.nC = nC; gT.nK = nK; gT.nFields = nFields;
     const size_t nTot = (size_t)nZ*nG*nC*nK;
 
+    // 노드-우선 전치 [node*nFields + f] — 커널의 16-코너 게더가
+    // 코너당 전 필드를 연속으로 읽도록 (호스트 1회, 값 불변)
+    std::vector<double> tN(nTot*nFields);
+    for (size_t f = 0; f < (size_t)nFields; f++)
+    {
+        const double* src = tables + f*nTot;
+        for (size_t n = 0; n < nTot; n++)
+        {
+            tN[n*nFields + f] = src[n];
+        }
+    }
+
     struct { double** d; const double* s; size_t n; } it[] =
     {
         {&gT.Zax, Zax, (size_t)nZ}, {&gT.Gax, Gax, (size_t)nG},
         {&gT.Cax, Cax, (size_t)nC}, {&gT.Kax, Kax, (size_t)nK},
-        {&gT.tables, tables, nTot*nFields}
+        {&gT.tables, tN.data(), nTot*nFields}
     };
     for (auto& e : it)
     {
