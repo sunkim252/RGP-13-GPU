@@ -17,9 +17,11 @@ prep() {  # $1=디렉터리 $2=dlb(on/off)
     apptainer exec "$SIF" bash -c "
       set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
       cd '$d'
+      foamDictionary -entry endTime -set 2e-5 system/controlDict
       blockMesh > log.blockMesh 2>&1 || true
       [ -f system/setFieldsDict ] && setFields > log.setFields 2>&1 || true
-      sed -i 's/dlb  *on;/dlb             $dlb;/' constant/chemistryProperties || true
+      foamDictionary -entry gpuCoeffs -set \"{ dlb $dlb; }\" \
+          constant/chemistryProperties
       decomposePar -force > log.decomp 2>&1
     "
 }

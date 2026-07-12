@@ -1,0 +1,2 @@
+FoamFile { format ascii; class dictionary; object gpuProperties; }
+gpuYEqn off; gpuEEqn off; gpuUEqn on; gpuPEqn on; gpuCheck off;

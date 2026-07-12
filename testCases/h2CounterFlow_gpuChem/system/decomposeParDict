@@ -9,38 +9,12 @@ FoamFile
 {
     format      ascii;
     class       dictionary;
-    location    "constant";
-    object      chemistryProperties;
+    object      decomposeParDict;
 }
-// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// KISTI GH200 smoke3 / 로컬 4랭크 파리티 게이트용
+numberOfSubdomains  4;
 
-chemistryType
-{
-    solver            gpu;
-}
-
-chemistry           on;
-
-initialChemicalTimeStep 1e-07;
-
-EulerImplicitCoeffs
-{
-    cTauChem        1;
-}
-
-odeCoeffs
-{
-    solver          Rosenbrock34;
-    absTol          1e-12;
-    relTol          1e-5;
-}
-
-gpuCoeffs
-{
-    relTol          1e-5;
-    absTol          1e-12;
-}
-
-#include "reactions"
+decomposer      scotch;
+distributor     scotch;
 
 // ************************************************************************* //

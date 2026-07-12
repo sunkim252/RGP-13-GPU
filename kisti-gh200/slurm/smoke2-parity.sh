@@ -19,6 +19,7 @@ run_one() {  # $1=디렉터리 $2=RGP_GPU_UNIFIED값("auto"면 미설정)
       set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
       [ '$mode' != auto ] && export RGP_GPU_UNIFIED=$mode
       cd '$d'
+      foamDictionary -entry endTime -set 2e-5 system/controlDict
       blockMesh > log.blockMesh 2>&1 || true
       [ -f system/setFieldsDict ] && setFields > log.setFields 2>&1 || true
       foamRun > log.run 2>&1

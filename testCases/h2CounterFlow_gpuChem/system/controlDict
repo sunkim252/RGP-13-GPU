@@ -7,14 +7,14 @@
 \*---------------------------------------------------------------------------*/
 FoamFile
 {
-    format      ascii;
-    class       dictionary;
-    location    "system";
-    object      controlDict;
+    format          ascii;
+    class           dictionary;
+    location        "system";
+    object          controlDict;
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-solver          multicomponentFluid;
+solver          gpuMulticomponentFluid;
 
 startFrom       startTime;
 
@@ -24,11 +24,11 @@ stopAt          endTime;
 
 endTime         4e-4;
 
-deltaT          1e-6;
+deltaT          1e-06;
 
 writeControl    adjustableRunTime;
 
-writeInterval   2e-4;
+writeInterval   0.0002;
 
 purgeWrite      0;
 
@@ -48,6 +48,7 @@ adjustTimeStep  yes;
 
 maxCo           0.4;
 
-// ************************************************************************* //
+libs            ( "libRGP13gpuChemistry.so" );
 
-libs ("libRGP13gpuChemistry.so");
+
+// ************************************************************************* //

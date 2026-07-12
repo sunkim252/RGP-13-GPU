@@ -10,6 +10,7 @@
 #include "processorFvPatch.H"
 #include "PstreamReduceOps.H"
 #include "gpu/rgpPEqnTypes.H"
+#include "gpu/rgpKernelTypes.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -433,8 +434,16 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
     gpuMeshCells_ = nc;
     gpuMeshFaces_ = nif;
     gpuMeshStampTime_ = mesh.time().timeIndex();
-    Info<< "gpuMulticomponentFluid: GPU transport mesh armed -- "
-        << nc << " cells" << nl << endl;
+    {
+        const int um = rgpGpuUnifiedMode();
+        Info<< "gpuMulticomponentFluid: GPU transport mesh armed -- "
+            << nc << " cells; staging "
+            << (um == 2 ? "unified-native (coherent, zero-copy)"
+              : um == 1 ? "mapped (validation)"
+                        : "copy (discrete)")
+            << " [coherent HW: " << (rgpGpuCoherentHW() ? "yes" : "no")
+            << "]" << nl << endl;
+    }
 }
 
 
