@@ -137,6 +137,7 @@ namespace
         double *resC3 = nullptr;                   // [3*nc] (MD시)
         double *resDcs = nullptr;                  // [nf]
         int resLoaded = 0;   // kf/Cf는 첫 Prep에서 lazy 업로드
+        int resTried = 0;    // 캐시 할당 판단(첫 Prep) 완료 여부
     } gNO;
 
     struct PBuf
@@ -242,6 +243,7 @@ namespace
         gNO.armed = 0;
         gNO.mdK = -1;
         gNO.resLoaded = 0;
+        gNO.resTried = 0;
 
         int* dic_i[] = {gDIC.colorOf, gDIC.colCells,
                         gDIC.fwdFace, gDIC.bwdFace};
@@ -3589,50 +3591,15 @@ int rgpPEqnNOArm
     }
     gNO.mdK = useMD ? mdK : -1;
 
-    // ── 메시-불변 상주 캐시 (여유 VRAM 시에만; 실패는 성능 폴백일 뿐) ──
+    // 메시-불변 상주 캐시는 첫 Prep에서 lazy 판단 — 아밍 시점엔 UEqn
+    // grad9 등 후속 정규 상주 할당이 아직이라, 여기서 잡으면 6GB
+    // 카드에서 그 할당을 밀어내 OOM이 된다(parcom5 rd0110 실증).
     gNO.resLoaded = 0;
-    if (gRgpUnified != 2)
+    gNO.resTried = 0;
     {
         double* frees[] = {gNO.resKf, gNO.resCf, gNO.resC3, gNO.resDcs};
         for (auto pf : frees) { if (pf) cudaFree(pf); }
         gNO.resKf = gNO.resCf = gNO.resC3 = gNO.resDcs = nullptr;
-
-        const size_t need =
-            ((size_t)3*nf + (useMD ? (size_t)3*nf + 3*nc : 0)
-             + (size_t)nf)*sizeof(double);
-        size_t freeB = 0, totB = 0;
-        if (cudaMemGetInfo(&freeB, &totB) == cudaSuccess
-         && freeB > need + (size_t)256*1024*1024)
-        {
-            bool ok =
-                cudaMalloc(&gNO.resKf, (size_t)3*nf*sizeof(double))
-                    == cudaSuccess
-             && cudaMalloc(&gNO.resDcs, (size_t)nf*sizeof(double))
-                    == cudaSuccess
-             && (!useMD ||
-                 (cudaMalloc(&gNO.resCf, (size_t)3*nf*sizeof(double))
-                      == cudaSuccess
-               && cudaMalloc(&gNO.resC3, (size_t)3*nc*sizeof(double))
-                      == cudaSuccess));
-            if (ok)
-            {
-                ok = cudaMemcpy(gNO.resDcs, dcsNO, nf*sizeof(double),
-                                cudaMemcpyHostToDevice) == cudaSuccess
-                  && (!useMD ||
-                      cudaMemcpy(gNO.resC3, C3,
-                                 (size_t)3*nc*sizeof(double),
-                                 cudaMemcpyHostToDevice) == cudaSuccess);
-            }
-            if (!ok)
-            {
-                cudaGetLastError();
-                double* ps[] =
-                    {gNO.resKf, gNO.resCf, gNO.resC3, gNO.resDcs};
-                for (auto pp : ps) { if (pp) cudaFree(pp); }
-                gNO.resKf = gNO.resCf = gNO.resC3 = gNO.resDcs
-                    = nullptr;
-            }
-        }
     }
 
     gNO.armed = 1;
@@ -3724,6 +3691,52 @@ int rgpPEqnNOCorrPrep
     rgppeqn::stGradGather<<<nb(nc), BS>>>
         (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
          gB.flux, dPBF, gM.V, gST.grad);
+    // ── 메시-불변 상주 캐시: 첫 Prep에서 1회 판단 (이 시점엔 UEqn/
+    //    솔버의 정규 상주 할당이 끝나 있어 여유 측정이 정확) ──
+    if (!gNO.resTried && gRgpUnified != 2)
+    {
+        gNO.resTried = 1;
+        const int useMD = (gNO.mdK >= 0);
+        const size_t need =
+            ((size_t)3*nf + (useMD ? (size_t)3*nf + 3*nc : 0)
+             + (size_t)nf)*sizeof(double);
+        size_t freeB = 0, totB = 0;
+        if (cudaMemGetInfo(&freeB, &totB) == cudaSuccess
+         && freeB > need + (size_t)512*1024*1024)
+        {
+            bool ok =
+                cudaMalloc(&gNO.resKf, (size_t)3*nf*sizeof(double))
+                    == cudaSuccess
+             && cudaMalloc(&gNO.resDcs, (size_t)nf*sizeof(double))
+                    == cudaSuccess
+             && (!useMD ||
+                 (cudaMalloc(&gNO.resCf, (size_t)3*nf*sizeof(double))
+                      == cudaSuccess
+               && cudaMalloc(&gNO.resC3, (size_t)3*nc*sizeof(double))
+                      == cudaSuccess));
+            if (ok)
+            {
+                ok = cudaMemcpy(gNO.resDcs, gNO.hDcs.data(),
+                                (size_t)nf*sizeof(double),
+                                cudaMemcpyHostToDevice) == cudaSuccess
+                  && (!useMD ||
+                      cudaMemcpy(gNO.resC3, gNO.hC3.data(),
+                                 (size_t)3*nc*sizeof(double),
+                                 cudaMemcpyHostToDevice)
+                          == cudaSuccess);
+            }
+            if (!ok)
+            {
+                cudaGetLastError();
+                double* ps[] =
+                    {gNO.resKf, gNO.resCf, gNO.resC3, gNO.resDcs};
+                for (auto pp : ps) { if (pp) cudaFree(pp); }
+                gNO.resKf = gNO.resCf = gNO.resC3 = gNO.resDcs
+                    = nullptr;
+            }
+        }
+    }
+
     // xf(gB.flux) 소비 완료 — 이후 z-성분 스테이지로 재사용.
     // 상주 캐시가 있으면 성분 스테이징 자체가 불필요.
     double *vx = nullptr, *vy = nullptr, *vz = nullptr;
