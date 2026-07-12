@@ -286,10 +286,13 @@ protected:
         mutable bool gpuNonOrthoWarned_ = false;
 
         //- 비직교 보정 소스 디바이스화 (아밍 시 자격 판정: corrected/
-        //  limited-corrected snGrad + Gauss linear grad(p) + 직렬) —
-        //  부적격/VRAM 부족이면 호스트 fvc 경로 유지
+        //  limited-corrected snGrad + [cellMDLimited] Gauss linear
+        //  grad(p) + 직렬) — 부적격/VRAM 부족이면 호스트 fvc 경로 유지.
+        //  kf3/Cf3 SoA는 호스트 보존(패스별 스테이징 업로드)
         mutable bool gpuNOSrcDev_ = false;
         mutable scalar gpuNOLimitCoeff_ = -1;
+        mutable List<double> gpuNOKf3_;
+        mutable List<double> gpuNOCf3_;
         mutable List<double> gpuPEqnBuf_;   // 경계 연접 (bDiag,bSrc,phiB)
         mutable List<double> gpuPEqnFlux_;  // 내부면 플럭스 out
         mutable List<double> gpuPEqnParB_;  // processor 인터페이스 계수

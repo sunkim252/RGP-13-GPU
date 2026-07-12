@@ -109,9 +109,12 @@ class gpuMulticomponentFluid
         mutable bool gpuNonOrthoWarned_;
 
         //- 비직교 보정 소스 디바이스화 (자격: corrected/limited-corrected
-        //  snGrad + Gauss linear grad(p) + 직렬; 아니면 호스트 fvc 유지)
+        //  snGrad + [cellMDLimited] Gauss linear grad(p) + 직렬; 아니면
+        //  호스트 fvc 유지). kf3/Cf3 SoA는 호스트 보존(패스별 스테이징)
         mutable bool gpuNOSrcDev_;
         mutable scalar gpuNOLimitCoeff_;
+        mutable List<double> gpuNOKf3_;
+        mutable List<double> gpuNOCf3_;
 
 
     // Private Member Functions

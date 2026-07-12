@@ -99,14 +99,15 @@ namespace
 
     //- 비직교 보정 소스 (limited/corrected snGrad의 correction(p)를
     //  디바이스에서 — grad는 결정론 CSR 게더, 면/셀 산술은 CPU FP 순서
-    //  1:1). kf/dcsNO는 아밍 시 상주, 나머지는 pass별 재사용.
-    //  mdK >= 0 이면 grad에 cellMDLimited 리미터(결정론 CSR 재생)를
-    //  적용 — Cf/C/CfB 지오메트리 상주 필요.
+    //  1:1). VRAM 절약: kf3/Cf3 [3*nf]는 상주 대신 패스별 스테이징
+    //  (UEqn grad9가 pCorr 동안 유휴라 별칭; 없거나 작으면 자체 할당).
+    //  mdK >= 0 이면 grad에 cellMDLimited 리미터(결정론 CSR 재생).
     struct NOBuf
     {
-        double *kf3 = nullptr, *dcs = nullptr;    // [3*nf], [nf] 상주
+        double *dcs = nullptr;                     // [nf] 상주
         double *corrF = nullptr, *bCorr = nullptr; // [nf], [nbf]
-        double *Cf3 = nullptr, *C3 = nullptr, *CfB3 = nullptr;
+        double *C3 = nullptr, *CfB3 = nullptr;     // [3*nc], [3*nbf]
+        double *ownStage = nullptr;                // 자체 [3*nf] (필요시)
         double mdK = -1;
         int armed = 0;
     } gNO;
@@ -197,8 +198,8 @@ namespace
             &gU.rAU, &gU.HbyA3, &gU.parB,
             &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld,
-            &gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr,
-            &gNO.Cf3, &gNO.C3, &gNO.CfB3
+            &gNO.dcs, &gNO.corrF, &gNO.bCorr,
+            &gNO.C3, &gNO.CfB3, &gNO.ownStage
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gNO.armed = 0;
@@ -3239,20 +3240,18 @@ int rgpSTEqnDump
 //  강등 규약과 동일).
 int rgpPEqnNOArm
 (
-    const double* kf3, const double* dcsNO,
-    double mdK, const double* Cf3, const double* C3, const double* CfB3
+    const double* dcsNO, double mdK,
+    const double* C3, const double* CfB3
 )
 {
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
     cudaError_t e = cudaSuccess;
-    const int useMD = (mdK >= 0 && Cf3 && C3);
+    const int useMD = (mdK >= 0 && C3);
     struct { double** d; const double* s; size_t n; } it[] =
     {
-        {&gNO.kf3, kf3, (size_t)3*nf},
         {&gNO.dcs, dcsNO, (size_t)nf},
         {&gNO.corrF, nullptr, (size_t)nf},
         {&gNO.bCorr, nullptr, (size_t)(nbf > 0 ? nbf : 1)},
-        {&gNO.Cf3, useMD ? Cf3 : nullptr, useMD ? (size_t)3*nf : 0},
         {&gNO.C3, useMD ? C3 : nullptr, useMD ? (size_t)3*nc : 0},
         {&gNO.CfB3, useMD ? CfB3 : nullptr,
          useMD ? (size_t)3*(nbf > 0 ? nbf : 1) : 0}
@@ -3266,8 +3265,8 @@ int rgpPEqnNOArm
             {
                 double** ps[] =
                 {
-                    &gNO.kf3, &gNO.dcs, &gNO.corrF, &gNO.bCorr,
-                    &gNO.Cf3, &gNO.C3, &gNO.CfB3
+                    &gNO.dcs, &gNO.corrF, &gNO.bCorr,
+                    &gNO.C3, &gNO.CfB3, &gNO.ownStage
                 };
                 for (auto p : ps)
                 {
@@ -3292,6 +3291,25 @@ int rgpPEqnNOArm
 }
 
 
+//- kf3/Cf3 [3*nf] 패스별 스테이지: pCorr 동안 유휴인 UEqn grad9를
+//  별칭(9*nc >= 3*nf일 때), 아니면 자체 지연 할당
+static double* noStage(cudaError_t* e)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces;
+    *e = cudaSuccess;
+    if (gU.grad9 && (size_t)9*nc >= (size_t)3*nf)
+    {
+        return gU.grad9;
+    }
+    if (!gNO.ownStage)
+    {
+        if ((*e = cudaMalloc(&gNO.ownStage, (size_t)3*nf*sizeof(double)))
+            != cudaSuccess) return nullptr;
+    }
+    return gNO.ownStage;
+}
+
+
 //- 은퇴한 디바이스 U-리미터(uLimVWeights)의 dvec [3*nf] 해제 —
 //  호스트 가중치 전달이 상시가 된 뒤 VRAM 회수용 (6GB 카드의
 //  cellMDLimited 지오메트리 상주 여유 확보)
@@ -3308,6 +3326,7 @@ int rgpSTDvecRelease(void)
 int rgpPEqnNOCorrPrep
 (
     const double* pCell, const double* pBFace, const double* gMsf,
+    const double* kf3, const double* Cf3,
     double limitCoeff, double* bGrad3Out
 )
 {
@@ -3333,6 +3352,9 @@ int rgpPEqnNOCorrPrep
             return pfail(e, "noCorr/H2D");
     }
 
+    double* stage = noStage(&e);
+    if (!stage) return pfail(e, "noCorr/stage");
+
     rgppeqn::noFaceInterp<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gSTM.wLin, gB.pA, gB.flux);
     rgppeqn::stGradGather<<<nb(nc), BS>>>
@@ -3340,6 +3362,15 @@ int rgpPEqnNOCorrPrep
          gB.flux, gST.bPsi, gM.V, gST.grad);
     if (gNO.mdK >= 0)
     {
+        if (!Cf3)
+        {
+            snprintf(gPErr, sizeof(gPErr), "noCorr: Cf3 required (MD)");
+            return -1;
+        }
+        // Cf3 스테이징 (동기 memcpy가 위 커널들 완료를 대기 — 순서 안전)
+        if ((e = cudaMemcpy(stage, Cf3, (size_t)3*nf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "noCorr/Cf3 H2D");
         // cellMDLimited (min/max 스크래치는 BiCG 작업 버퍼 재사용 —
         // pEqn 솔브 전이라 유휴)
         const double rk = (gNO.mdK < 1.0) ? (1.0/gNO.mdK - 1.0) : 0.0;
@@ -3348,10 +3379,14 @@ int rgpPEqnNOCorrPrep
              gB.pA, gST.bPsi, rk, gST.rA0, gST.sA);
         rgppeqn::noMDLimit<<<nb(nc), BS>>>
             (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
-             gNO.Cf3, gNO.C3, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
+             stage, gNO.C3, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
     }
+    // kf3 스테이징 (Cf3 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장)
+    if ((e = cudaMemcpy(stage, kf3, (size_t)3*nf*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "noCorr/kf3 H2D");
     rgppeqn::noFaceCorr<<<nb(nf), BS>>>
-        (nf, nc, gM.own, gM.nei, gSTM.wLin, gNO.kf3, gNO.dcs,
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, stage, gNO.dcs,
          gB.pA, gB.rAUf, gST.grad, limitCoeff, gNO.corrF);
     if (nbf > 0 && bGrad3Out)
     {

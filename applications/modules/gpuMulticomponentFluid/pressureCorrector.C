@@ -466,6 +466,8 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
             (
                 solveP.primitiveField().begin(), pBF.begin(),
                 A.primitiveField().begin(),
+                gpuNOKf3_.begin(),
+                gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
                 gpuNOLimitCoeff_, bG3.begin()
             ))
         {

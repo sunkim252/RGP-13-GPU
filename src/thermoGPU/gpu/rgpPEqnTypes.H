@@ -258,11 +258,12 @@ int rgpSTEqnSolve
 
 /*  비직교 보정 소스 디바이스화 (limited/corrected snGrad 전용, 직렬 v1;
     호출자는 스킴 파싱·경계 corr_b 계산·강등 폴백을 담당):
-    Arm: kf3=[3*nf] 비직교 보정 벡터 SoA, dcsNO=[nf] nonOrthDeltaCoeffs.
-         mdK >= 0 이면 grad(p)에 cellMDLimited(k=mdK) 리미터를 결정론
-         CSR 재생으로 적용 — Cf3=[3*nf]·C3=[3*nc]·CfB3=[3*nbf] 지오메트리
-         상주 필요 (CPU 식 dcf=Cf−C 그대로 — 파생식은 ±ulp로 이산 분기
-         플립). mdK < 0 또는 k<small → 순수 Gauss linear.
+    Arm: dcsNO=[nf] nonOrthDeltaCoeffs 상주. mdK >= 0 이면 grad(p)에
+         cellMDLimited(k=mdK) 리미터를 결정론 CSR 재생으로 적용 —
+         C3=[3*nc]·CfB3=[3*nbf] 상주 (CPU 식 dcf=Cf−C 그대로 — 파생식은
+         ±ulp로 이산 분기 플립). mdK < 0 또는 k<small → 순수 Gauss
+         linear. kf3/Cf3 [3*nf]는 상주하지 않고 Prep가 패스별 스테이징
+         (UEqn grad9 별칭 — VRAM 순증 ~수십 MB).
          VRAM 부족 시 -2 (호스트 경로 강등).
     Prep: p 셀값·경계 면값(linear interp 규약)·gMsf=rAUf*magSf 업로드
          → grad(결정론 게더)·면 보정 플럭스 디바이스 계산, 경계셀
@@ -273,8 +274,8 @@ int rgpSTEqnSolve
     limitCoeff < 0 → corrected(무리미터).                              */
 int rgpPEqnNOArm
 (
-    const double* kf3, const double* dcsNO,
-    double mdK, const double* Cf3, const double* C3, const double* CfB3
+    const double* dcsNO, double mdK,
+    const double* C3, const double* CfB3
 );
 
 /*  은퇴한 디바이스 U-리미터의 dvec [3*nf] 해제 (호스트 가중치 상시
@@ -283,6 +284,8 @@ int rgpSTDvecRelease(void);
 int rgpPEqnNOCorrPrep
 (
     const double* pCell, const double* pBFace, const double* gMsf,
+    const double* kf3,          /* [3*nf] 비직교 보정 벡터 (매 패스) */
+    const double* Cf3,          /* [3*nf] 면 중심 (mdK>=0일 때 필수) */
     double limitCoeff, double* bGrad3Out
 );
 int rgpPEqnNOCorrFinish

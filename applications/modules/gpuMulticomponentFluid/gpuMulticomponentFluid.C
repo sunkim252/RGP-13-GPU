@@ -288,27 +288,28 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
             forAll(dno, f) { dno[f] = dnof[f]; }
             const surfaceVectorField& kf =
                 mesh.nonOrthCorrectionVectors();
-            List<double> kf3(3*nif);
+            gpuNOKf3_.setSize(3*nif);
             forAll(mesh.owner(), f)
             {
                 for (label k = 0; k < 3; k++)
                 {
-                    kf3[k*nif + f] = kf.primitiveField()[f][k];
+                    gpuNOKf3_[k*nif + f] = kf.primitiveField()[f][k];
                 }
             }
-            List<double> Cf3, C3, CfB3;
+            List<double> C3, CfB3;
             if (mdK >= 0)
             {
                 const surfaceVectorField& Cf = mesh.Cf();
                 const volVectorField& C = mesh.C();
-                Cf3.setSize(3*nif);
+                gpuNOCf3_.setSize(3*nif);
                 C3.setSize(3*nc);
                 CfB3.setSize(3*max(nbf, label(1)), 0.0);
                 forAll(mesh.owner(), f)
                 {
                     for (label k = 0; k < 3; k++)
                     {
-                        Cf3[k*nif + f] = Cf.primitiveField()[f][k];
+                        gpuNOCf3_[k*nif + f] =
+                            Cf.primitiveField()[f][k];
                     }
                 }
                 for (label i = 0; i < nc; i++)
@@ -335,8 +336,7 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
             }
             const int rcNO = rgpPEqnNOArm
             (
-                kf3.begin(), dno.begin(), mdK,
-                mdK >= 0 ? Cf3.begin() : nullptr,
+                dno.begin(), mdK,
                 mdK >= 0 ? C3.begin() : nullptr,
                 mdK >= 0 ? CfB3.begin() : nullptr
             );
