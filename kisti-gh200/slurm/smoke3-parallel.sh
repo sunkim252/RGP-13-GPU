@@ -18,8 +18,8 @@ prep() {  # $1=디렉터리 $2=dlb(on/off)
       set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
       cd '$d'
       foamDictionary -entry endTime -set 2e-5 system/controlDict
-  foamDictionary -entry writeControl -set timeStep system/controlDict
-      foamDictionary -entry writeInterval -set 20 system/controlDict
+  foamDictionary -entry writeControl -set adjustableRunTime system/controlDict
+      foamDictionary -entry writeInterval -set 2e-5 system/controlDict
       blockMesh > log.blockMesh 2>&1 || true
       [ -f system/setFieldsDict ] && setFields > log.setFields 2>&1 || true
       foamDictionary -entry gpuCoeffs/dlb -set $dlb \

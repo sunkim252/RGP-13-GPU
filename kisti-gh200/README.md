@@ -79,10 +79,13 @@ gpuChemistryModel: ARMED — 9 species / 22 reactions exported from the case mec
 sbatch slurm/smoke2-parity.sh
 ```
 
-같은 케이스를 ① 자동(native) ② `RGP_GPU_UNIFIED=0`(강제 copy)로 돌려
-최종 시간 디렉터리 전 필드 `cmp` — **비트-동일이 통과 기준**.
-(x86에서 mode-1 mapped 프록시로 사전 검증된 항목의 실기 확정.
- 유일한 미검증 요소였던 'CUDA 런타임의 코히런스 시맨틱'이 여기서 닫힌다.)
+2단 판정 (x86에서 mode-1 mapped 프록시로 로직 자체를 사전 검증):
+- **Phase A (강)**: 화학-only GPU(gpuUEqn/pEqn off) — 완전 결정론 구성.
+  native vs copy **전 필드 비트-동일**이 통과 기준.
+- **Phase B (보조)**: 풀-GPU — U/phi 등 atomics 리덕션 필드는 같은
+  모드끼리도 run-to-run 비트-비동일(노이즈 클래스)이므로, copy 2회로
+  결정론 필드 집합을 구한 뒤 **그 집합에서만** native와 비트 비교.
+(유일한 미검증 요소였던 'CUDA 런타임의 코히런스 시맨틱'이 여기서 닫힌다.)
 
 ## 5. 스모크 #3 — 4랭크 병렬 + DLB + AmgX (GPU 1~4장, 15분)
 

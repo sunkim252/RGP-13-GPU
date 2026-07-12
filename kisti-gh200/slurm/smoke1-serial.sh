@@ -17,8 +17,8 @@ apptainer exec --nv "$SIF" bash -c "
   set +e; . /opt/OpenFOAM/OpenFOAM-13/etc/bashrc 2>/dev/null; set -e
   cd '$RUN'
   foamDictionary -entry endTime -set 2e-5 system/controlDict
-  foamDictionary -entry writeControl -set timeStep system/controlDict
-  foamDictionary -entry writeInterval -set 20 system/controlDict
+  foamDictionary -entry writeControl -set adjustableRunTime system/controlDict
+  foamDictionary -entry writeInterval -set 2e-5 system/controlDict
   blockMesh > log.blockMesh 2>&1 || true
   [ -f system/setFieldsDict ] && setFields > log.setFields 2>&1 || true
   foamRun > log.smoke1 2>&1
