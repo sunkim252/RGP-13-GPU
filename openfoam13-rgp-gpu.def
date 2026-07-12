@@ -86,7 +86,7 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
 # ── wmake CUDA compilation rules ──
 SUFFIXES += .cu
 
-CUDA_ARCH   = -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90
+CUDA_ARCH   = -gencode arch=compute_75,code=sm_75 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90
 NVCC        = nvcc
 # -fmad=false: FMA 축약 금지 -- CPU(g++ 비-FMA 코드젠)와의 ULP 정합을 위해.
 # --use_fast_math는 정합 검증(Test-rgpThermoGPU) 신뢰성을 위해 제외.
