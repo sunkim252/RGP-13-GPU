@@ -131,6 +131,8 @@ CUDA_RULES
 
     # fgmFluid 솔버 모듈 + 테이블 유틸리티
     ( cd applications/modules/fgmFluid && wmake libso ) 2>&1 | tail -5
+    # 일반 연소(finite-rate/EDC) GPU 모듈
+    ( cd applications/modules/gpuMulticomponentFluid && wmake libso ) 2>&1 | tail -5
     ( cd applications/utilities/fgmTabulateRealGasCoeffs && wmake ) 2>&1 | tail -3
     ( cd applications/utilities/fgmTabulateLewis && wmake ) 2>&1 | tail -3
 
@@ -142,6 +144,7 @@ CUDA_RULES
 
     # 산출물 검증 — 없으면 이미지 빌드 자체를 실패시킨다
     ls -lh $FOAM_LIBBIN/libRGP13realFluid.so $FOAM_LIBBIN/libfgmFluid.so \
+           $FOAM_LIBBIN/libgpuMulticomponentFluid.so \
            $FOAM_LIBBIN/librgpThermoGPU.so \
            $FOAM_APPBIN/fgmTabulateRealGasCoeffs $FOAM_APPBIN/fgmTabulateLewis \
            $FOAM_APPBIN/Test-rgpThermoGPU
