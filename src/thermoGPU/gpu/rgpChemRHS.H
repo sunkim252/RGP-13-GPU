@@ -127,7 +127,15 @@ RGP_HD void chemRHS
                 dnu += nu;
             }
             const double lnKc = -sumG + dnu*lnP0RT;
-            kr = kf*exp(-lnKc);
+            // OF-13 ReversibleReaction::kr = kf/max(Kc, rootSmall) 정합.
+            // Kc 언더플로(전선/순수희석 저온 셀)에서 exp(-lnKc)가 Inf로
+            // 오버플로해 qr=Inf*0=NaN -> Jacobian NaN -> LU 실패 ->
+            // h-붕괴가 되는 것을 방지. Kc > rootSmall이면 기존 식 그대로
+            // (비트 동일); NaN도 비교 false로 클램프 가지에 잡힘.
+            const double Kc = exp(lnKc);
+            kr = (Kc > 3.1622776601683795e-8)
+                ? kf*exp(-lnKc)
+                : kf/3.1622776601683795e-8;
         }
 
         // 질량작용

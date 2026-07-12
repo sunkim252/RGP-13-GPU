@@ -279,6 +279,8 @@ __global__ void chemScatter
 }
 
 //- 셀 하나 적분: [0, dtTot], 적응 Rosenbrock34
+__device__ int gDiagCount = 0;
+
 __global__ void chemIntegrateKernel
 (
     const rgpChemMech* __restrict__ mechP,
@@ -343,7 +345,18 @@ __global__ void chemIntegrateKernel
                 ? 0.25
                 : fmin(fmax(0.9*pow(errNorm, -1.0/3.0), 0.1), 0.5);
             h *= f;
-            if (h < 1e-25) { stepsF[celli] = -1; return; }
+            if (h < 1e-25)
+            {
+                // 진단: 붕괴 셀 상태 한 줄 덤프 (최초 8셀)
+                if (atomicAdd(&gDiagCount, 1) < 8)
+                {
+                    printf("rgpChem h-collapse: cell %d t=%.3e/%.3e"
+                           " err=%.3e p=%.3e T=%.2f c0..3= %.3e %.3e"
+                           " %.3e %.3e\n", celli, t, dtTot, errNorm,
+                           p, y0[n], y0[0], y0[1], y0[2], y0[3]);
+                }
+                stepsF[celli] = -1; return;
+            }
         }
 
         if (nSteps > 2000000) { stepsF[celli] = -2; return; }
