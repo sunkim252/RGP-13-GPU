@@ -132,22 +132,6 @@ Foam::solvers::gpuMulticomponentFluid::~gpuMulticomponentFluid()
 
 void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
 {
-    // 랭크→GPU 매핑 + 코히런트 HW 감지(gRgpUnified)를 **버퍼 할당 전**
-    // 수행 — 미호출이면 전 랭크가 device 0에 할당(멀티 GPU 노드에서
-    // cudaErrorIllegalAddress)하고 GH200 native 감지도 안 된다.
-    // (fgmFluid::gpuThermoCorrect 아밍과 동일 규약; 멱등)
-    {
-        const int nDev = max(rgpGpuDeviceCount(), 1);
-        const int dev = Pstream::parRun()
-            ? (Pstream::myProcNo() % nDev) : 0;
-        if (rgpGpuInit(dev))
-        {
-            FatalErrorInFunction
-                << "rgpGpuInit(device " << dev << ") failed"
-                << exit(FatalError);
-        }
-    }
-
     const label nc = mesh.nCells();
     const label nif = mesh.owner().size();
 
@@ -164,6 +148,23 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
         }
         Info<< "gpuMulticomponentFluid: mesh changed -- re-arming"
             << nl << endl;
+    }
+
+    // 랭크→GPU 매핑 + 코히런트 HW 감지(gRgpUnified)를 **버퍼 할당 전**
+    // 수행 — 미호출이면 전 랭크가 device 0에 할당(멀티 GPU 노드에서
+    // cudaErrorIllegalAddress)하고 GH200 native 감지도 안 된다.
+    // (fgmFluid::gpuThermoCorrect 아밍과 동일 규약; 멱등 — 래치 뒤라
+    // 아밍/재아밍 시에만 실행)
+    {
+        const int nDev = max(rgpGpuDeviceCount(), 1);
+        const int dev = Pstream::parRun()
+            ? (Pstream::myProcNo() % nDev) : 0;
+        if (rgpGpuInit(dev))
+        {
+            FatalErrorInFunction
+                << "rgpGpuInit(device " << dev << ") failed"
+                << exit(FatalError);
+        }
     }
 
     label nbf = 0;
