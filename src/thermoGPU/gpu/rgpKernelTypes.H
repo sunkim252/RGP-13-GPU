@@ -89,6 +89,12 @@ int  rgpGpuEvaluateHa
     디바이스 SoA 출력에서 직접 취해 호스트 왕복을 제거한다. p만 업로드.
     yMap[s] >= 0: fgm 필드 인덱스(2+k), < 0: yHost SoA의 (-1-yMap[s])행
     (비테이블 종). 셀 수는 마지막 fgm evaluate와 같아야 한다.          */
+/*  coeffMap: fgm SoA 내 Tier-2 실기체 혼합계수 13필드의 인덱스
+    [bM, coef1, coef2, coef3, cM, sigmaM, epsilonkM, MM, VcM, TcM,
+     omegaM, miuiM, kappaiM] (tabulatedRealGasMixture::coeffNames 순).
+    비-NULL이면 커널이 셀당 O(n^2) 쌍 혼합 대신 보간된 계수를 직접
+    소비 — CPU Tier-2 lookup 경로와 1:1 (Wmix/janaf 블렌드는 O(n) 유지).
+    NULL이면 기존 라이브 혼합.                                          */
 int  rgpGpuEvaluateFromFgm
 (
     int nCells,
@@ -96,6 +102,7 @@ int  rgpGpuEvaluateFromFgm
     const int* yMap,
     int nYHost,
     const double* yHost,
+    const int* coeffMap,
     double* rho,
     double* mu,
     double* kappa,
@@ -111,6 +118,7 @@ int  rgpGpuEvaluateHaFromFgm
     const int* yMap,
     int nYHost,
     const double* yHost,
+    const int* coeffMap,
     double* ha
 );
 

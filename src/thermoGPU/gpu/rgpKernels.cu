@@ -67,6 +67,7 @@ namespace
 
         // fgm 디바이스 체인용: 종→fgm 필드 맵 + 비테이블 종 호스트 Y
         int*    yMap = nullptr;   // [RGP_GPU_MAX_SPECIES]
+        int*    cMap = nullptr;   // [13] Tier-2 계수 fgm 필드 인덱스
         double* yH = nullptr;     // [yHCap]
         size_t  yHCap = 0;
     };
@@ -103,6 +104,7 @@ namespace
         };
         for (auto pp : ptrs) { if (*pp) { cudaFree(*pp); *pp = nullptr; } }
         if (gBuf.yMap) { cudaFree(gBuf.yMap); gBuf.yMap = nullptr; }
+        if (gBuf.cMap) { cudaFree(gBuf.cMap); gBuf.cMap = nullptr; }
         gBuf.capOut = 0;
         gBuf.capStage = 0;
         gBuf.yHCap = 0;
@@ -381,6 +383,24 @@ __device__ inline double rgpYAt
       : v.yh[(size_t)(-1 - m)*v.stride + cell];
 }
 
+//- Tier-2 혼합계수 뷰: map != null이면 fgm SoA에서 보간된 13계수
+//  [bM,coef1..3,cM,sigmaM,epsilonkM,MM,VcM,TcM,omegaM,miuiM,kappaiM]
+//  를 직접 읽어 셀당 O(n^2) 쌍 혼합을 건너뛴다 (CPU Tier-2 lookup 1:1)
+struct TabView
+{
+    const double* soa;
+    const int*    map;    // [13] fgm 필드 인덱스 (디바이스)
+    size_t        stride;
+};
+
+__device__ inline double rgpCoeffAt
+(
+    const TabView& t, const int k, const int cell
+)
+{
+    return t.soa[(size_t)t.map[k]*t.stride + cell];
+}
+
 
 //- 셀 하나의 ha [J/kg]: janafThermo::ha(질량기준 계수 블렌드) +
 //  SRKGas::h(믹스처 departure) — updateManifold의 he 재시드
@@ -392,6 +412,7 @@ __global__ void rgpHaKernel
     const double* __restrict__ pF,
     const double* __restrict__ TF,
     const YView    yv,
+    const TabView  tv,
     double* __restrict__ haF
 )
 {
@@ -405,6 +426,25 @@ __global__ void rgpHaKernel
     double Yc[RGP_GPU_MAX_SPECIES];
     for (int i = 0; i < n; i++) { Yc[i] = rgpYAt(yv, n, celli, i); }
 
+    double sumY = 0.0, sumYoW = 0.0;
+    for (int i = 0; i < n; i++)
+    {
+        sumY += Yc[i];
+        sumYoW += Yc[i]/kp.W[i];
+    }
+    const double Wmix = (sumYoW != 0.0) ? sumY/sumYoW : kp.W[0];
+
+    double bM, coef1, coef2, coef3;
+    if (tv.map)
+    {
+        // Tier-2: 매니폴드 보간 계수 직접 소비 (CPU lookup 1:1)
+        bM    = rgpCoeffAt(tv, 0, celli);
+        coef1 = rgpCoeffAt(tv, 1, celli);
+        coef2 = rgpCoeffAt(tv, 2, celli);
+        coef3 = rgpCoeffAt(tv, 3, celli);
+    }
+    else
+    {
     double X[RGP_GPU_MAX_SPECIES];
 
     // ── compositionToX (원시 Y → 몰분율) ──────────────────────────────
@@ -417,16 +457,8 @@ __global__ void rgpHaKernel
         if (X[i] <= 0.0) { X[i] = 0.0; }
     }
 
-    double sumY = 0.0, sumYoW = 0.0;
-    for (int i = 0; i < n; i++)
-    {
-        sumY += Yc[i];
-        sumYoW += Yc[i]/kp.W[i];
-    }
-    const double Wmix = (sumYoW != 0.0) ? sumY/sumYoW : kp.W[0];
-
     // ── EOS 쌍 혼합 (ha에는 bM, coef1..3만 필요) ──────────────────────
-    double bM = 0, coef1 = 0, coef2 = 0, coef3 = 0;
+    bM = 0; coef1 = 0; coef2 = 0; coef3 = 0;
     for (int i = 0; i < n; i++)
     {
         bM += X[i]*kp.BM[i];
@@ -446,6 +478,7 @@ __global__ void rgpHaKernel
             coef2 += txx*kp.C2[ij];
             coef3 += txx*kp.C3[ij];
         }
+    }
     }
 
     const double p = pF[celli];
@@ -506,6 +539,7 @@ __global__ void rgpEvaluateKernel
     const double* __restrict__ pF,
     const double* __restrict__ TF,
     const YView    yv,
+    const TabView  tv,
     double* __restrict__ rhoF,
     double* __restrict__ muF,
     double* __restrict__ kappaF,
@@ -523,6 +557,44 @@ __global__ void rgpEvaluateKernel
     double Yc[RGP_GPU_MAX_SPECIES];
     for (int i = 0; i < n; i++) { Yc[i] = rgpYAt(yv, n, celli, i); }
 
+    // ── 믹스처 몰질량 (specie 질량 블렌드: Wmix = ΣY / Σ(Y/W)) ─────────
+    double sumY = 0.0, sumYoW = 0.0;
+    for (int i = 0; i < n; i++)
+    {
+        sumY += Yc[i];
+        sumYoW += Yc[i]/kp.W[i];
+    }
+    const double Wmix = (sumYoW != 0.0) ? sumY/sumYoW : kp.W[0];
+    const double Rmass = RR/Wmix;
+
+    double bM, coef1, coef2, coef3, cM;
+    double sigmaM, epsilonkM, VcM, TcM, omegaM, MM, miuiM, kappaiM;
+    double sumXmd;
+
+    if (tv.map)
+    {
+        // ── Tier-2: 매니폴드 보간 계수 직접 소비 (CPU lookup 1:1;
+        //    O(n^2) 쌍 혼합·유도 변환 전부 생략, floor도 미적용 —
+        //    테이블 노드값이 이미 calculateRealGas 산출물) ──
+        bM        = rgpCoeffAt(tv,  0, celli);
+        coef1     = rgpCoeffAt(tv,  1, celli);
+        coef2     = rgpCoeffAt(tv,  2, celli);
+        coef3     = rgpCoeffAt(tv,  3, celli);
+        cM        = rgpCoeffAt(tv,  4, celli);
+        sigmaM    = rgpCoeffAt(tv,  5, celli);
+        epsilonkM = rgpCoeffAt(tv,  6, celli);
+        MM        = rgpCoeffAt(tv,  7, celli);
+        VcM       = rgpCoeffAt(tv,  8, celli);
+        TcM       = rgpCoeffAt(tv,  9, celli);
+        omegaM    = rgpCoeffAt(tv, 10, celli);
+        miuiM     = rgpCoeffAt(tv, 11, celli);
+        kappaiM   = rgpCoeffAt(tv, 12, celli);
+        (void)sigmaM;
+        // updateTRANS의 Xmd 게이트: 정규화 X라 항상 1 (CPU 동일)
+        sumXmd = 1.0;
+    }
+    else
+    {
     double X[RGP_GPU_MAX_SPECIES];
 
     // ── compositionToX (원시 Y → 몰분율) ──────────────────────────────
@@ -535,20 +607,10 @@ __global__ void rgpEvaluateKernel
         if (X[i] <= 0.0) { X[i] = 0.0; }
     }
 
-    // ── 믹스처 몰질량 (specie 질량 블렌드: Wmix = ΣY / Σ(Y/W)) ─────────
-    double sumY = 0.0, sumYoW = 0.0;
-    for (int i = 0; i < n; i++)
-    {
-        sumY += Yc[i];
-        sumYoW += Yc[i]/kp.W[i];
-    }
-    const double Wmix = (sumYoW != 0.0) ? sumY/sumYoW : kp.W[0];
-    const double Rmass = RR/Wmix;
-
     // ── calculateRealGas: 쌍 혼합 (대각 + 2×상삼각) ────────────────────
-    double bM = 0, coef1 = 0, coef2 = 0, coef3 = 0, cM = 0;
+    bM = 0; coef1 = 0; coef2 = 0; coef3 = 0; cM = 0;
     double sigma3M = 0, epsilonkM0 = 0, omegaM0 = 0, MM0v = 0, miuiM0 = 0;
-    double kappaiM = 0;
+    kappaiM = 0;
 
     for (int i = 0; i < n; i++)
     {
@@ -586,29 +648,30 @@ __global__ void rgpEvaluateKernel
     }
 
     if (sigma3M == 0.0) { sigma3M = 1e-30; }
-    const double sigmaM = cbrt(sigma3M);
+    sigmaM = cbrt(sigma3M);
 
-    double epsilonkM = epsilonkM0/sigma3M;
+    epsilonkM = epsilonkM0/sigma3M;
     if (epsilonkM == 0.0) { epsilonkM = 1e-30; }
 
     const double sigmaOverConst = sigmaM/0.809;
-    double VcM = sigmaOverConst*sigmaOverConst*sigmaOverConst;
+    VcM = sigmaOverConst*sigmaOverConst*sigmaOverConst;
     if (VcM == 0.0) { VcM = 1e-30; }
 
-    const double TcM = 1.2593*epsilonkM;
-    const double omegaM = omegaM0/sigma3M;
+    TcM = 1.2593*epsilonkM;
+    omegaM = omegaM0/sigma3M;
 
     const double MM0_term = MM0v/(epsilonkM*sigmaM*sigmaM);
-    double MM = MM0_term*MM0_term;
+    MM = MM0_term*MM0_term;
     if (MM == 0.0) { MM = 1e-30; }
 
-    const double miuiM = sqrt(sqrt(miuiM0*sigma3M*epsilonkM));
+    miuiM = sqrt(sqrt(miuiM0*sigma3M*epsilonkM));
 
     // ── X 보정 (calcMixture: updateTRANS 직전) ────────────────────────
     double sumXcorr = 0.0;
     for (int i = 0; i < n; i++) { X[i] += 1e-40; sumXcorr += X[i]; }
-    double sumXmd = 0.0;
+    sumXmd = 0.0;
     for (int i = 0; i < n; i++) { X[i] /= sumXcorr; sumXmd += X[i]; }
+    }
 
     // ── JANAF 질량기준 계수 블렌드 (Σ (Y/ΣY)·a_i) ─────────────────────
     //   (kappa의 Cv_ideal용. OF 관례: 온도범위/Tcommon은 종-0 승계)
@@ -782,7 +845,8 @@ static int chainPrepare
 (
     int nCells, const double* p,
     const int* yMap, int nYHost, const double* yHost,
-    const double** dTOut, rgp::YView* yvOut
+    const int* coeffMap,
+    const double** dTOut, rgp::YView* yvOut, rgp::TabView* tvOut
 );
 
 int rgpGpuInit(int deviceId)
@@ -944,11 +1008,12 @@ int rgpGpuEvaluate
         double* oPsi = rgpOutPtr(psi + off, gBuf.psi);
 
         const rgp::YView yv{dY, nullptr, nullptr, nullptr, 0};
+        const rgp::TabView tvN{nullptr, nullptr, 0};
 
         const int gridSize = (count + blockSize - 1)/blockSize;
         rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
         (
-            kp, count, dP, dT, yv,
+            kp, count, dP, dT, yv, tvN,
             oRho, oMu, oKappa, oCp, oCv, oPsi
         );
         if ((e = cudaGetLastError()) != cudaSuccess)
@@ -978,7 +1043,8 @@ static int chainPrepare
 (
     int nCells, const double* p,
     const int* yMap, int nYHost, const double* yHost,
-    const double** dTOut, rgp::YView* yvOut
+    const int* coeffMap,
+    const double** dTOut, rgp::YView* yvOut, rgp::TabView* tvOut
 )
 {
     const int n = gTab.nSpecies;
@@ -1024,6 +1090,23 @@ static int chainPrepare
             != cudaSuccess) return fail(e, "chain/H2D yH");
     }
 
+    // Tier-2 계수 맵 (nullable)
+    tvOut->soa = fgmOut;
+    tvOut->map = nullptr;
+    tvOut->stride = (size_t)nCells;
+    if (coeffMap)
+    {
+        if (!gBuf.cMap)
+        {
+            if ((e = cudaMalloc(&gBuf.cMap, 13*sizeof(int)))
+                != cudaSuccess) return fail(e, "chain/malloc cMap");
+        }
+        if ((e = cudaMemcpy(gBuf.cMap, coeffMap, 13*sizeof(int),
+                            cudaMemcpyHostToDevice))
+            != cudaSuccess) return fail(e, "chain/H2D cMap");
+        tvOut->map = gBuf.cMap;
+    }
+
     *dTOut = fgmOut + (size_t)nCells;   // field 1 = T
     yvOut->aos = nullptr;
     yvOut->soa = fgmOut;
@@ -1059,6 +1142,7 @@ int rgpGpuEvaluateFromFgm
     const int* yMap,
     int nYHost,
     const double* yHost,
+    const int* coeffMap,
     double* rho,
     double* mu,
     double* kappa,
@@ -1077,7 +1161,11 @@ int rgpGpuEvaluateFromFgm
 
     const double* dT = nullptr;
     rgp::YView yv{};
-    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost, &dT, &yv);
+    rgp::TabView tvC{};
+    int rc = chainPrepare
+    (
+        nCells, p, yMap, nYHost, yHost, coeffMap, &dT, &yv, &tvC
+    );
     if (rc) return rc;
 
     rgp::KParams kp;
@@ -1088,7 +1176,7 @@ int rgpGpuEvaluateFromFgm
 
     rgp::rgpEvaluateKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, dT, yv,
+        kp, nCells, gBuf.p, dT, yv, tvC,
         gBuf.rho, gBuf.mu, gBuf.kappa, gBuf.Cp, gBuf.Cv, gBuf.psi
     );
     cudaError_t e;
@@ -1119,6 +1207,7 @@ int rgpGpuEvaluateHaFromFgm
     const int* yMap,
     int nYHost,
     const double* yHost,
+    const int* coeffMap,
     double* ha
 )
 {
@@ -1132,7 +1221,11 @@ int rgpGpuEvaluateHaFromFgm
 
     const double* dT = nullptr;
     rgp::YView yv{};
-    int rc = chainPrepare(nCells, p, yMap, nYHost, yHost, &dT, &yv);
+    rgp::TabView tvC{};
+    int rc = chainPrepare
+    (
+        nCells, p, yMap, nYHost, yHost, coeffMap, &dT, &yv, &tvC
+    );
     if (rc) return rc;
 
     rgp::KParams kp;
@@ -1145,7 +1238,7 @@ int rgpGpuEvaluateHaFromFgm
     // 있으므로 피한다 — ha 전용 호출 뒤 항상 D2H로 회수됨)
     rgp::rgpHaKernel<<<gridSize, blockSize>>>
     (
-        kp, nCells, gBuf.p, dT, yv, gBuf.rho
+        kp, nCells, gBuf.p, dT, yv, tvC, gBuf.rho
     );
     cudaError_t e;
     if ((e = cudaGetLastError()) != cudaSuccess)
@@ -1208,11 +1301,12 @@ int rgpGpuEvaluateHa
         double* oHa = rgpOutPtr(ha + off, gBuf.Cp);
 
         const rgp::YView yv{dY, nullptr, nullptr, nullptr, 0};
+        const rgp::TabView tvN{nullptr, nullptr, 0};
 
         const int gridSize = (count + blockSize - 1)/blockSize;
         rgp::rgpHaKernel<<<gridSize, blockSize>>>
         (
-            kp, count, dP, dT, yv, oHa
+            kp, count, dP, dT, yv, tvN, oHa
         );
         if ((e = cudaGetLastError()) != cudaSuccess)
             return fail(e, "evaluateHa/launch");

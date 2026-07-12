@@ -190,11 +190,24 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
             gpuP_.begin(), pf.primitiveField().begin(), nInt*sizeof(double)
         );
 
+        // Tier-2: 매니폴드 SoA의 RG_* 13필드 인덱스 — 커널이 계수를
+        // 직접 소비해 셀당 O(n^2) 혼합 제거 (CPU lookup 경로와 1:1)
+        List<int> cMap;
+        if (tabRealGasCoeffs_)
+        {
+            cMap.setSize(13);
+            forAll(cMap, k)
+            {
+                cMap[k] = 2 + tabSpecieIDs_.size() + k;
+            }
+        }
+
         chained =
             rgpGpuEvaluateFromFgm
             (
                 nInt,
                 gpuP_.begin(), yMap.begin(), nH, gpuY_.begin(),
+                cMap.size() ? cMap.begin() : nullptr,
                 gpuRho_.begin(), gpuMu_.begin(), gpuKappa_.begin(),
                 gpuCp_.begin(), gpuCv_.begin(), gpuPsi_.begin()
             ) == 0;
@@ -460,11 +473,22 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
             gpuP_.begin(), pf.primitiveField().begin(), nInt*sizeof(double)
         );
 
+        List<int> cMap;
+        if (tabRealGasCoeffs_)
+        {
+            cMap.setSize(13);
+            forAll(cMap, k)
+            {
+                cMap[k] = 2 + tabSpecieIDs_.size() + k;
+            }
+        }
+
         chained =
             rgpGpuEvaluateHaFromFgm
             (
                 nInt,
                 gpuP_.begin(), yMap.begin(), nH, gpuY_.begin(),
+                cMap.size() ? cMap.begin() : nullptr,
                 gpuCp_.begin()
             ) == 0;
 
