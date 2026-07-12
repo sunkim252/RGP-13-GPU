@@ -160,7 +160,14 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             );
 
             const scalarField& wi = wMv.primitiveField();
-            gpuZCBuf_.setSize(wi.size());
+            // grow-only: 이 버퍼는 pin 대상 — setSize 축소/재확장은
+            // 재할당이라 page-lock 등록이 dangling이 된다 (glibc가
+            // stale 등록 범위를 재활용하는 순간 H2D invalid argument
+            // — 2Mv2 실측). 최대 크기 도달 후 주소 고정.
+            if (gpuZCBuf_.size() < wi.size())
+            {
+                gpuZCBuf_.setSize(wi.size());
+            }
             forAll(wi, f) { gpuZCBuf_[f] = wi[f]; }
             if (rgpSTWeightsSet(gpuZCBuf_.begin()))
             {
@@ -353,7 +360,11 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         {
             nbf += psiF.boundaryField()[patchi].size();
         }
-        gpuZCBuf_.setSize(relaxAlpha > 0 ? 6*nbf : 3*nbf);
+        // grow-only (pin 안전 — 위 가중치 사이트 주석 참조)
+        {
+            const label need = relaxAlpha > 0 ? 6*nbf : 3*nbf;
+            if (gpuZCBuf_.size() < need) { gpuZCBuf_.setSize(need); }
+        }
         double* bDiagA = gpuZCBuf_.begin();
         double* bSrcA = bDiagA + nbf;
         double* bPsiA = bSrcA + nbf;
