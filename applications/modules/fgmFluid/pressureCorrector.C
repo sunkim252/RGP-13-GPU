@@ -1240,19 +1240,31 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 }
 
                 List<double> bG3(3*max(nbfL, label(1)), 0.0);
-                if (rgpPEqnNOCorrPrep
-                    (
-                        p.primitiveField().begin(), pBF.begin(),
-                        A.primitiveField().begin(),
-                        gpuNOKf3_.begin(),
-                        gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
-                        gpuNOLimitCoeff_, bG3.begin()
-                    ))
+                const int rcP = rgpPEqnNOCorrPrep
+                (
+                    p.primitiveField().begin(), pBF.begin(),
+                    A.primitiveField().begin(),
+                    gpuNOKf3_.begin(),
+                    gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
+                    gpuNOLimitCoeff_, bG3.begin()
+                );
+                if (rcP == -2)
+                {
+                    // 스테이징 VRAM 부족 — 호스트 경로로 영구 강등
+                    WarningInFunction
+                        << "device non-ortho source demoted ("
+                        << rgpPEqnLastError()
+                        << ") -- host fvc path" << endl;
+                    gpuNOSrcDev_ = false;
+                }
+                else if (rcP)
                 {
                     FatalErrorInFunction
                         << "rgpPEqnNOCorrPrep: " << rgpPEqnLastError()
                         << exit(FatalError);
                 }
+                if (gpuNOSrcDev_)
+                {
 
                 List<double> cfB(max(nbfL, label(1)), 0.0);
                 const surfaceVectorField& kf =
@@ -1343,6 +1355,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     r += tamdSrc().primitiveField();
                 }
                 return r;
+                }   // if (gpuNOSrcDev_) — 강등 시 아래 호스트 경로로
             }
 
             tmp<fv::snGradScheme<scalar>> tsn

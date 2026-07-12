@@ -462,19 +462,29 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
         }
 
         List<double> bG3(3*max(nbf, label(1)), 0.0);
-        if (rgpPEqnNOCorrPrep
-            (
-                solveP.primitiveField().begin(), pBF.begin(),
-                A.primitiveField().begin(),
-                gpuNOKf3_.begin(),
-                gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
-                gpuNOLimitCoeff_, bG3.begin()
-            ))
+        const int rcP = rgpPEqnNOCorrPrep
+        (
+            solveP.primitiveField().begin(), pBF.begin(),
+            A.primitiveField().begin(),
+            gpuNOKf3_.begin(),
+            gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
+            gpuNOLimitCoeff_, bG3.begin()
+        );
+        if (rcP == -2)
+        {
+            WarningInFunction
+                << "device non-ortho source demoted ("
+                << rgpPEqnLastError() << ") -- host fvc path" << endl;
+            gpuNOSrcDev_ = false;
+        }
+        else if (rcP)
         {
             FatalErrorInFunction
                 << "rgpPEqnNOCorrPrep: " << rgpPEqnLastError()
                 << exit(FatalError);
         }
+        if (gpuNOSrcDev_)
+        {
 
         List<double> cfB(max(nbf, label(1)), 0.0);
         const surfaceVectorField& kf = mesh.nonOrthCorrectionVectors();
@@ -552,8 +562,9 @@ void Foam::solvers::gpuMulticomponentFluid::correctPressureGpu()
             }
         }
         srcExtra += r;
+        }   // if (gpuNOSrcDev_) — 강등 시 아래 호스트 경로로
     }
-    else if (gpuNonOrtho_)
+    if (gpuNonOrtho_ && !gpuNOSrcDev_)
     {
         tPCorrFace = surfaceScalarField::New
         (

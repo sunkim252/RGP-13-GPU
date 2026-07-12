@@ -1501,7 +1501,9 @@ __global__ void noFaceCorr
     const int nf, const int nc,
     const int* __restrict__ own, const int* __restrict__ nei,
     const double* __restrict__ wLin,
-    const double* __restrict__ kf3, const double* __restrict__ dcs,
+    const double* __restrict__ kfx, const double* __restrict__ kfy,
+    const double* __restrict__ kfz,
+    const double* __restrict__ dcs,
     const double* __restrict__ x, const double* __restrict__ gMsf,
     const double* __restrict__ g3,
     const double limitCoeff,
@@ -1518,8 +1520,7 @@ __global__ void noFaceCorr
     const double g2 =
         w*(g3[(size_t)2*nc + o] - g3[(size_t)2*nc + n])
       + g3[(size_t)2*nc + n];
-    const double corr =
-        kf3[f]*g0 + kf3[(size_t)nf + f]*g1 + kf3[(size_t)2*nf + f]*g2;
+    const double corr = kfx[f]*g0 + kfy[f]*g1 + kfz[f]*g2;
 
     double lim = 1.0;
     if (limitCoeff >= 0.0)
@@ -1611,7 +1612,9 @@ __global__ void noMDLimit
 (
     const int nc, const int nf, const int nbf,
     const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
-    const double* __restrict__ Cf3, const double* __restrict__ C3,
+    const double* __restrict__ Cfx, const double* __restrict__ Cfy,
+    const double* __restrict__ Cfz,
+    const double* __restrict__ C3,
     const double* __restrict__ CfB3,
     const double* __restrict__ maxV, const double* __restrict__ minV,
     double* __restrict__ g3
@@ -1634,9 +1637,9 @@ __global__ void noMDLimit
         double dx, dy, dz;
         if (idx < nf)
         {
-            dx = Cf3[idx] - cx;
-            dy = Cf3[(size_t)nf + idx] - cy;
-            dz = Cf3[(size_t)2*nf + idx] - cz;
+            dx = Cfx[idx] - cx;
+            dy = Cfy[idx] - cy;
+            dz = Cfz[idx] - cz;
         }
         else
         {
@@ -3303,22 +3306,33 @@ int rgpPEqnNOArm
 }
 
 
-//- kf3/Cf3 [3*nf] 패스별 스테이지: pCorr 동안 유휴인 UEqn grad9를
-//  별칭(9*nc >= 3*nf일 때), 아니면 자체 지연 할당
-static double* noStage(cudaError_t* e)
+//- kf3/Cf3 패스별 성분 스테이징 플랜: x,y → gU.grad9 (9*nc >= 2*nf일
+//  때 — pCorr 동안 유휴), z → gB.flux (xf 스크래치, stGradGather 후
+//  유휴; [nf] 정확). 별칭 불가면 자체 [3*nf] 지연 할당 (실패 시
+//  false → 호출자는 -2 강등)
+static bool noStage3
+(
+    double*& vx, double*& vy, double*& vz, cudaError_t* e
+)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
     *e = cudaSuccess;
-    if (gU.grad9 && (size_t)9*nc >= (size_t)3*nf)
+    if (gU.grad9 && (size_t)9*nc >= (size_t)2*nf)
     {
-        return gU.grad9;
+        vx = gU.grad9;
+        vy = gU.grad9 + (size_t)nf;
+        vz = gB.flux;
+        return true;
     }
     if (!gNO.ownStage)
     {
         if ((*e = cudaMalloc(&gNO.ownStage, (size_t)3*nf*sizeof(double)))
-            != cudaSuccess) return nullptr;
+            != cudaSuccess) return false;
     }
-    return gNO.ownStage;
+    vx = gNO.ownStage;
+    vy = gNO.ownStage + (size_t)nf;
+    vz = gNO.ownStage + (size_t)2*nf;
+    return true;
 }
 
 
@@ -3364,14 +3378,19 @@ int rgpPEqnNOCorrPrep
             return pfail(e, "noCorr/H2D");
     }
 
-    double* stage = noStage(&e);
-    if (!stage) return pfail(e, "noCorr/stage");
-
     rgppeqn::noFaceInterp<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gSTM.wLin, gB.pA, gB.flux);
     rgppeqn::stGradGather<<<nb(nc), BS>>>
         (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
          gB.flux, gST.bPsi, gM.V, gST.grad);
+    // xf(gB.flux) 소비 완료 — 이후 z-성분 스테이지로 재사용
+    double *vx, *vy, *vz;
+    if (!noStage3(vx, vy, vz, &e))
+    {
+        snprintf(gPErr, sizeof(gPErr),
+                 "noCorr/stage: %s", cudaGetErrorString(e));
+        return -2;   // 호출자: 호스트 경로 강등
+    }
     if (gNO.mdK >= 0)
     {
         if (!Cf3 || gNO.hC3.empty())
@@ -3388,7 +3407,12 @@ int rgpPEqnNOCorrPrep
             {
                 if ((e = cudaMalloc(&gNO.ownC3,
                                     (size_t)3*nc*sizeof(double)))
-                    != cudaSuccess) return pfail(e, "noCorr/C3 malloc");
+                    != cudaSuccess)
+                {
+                    snprintf(gPErr, sizeof(gPErr), "noCorr/C3: %s",
+                             cudaGetErrorString(e));
+                    return -2;
+                }
             }
             c3d = gNO.ownC3;
         }
@@ -3396,10 +3420,18 @@ int rgpPEqnNOCorrPrep
                             (size_t)3*nc*sizeof(double),
                             cudaMemcpyHostToDevice)) != cudaSuccess)
             return pfail(e, "noCorr/C3 H2D");
-        // Cf3 스테이징 (동기 memcpy가 위 커널들 완료를 대기 — 순서 안전)
-        if ((e = cudaMemcpy(stage, Cf3, (size_t)3*nf*sizeof(double),
-                            cudaMemcpyHostToDevice)) != cudaSuccess)
-            return pfail(e, "noCorr/Cf3 H2D");
+        // Cf 성분 스테이징 (동기 memcpy가 위 커널 완료를 대기 — 순서
+        // 안전; z는 xf가 쓰던 gB.flux)
+        struct { double* d; const double* s; } cfUp[] =
+        {
+            {vx, Cf3}, {vy, Cf3 + (size_t)nf}, {vz, Cf3 + (size_t)2*nf}
+        };
+        for (auto& u : cfUp)
+        {
+            if ((e = cudaMemcpy(u.d, u.s, (size_t)nf*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "noCorr/Cf H2D");
+        }
         // cellMDLimited (min/max 스크래치는 BiCG 작업 버퍼 재사용 —
         // pEqn 솔브 전이라 유휴)
         const double rk = (gNO.mdK < 1.0) ? (1.0/gNO.mdK - 1.0) : 0.0;
@@ -3408,20 +3440,29 @@ int rgpPEqnNOCorrPrep
              gB.pA, gST.bPsi, rk, gST.rA0, gST.sA);
         rgppeqn::noMDLimit<<<nb(nc), BS>>>
             (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
-             stage, c3d, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
+             vx, vy, vz, c3d, gNO.CfB3, gST.rA0, gST.sA, gST.grad);
     }
-    // kf3 스테이징 (Cf3 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장).
+    // kf 성분 스테이징 (Cf 소비 완료 후 덮어씀 — 동기 memcpy 순서 보장).
     // dcs → gB.upper 별칭 (pEqn 솔브 조립이 직후 재작성),
     // corrF → gST.lower 별칭 (ZC 전용, pCorr 동안 유휴)
-    if ((e = cudaMemcpy(stage, kf3, (size_t)3*nf*sizeof(double),
-                        cudaMemcpyHostToDevice)) != cudaSuccess)
-        return pfail(e, "noCorr/kf3 H2D");
+    {
+        struct { double* d; const double* s; } kfUp[] =
+        {
+            {vx, kf3}, {vy, kf3 + (size_t)nf}, {vz, kf3 + (size_t)2*nf}
+        };
+        for (auto& u : kfUp)
+        {
+            if ((e = cudaMemcpy(u.d, u.s, (size_t)nf*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "noCorr/kf H2D");
+        }
+    }
     if ((e = cudaMemcpy(gB.upper, gNO.hDcs.data(),
                         (size_t)nf*sizeof(double),
                         cudaMemcpyHostToDevice)) != cudaSuccess)
         return pfail(e, "noCorr/dcs H2D");
     rgppeqn::noFaceCorr<<<nb(nf), BS>>>
-        (nf, nc, gM.own, gM.nei, gSTM.wLin, stage, gB.upper,
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, vx, vy, vz, gB.upper,
          gB.pA, gB.rAUf, gST.grad, limitCoeff, gST.lower);
     if (nbf > 0 && bGrad3Out)
     {
