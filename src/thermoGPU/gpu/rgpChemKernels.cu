@@ -9,6 +9,7 @@
 \*---------------------------------------------------------------------------*/
 
 #include "rgpChemTypes.H"
+#include "rgpStage.H"
 #include "rgpChemRHS.H"
 
 #include <cuda_runtime.h>
@@ -50,6 +51,12 @@ namespace
         int* flag = nullptr;
         double *cp = nullptr, *cT = nullptr, *cc = nullptr, *cdt = nullptr;
         double *coT = nullptr, *coc = nullptr;
+
+        // Rosenbrock 작업공간 풀: 상주-스레드 슬롯 × neq*(neq+7).
+        // 스택(로컬 메모리) 대신 런타임 크기 — MAX_SPECIES가 아닌 실제
+        // 종수로 사이징되어 소형 메커니즘에서 VRAM ~10× 절감.
+        double* wk = nullptr;
+        size_t wkCapB = 0;
     } gBuf;
 
     // 균형/캐시 상태 (호스트)
@@ -74,6 +81,7 @@ namespace
         if (gBuf.perm) cudaFree(gBuf.perm);
         if (gBuf.flag) cudaFree(gBuf.flag);
         if (gBuf.flag2) cudaFree(gBuf.flag2);
+        if (gBuf.wk) cudaFree(gBuf.wk);
         gBuf = Buffers();
         gCacheValid = false;
         gPermN = -1;
@@ -281,6 +289,16 @@ __global__ void chemScatter
 //- 셀 하나 적분: [0, dtTot], 적응 Rosenbrock34
 __device__ int gDiagCount = 0;
 
+__device__ void integrateOneCell
+(
+    const rgpChemMech& dMech, const int celli,
+    const double* __restrict__ dtF,
+    const double relTol, const double absTol,
+    const double* __restrict__ pF, double* __restrict__ TF,
+    double* __restrict__ cF, long long* __restrict__ stepsF,
+    const int* __restrict__ hitF, double* wk
+);
+
 __global__ void chemIntegrateKernel
 (
     const rgpChemMech* __restrict__ mechP,
@@ -292,22 +310,52 @@ __global__ void chemIntegrateKernel
     double* __restrict__ TF,
     double* __restrict__ cF,
     long long* __restrict__ stepsF,
-    const int* __restrict__ hitF
+    const int* __restrict__ hitF,
+    double* __restrict__ wkPool,
+    const size_t wkStride
 )
 {
-    const int celli = blockIdx.x*blockDim.x + threadIdx.x;
-    if (celli >= nCells) return;
+    // grid-stride: wk 슬롯은 스레드당 1개(스트라이드 반복끼리 공유),
+    // 크기는 런타임 neq*(neq+7) — 호출측(rgpChemIntegrate)이 상주
+    // 스레드 수만큼만 풀을 할당한다. 셀별 적분은 독립이라 순회
+    // 순서·작업공간 위치는 결과에 영향 없음(비트-보존).
+    const size_t slot = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    double* wk = wkPool + slot*wkStride;
+    const int stride = gridDim.x*blockDim.x;
 
+    for (int celli = (int)slot; celli < nCells; celli += stride)
+    {
+        integrateOneCell
+        (
+            *mechP, celli, dtF, relTol, absTol,
+            pF, TF, cF, stepsF, hitF, wk
+        );
+    }
+}
+
+__device__ void integrateOneCell
+(
+    const rgpChemMech& dMech,
+    const int celli,
+    const double* __restrict__ dtF,
+    const double relTol,
+    const double absTol,
+    const double* __restrict__ pF,
+    double* __restrict__ TF,
+    double* __restrict__ cF,
+    long long* __restrict__ stepsF,
+    const int* __restrict__ hitF,
+    double* wk
+)
+{
     // retrieve 캐시 hit — 출력은 chemCacheCheck가 이미 기록
     if (hitF && hitF[celli]) { stepsF[celli] = 0; return; }
 
-    const rgpChemMech& dMech = *mechP;
     const int n = dMech.nSpecies;
     const int neq = n + 1;
     const double p = pF[celli];
 
     double y0[NEQ], y[NEQ];
-    double wk[NEQ*(NEQ + 7)];
 
     for (int s = 0; s < n; s++) { y0[s] = cF[(size_t)celli*n + s]; }
     y0[n] = TF[celli];
@@ -465,33 +513,85 @@ int rgpChemIntegrate
     if (nCells > gBuf.capCells)
     {
         freeBuffers();
-        if ((e = cudaMalloc(&gBuf.p, nCells*sizeof(double))) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.T, nCells*sizeof(double))) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.c, (size_t)nCells*n*sizeof(double)))
-                != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.dt, nCells*sizeof(double))) != cudaSuccess ||
-            (e = cudaMalloc(&gBuf.steps, nCells*sizeof(long long)))
+        // native(2)는 배치 입출력이 호스트 포인터 직행(zero-copy) —
+        // 스테이징 버퍼는 copy/mapped 폴백 전용. steps는 유지(소형).
+        if (gRgpUnified != 2)
+        {
+            if ((e = cudaMalloc(&gBuf.p, nCells*sizeof(double)))
+                    != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.T, nCells*sizeof(double)))
+                    != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.c, (size_t)nCells*n*sizeof(double)))
+                    != cudaSuccess ||
+                (e = cudaMalloc(&gBuf.dt, nCells*sizeof(double)))
+                    != cudaSuccess)
+            {
+                freeBuffers();
+                return fail(e, "integrate/malloc");
+            }
+        }
+        if ((e = cudaMalloc(&gBuf.steps, nCells*sizeof(long long)))
                 != cudaSuccess)
         {
             freeBuffers();
-            return fail(e, "integrate/malloc");
+            return fail(e, "integrate/malloc steps");
         }
         gBuf.capCells = nCells;
     }
 
-    const size_t b1s = nCells*sizeof(double);
-    const size_t bns = (size_t)nCells*n*sizeof(double);
-    if ((e = cudaMemcpy(gBuf.p, p, b1s, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "integrate/H2D p");
-    if ((e = cudaMemcpy(gBuf.T, T, b1s, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "integrate/H2D T");
-    if ((e = cudaMemcpy(gBuf.c, c, bns, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "integrate/H2D c");
-    if ((e = cudaMemcpy(gBuf.dt, dt, b1s, cudaMemcpyHostToDevice))
-        != cudaSuccess) return fail(e, "integrate/H2D dt");
+    // ── 스테이징 (rgpStage 규약): copy 모드는 기존과 동일한 H2D,
+    //    mapped는 등록 별칭, native는 호스트 포인터 직행 ──
+    const double* pIn = rgpInPtr(p, gBuf.p, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "integrate/H2D p");
+    const double* dtIn = rgpInPtr(dt, gBuf.dt, (size_t)nCells, &e);
+    if (e != cudaSuccess) return fail(e, "integrate/H2D dt");
+    // T/c는 커널이 읽고 쓰는 RW 버퍼 — in으로 스테이징 후 같은
+    // 포인터에 커널이 쓰고, rgpOutFinish로 회수(스테이징 경유 시만 D2H)
+    double* Tio = const_cast<double*>
+    (
+        rgpInPtr(T, gBuf.T, (size_t)nCells, &e)
+    );
+    if (e != cudaSuccess) return fail(e, "integrate/H2D T");
+    double* cio = const_cast<double*>
+    (
+        rgpInPtr(c, gBuf.c, (size_t)nCells*n, &e)
+    );
+    if (e != cudaSuccess) return fail(e, "integrate/H2D c");
 
     constexpr int blockSize = 64;
     const int gridSize = (nCells + blockSize - 1)/blockSize;
+
+    // ── Rosenbrock 작업공간 풀: 그리드를 상주 한계로 캡(grid-stride) ──
+    // 풀 = 슬롯수 × neq*(neq+7) 런타임 크기. 스택 배열(컴파일타임
+    // MAX_SPECIES 크기) 대비 소형 메커니즘에서 로컬 메모리 ~10× 절감.
+    static int residentBlocks = 0;
+    if (!residentBlocks)
+    {
+        int dev = 0, nSM = 0, thrSM = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&nSM, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute
+        (
+            &thrSM, cudaDevAttrMaxThreadsPerMultiProcessor, dev
+        );
+        residentBlocks = (nSM*thrSM)/blockSize;
+        if (residentBlocks < 1) { residentBlocks = 1; }
+    }
+    const int gridInt = gridSize < residentBlocks ? gridSize
+                                                  : residentBlocks;
+    const size_t wkStride = (size_t)(n + 1)*(n + 8);
+    const size_t wkNeedB =
+        (size_t)gridInt*blockSize*wkStride*sizeof(double);
+    if (wkNeedB > gBuf.wkCapB)
+    {
+        if (gBuf.wk) { cudaFree(gBuf.wk); gBuf.wk = nullptr; }
+        if ((e = cudaMalloc(&gBuf.wk, wkNeedB)) != cudaSuccess)
+        {
+            gBuf.wkCapB = 0;
+            return fail(e, "integrate/wk malloc");
+        }
+        gBuf.wkCapB = wkNeedB;
+    }
 
     // ── retrieve 캐시 (opt-in): 입력 미변화 셀은 저장된 출력으로 스킵 ──
     gCacheHits = 0;
@@ -523,7 +623,7 @@ int rgpChemIntegrate
         rgpchem::chemCacheCheck<<<gridSize, blockSize>>>
         (
             nCells, n, gCacheTol, gCacheValid ? 1 : 0,
-            gBuf.p, gBuf.T, gBuf.c, gBuf.dt,
+            pIn, Tio, cio, dtIn,
             gBuf.cp, gBuf.cT, gBuf.cc, gBuf.cdt,
             gBuf.coT, gBuf.coc, gBuf.flag
         );
@@ -562,29 +662,29 @@ int rgpChemIntegrate
 
         rgpchem::chemGather<<<gridSize, blockSize>>>
         (
-            nCells, n, gBuf.perm, gBuf.p, gBuf.T, gBuf.c, gBuf.dt,
+            nCells, n, gBuf.perm, pIn, Tio, cio, dtIn,
             cacheOn ? gBuf.flag : nullptr,
             gBuf.p2, gBuf.T2, gBuf.c2, gBuf.dt2, gBuf.flag2
         );
-        rgpchem::chemIntegrateKernel<<<gridSize, blockSize>>>
+        rgpchem::chemIntegrateKernel<<<gridInt, blockSize>>>
         (
             dMechPtr, nCells, gBuf.dt2, relTol, absTol,
             gBuf.p2, gBuf.T2, gBuf.c2, gBuf.steps2,
-            cacheOn ? gBuf.flag2 : nullptr
+            cacheOn ? gBuf.flag2 : nullptr, gBuf.wk, wkStride
         );
         rgpchem::chemScatter<<<gridSize, blockSize>>>
         (
             nCells, n, gBuf.perm, gBuf.T2, gBuf.c2, gBuf.steps2,
-            gBuf.T, gBuf.c, gBuf.steps
+            Tio, cio, gBuf.steps
         );
     }
     else
     {
-        rgpchem::chemIntegrateKernel<<<gridSize, blockSize>>>
+        rgpchem::chemIntegrateKernel<<<gridInt, blockSize>>>
         (
-            dMechPtr, nCells, gBuf.dt, relTol, absTol,
-            gBuf.p, gBuf.T, gBuf.c, gBuf.steps,
-            cacheOn ? gBuf.flag : nullptr
+            dMechPtr, nCells, dtIn, relTol, absTol,
+            pIn, Tio, cio, gBuf.steps,
+            cacheOn ? gBuf.flag : nullptr, gBuf.wk, wkStride
         );
     }
     if ((e = cudaGetLastError()) != cudaSuccess)
@@ -594,16 +694,16 @@ int rgpChemIntegrate
     {
         rgpchem::chemCacheStore<<<gridSize, blockSize>>>
         (
-            nCells, n, gBuf.flag, gBuf.T, gBuf.c, gBuf.coT, gBuf.coc
+            nCells, n, gBuf.flag, Tio, cio, gBuf.coT, gBuf.coc
         );
         if ((e = cudaGetLastError()) != cudaSuccess)
             return fail(e, "integrate/cache store");
         gCacheValid = true;
     }
 
-    if ((e = cudaMemcpy(T, gBuf.T, b1s, cudaMemcpyDeviceToHost))
+    if ((e = rgpOutFinish(T, Tio, gBuf.T, (size_t)nCells))
         != cudaSuccess) return fail(e, "integrate/D2H T");
-    if ((e = cudaMemcpy(c, gBuf.c, bns, cudaMemcpyDeviceToHost))
+    if ((e = rgpOutFinish(c, cio, gBuf.c, (size_t)nCells*n))
         != cudaSuccess) return fail(e, "integrate/D2H c");
 
     // ── substep 통계 회수: stats 보고 + 다음 호출의 균형 perm 생성 ──

@@ -42,6 +42,13 @@ int rgpFgmEvaluate
     double* fieldsOut
 );
 
+/*  D2H 다이어트: 다음 rgpFgmEvaluate에서 fieldsOut의 [first, first+n)
+    필드 슬라이스는 호스트로 내리지 않는다(copy 모드 전용 — zero-copy
+    모드에선 무의미). 디바이스 상주 SoA(체인 소비)는 영향 없음.
+    호스트 배열의 해당 슬라이스는 미갱신으로 남으므로, 호출측은 그
+    필드들의 호스트 소비자가 없음을 보장할 것. (0,0)이 해제. */
+void rgpFgmHostCopySkip(int first, int n);
+
 /*  디바이스 체인용: 마지막 rgpFgmEvaluate의 SoA 출력(디바이스 포인터)
     과 레이아웃. field 1 = T, field 2+k = k번째 테이블 종 Y.           */
 const double* rgpFgmDevOutPtr(void);

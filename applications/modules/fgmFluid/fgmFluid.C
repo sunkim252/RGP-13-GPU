@@ -932,6 +932,17 @@ void Foam::solvers::fgmFluid::updateManifold()
             const double* hw =
                 useH ? hcl->begin() : (useW ? Wcl->begin() : nullptr);
 
+            // D2H 다이어트: gpuThermo 체인이 켜져 있으면 RG_* 내부
+            // 필드는 디바이스 SoA에서 직접 소비되고 호스트 내부값은
+            // 아무도 읽지 않는다(경계는 interpolateRealGasCoeffs의
+            // 별도 경로, IO는 NO_WRITE) — 해당 슬라이스 D2H 생략.
+            const bool skipRG = fillRG && gpuThermo_;
+            rgpFgmHostCopySkip
+            (
+                skipRG ? int(2 + Yref.size()) : 0,
+                skipRG ? int(RGref.size()) : 0
+            );
+
             const int rc = rgpFgmEvaluate
             (
                 nc, mode4,
@@ -963,7 +974,12 @@ void Foam::solvers::fgmFluid::updateManifold()
             }
             forAll(RGref, k)
             {
-                std::memcpy(RGref[k]->begin(), out + (f++)*nc, bytes);
+                // skipRG면 슬라이스가 D2H되지 않았음 — 산포 생략
+                if (!skipRG)
+                {
+                    std::memcpy(RGref[k]->begin(), out + f*nc, bytes);
+                }
+                f++;
             }
             if (fillLeZ)
             {

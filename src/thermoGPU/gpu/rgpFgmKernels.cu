@@ -43,6 +43,9 @@ namespace
         double *outActive = nullptr;   // 체인이 읽을 실제 출력 포인터
     } gB;
 
+    int gSkipFirst = 0;
+    int gSkipN = 0;
+
     void fgmFreeAll()
     {
         double** ps[] = {&gT.Zax,&gT.Gax,&gT.Cax,&gT.Kax,&gT.tables,
@@ -302,7 +305,10 @@ int rgpFgmEvaluate
     gB.outActive = nullptr;
 
     cudaError_t rc;
-    if (nCells > gB.cap)
+    // native(2)는 입력·출력 모두 호스트 포인터 직행(zero-copy) —
+    // 스테이징 버퍼가 전혀 쓰이지 않으므로 할당 자체를 생략
+    // ((9+nFields)*nCells*8B, 2.6M셀 ~2.7GB 절약). copy/mapped 폴백만 할당.
+    if (gRgpUnified != 2 && nCells > gB.cap)
     {
         double** ps[] = {&gB.Z,&gB.C,&gB.rho,&gB.Lsqr,&gB.msg,&gB.Deff,
                          &gB.hw,&gB.gZ,&gB.chi};
@@ -315,7 +321,7 @@ int rgpFgmEvaluate
         gB.cap = nCells;
     }
     const size_t need = (size_t)gT.nFields*nCells;
-    if (gB.outCap < need)
+    if (gRgpUnified != 2 && gB.outCap < need)
     {
         if (gB.out) cudaFree(gB.out);
         if ((rc = cudaMalloc(&gB.out, need*sizeof(double))) != cudaSuccess)
@@ -364,8 +370,36 @@ int rgpFgmEvaluate
         return ffail(rc, "fgm/out gZ");
     if ((rc = rgpOutFinish(chiSt, oChi, gB.chi, n1)) != cudaSuccess)
         return ffail(rc, "fgm/out chi");
-    if ((rc = rgpOutFinish(fieldsOut, oOut, gB.out, need)) != cudaSuccess)
-        return ffail(rc, "fgm/out fields");
+    // fieldsOut 회수: copy 경유(oOut==gB.out)일 때만 D2H — skip 범위
+    // [gSkipFirst, gSkipFirst+gSkipN)는 내리지 않는다 (호스트 미소비
+    // 필드의 대역폭 절약; 디바이스 상주 SoA는 완전하므로 체인 무영향).
+    if (oOut == gB.out && fieldsOut != nullptr)
+    {
+        const int nF = gT.nFields;
+        int s0 = gSkipFirst < nF ? gSkipFirst : nF;
+        int s1 = gSkipFirst + gSkipN < nF ? gSkipFirst + gSkipN : nF;
+        if (gSkipN <= 0) { s0 = nF; s1 = nF; }
+        const size_t cb = (size_t)nCells*sizeof(double);
+        if (s0 > 0)
+        {
+            if ((rc = cudaMemcpy(fieldsOut, gB.out,
+                                 (size_t)s0*cb, cudaMemcpyDeviceToHost))
+                != cudaSuccess) return ffail(rc, "fgm/out fields lo");
+        }
+        if (s1 < nF)
+        {
+            if ((rc = cudaMemcpy(fieldsOut + (size_t)s1*nCells,
+                                 gB.out + (size_t)s1*nCells,
+                                 (size_t)(nF - s1)*cb,
+                                 cudaMemcpyDeviceToHost))
+                != cudaSuccess) return ffail(rc, "fgm/out fields hi");
+        }
+    }
+    else
+    {
+        if ((rc = cudaDeviceSynchronize()) != cudaSuccess)
+            return ffail(rc, "fgm/out fields sync");
+    }
 
     gB.lastN = nCells;
     gB.outActive = oOut;   // 체인(he 재시드/refresh)이 읽을 위치
@@ -381,6 +415,12 @@ const double* rgpFgmDevOutPtr(void)
     return gB.outActive ? gB.outActive : gB.out;
 }
 int rgpFgmDevNFields(void) { return gT.nFields; }
+void rgpFgmHostCopySkip(int first, int n)
+{
+    gSkipFirst = first > 0 ? first : 0;
+    gSkipN = n > 0 ? n : 0;
+}
+
 int rgpFgmDevLastN(void) { return gB.lastN; }
 
 void rgpFgmFree(void) { fgmFreeAll(); }
