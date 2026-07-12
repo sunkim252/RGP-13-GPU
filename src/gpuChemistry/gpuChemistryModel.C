@@ -307,6 +307,11 @@ Foam::scalar Foam::gpuChemistryModel<ThermoType>::solveBatch
         }
         const scalar avg = total/Pstream::nProcs();
 
+        // 텔레메트리: 발동 여부와 무관하게 한 줄 (부하비 관찰용)
+        Info<< "gpuChemistry DLB: max/avg = "
+            << (avg > small ? maxLoad/avg : 1.0)
+            << " (thr " << dlbThreshold_ << ")" << endl;
+
         if (maxLoad > dlbThreshold_*avg + small)
         {
             dlbActive = true;

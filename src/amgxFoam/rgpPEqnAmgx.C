@@ -51,16 +51,42 @@ namespace
         long solveCount = 0;
     } gSD;
 
+    //- 설정 소스: env RGP_AMGX_JSON에 JSON 파일 경로가 있으면 그 파일로
+    //  AMGX_config_create_from_file (스무더/사이클/스윕 튜닝 스윕용) —
+    //  없으면 아래 내장 kJson. 주의: 내장 4-iter 블록 규약(외부 OF 잔차
+    //  판정)은 유지되므로 커스텀 JSON도 max_iters는 블록 크기로 둘 것.
+    int makeConfig(AMGX_config_handle* cfg)
+    {
+        const char* jf = getenv("RGP_AMGX_JSON");
+        if (jf && jf[0])
+        {
+            AMGX_RC rc_ = AMGX_config_create_from_file(cfg, jf);
+            if (rc_ != AMGX_RC_OK)
+            {
+                char msg_[400];
+                AMGX_get_error_string(rc_, msg_, 400);
+                snprintf(gErr, sizeof(gErr),
+                         "config_create_from_file(%s): %s", jf, msg_);
+                return -1;
+            }
+            return 0;
+        }
+        return 1;   // 내장 kJson 사용 신호
+    }
+
+    //- 기본 설정: AGGREGATION+MULTICOLOR_DILU — 설정 스윕(2M 직교 +
+    //  rd0110 2.6M 비직교, 2026-07-13) 전승자. CLASSICAL D2는 rd0110
+    //  비정렬 행렬에서 계층 구축이 지배적(솔브당 수 초)이라 2~4배
+    //  느렸다. 스윕 재현: RGP_AMGX_JSON=<json> (scratch/amgxJson 참조).
     const char* kJson =
         "{\"config_version\":2,\"solver\":{"
         "\"solver\":\"PCG\",\"max_iters\":4,\"tolerance\":1e-30,"
         "\"convergence\":\"ABSOLUTE\",\"norm\":\"L1\","
         "\"monitor_residual\":1,"
         "\"preconditioner\":{"
-        "\"solver\":\"AMG\",\"algorithm\":\"CLASSICAL\","
-        "\"interpolator\":\"D2\",\"aggressive_levels\":2,"
-        "\"max_levels\":24,\"cycle\":\"V\","
-        "\"matrix_coloring_scheme\":\"MIN_MAX\","
+        "\"solver\":\"AMG\",\"algorithm\":\"AGGREGATION\","
+        "\"selector\":\"SIZE_2\",\"cycle\":\"V\","
+        "\"max_levels\":24,"
         "\"smoother\":{\"solver\":\"MULTICOLOR_DILU\","
         "\"monitor_residual\":0},"
         "\"presweeps\":1,\"postsweeps\":1,"
@@ -125,7 +151,14 @@ int rgpPEqnAmgxSolve
             gS.cfg = nullptr;
         }
 
-        CHK(AMGX_config_create(&gS.cfg, kJson), "config_create");
+        {
+            const int cs = makeConfig(&gS.cfg);
+            if (cs < 0) { return -1; }
+            if (cs == 1)
+            {
+                CHK(AMGX_config_create(&gS.cfg, kJson), "config_create");
+            }
+        }
         CHK(AMGX_resources_create_simple(&gS.rsrc, gS.cfg),
             "resources_create");
         CHK(AMGX_matrix_create(&gS.A, gS.rsrc, AMGX_mode_dDDI),
@@ -231,7 +264,15 @@ int rgpPEqnAmgxSolveDist
 
         gSD.comm = MPI_COMM_WORLD;
 
-        CHK(AMGX_config_create(&gSD.cfg, kJson), "dist config_create");
+        {
+            const int cs = makeConfig(&gSD.cfg);
+            if (cs < 0) { return -1; }
+            if (cs == 1)
+            {
+                CHK(AMGX_config_create(&gSD.cfg, kJson),
+                    "dist config_create");
+            }
+        }
         CHK(AMGX_resources_create
             (
                 &gSD.rsrc, gSD.cfg, &gSD.comm, 1, &myDevice
