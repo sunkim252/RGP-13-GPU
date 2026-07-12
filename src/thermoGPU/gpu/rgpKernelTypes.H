@@ -128,9 +128,14 @@ int rgpPinHost(void* p, size_t bytes);
 int rgpUnpinHost(void* p);
 
 /*  unified 메모리 모드: 0=copy(디스크리트 기본), 1=mapped(등록 버퍼
-    zero-copy — 검증용), 2=native(GH200류 일관 메모리, 자동 감지).
-    env RGP_GPU_UNIFIED=0/1/2 로 override.                             */
+    zero-copy — 검증용), 2=native(NVLink-C2C/ATS 하드웨어 코히런스,
+    자동 감지). env RGP_GPU_UNIFIED=0/1/2 로 override.                  */
 int rgpGpuUnifiedMode(void);
+
+/*  감지된 하드웨어 코히런스: 1 = 진짜 코히런트(GH200 NVLink-C2C/ATS,
+    호스트 페이지테이블 직접 접근), 0 = discrete 또는 HMM 소프트웨어.
+    GH200 브링업 진단·native 자동 활성 판정에 사용.                    */
+int rgpGpuCoherentHW(void);
 
 void rgpGpuFree(void);
 const char* rgpGpuLastError(void);

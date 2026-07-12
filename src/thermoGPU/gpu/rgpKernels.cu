@@ -24,6 +24,7 @@
 
 //- unified 모드 (rgpStage.H 참조; 모든 nvcc TU가 공유)
 int gRgpUnified = 0;
+int gRgpCoherentHW = 0;   // rgpGpuInit이 하드웨어 코히런스 감지 시 1
 
 // * * * * * * * * * * * * * * 디바이스 테이블 상태 * * * * * * * * * * * * * //
 
@@ -855,10 +856,22 @@ int rgpGpuInit(int deviceId)
     cudaError_t e = cudaSetDevice(dev);
     if (e != cudaSuccess) return fail(e, "rgpGpuInit/cudaSetDevice");
 
-    // 기기 인식: GH200류 일관 메모리(HMM/ATS)면 native zero-copy.
+    // 기기 인식: native zero-copy는 "진짜 하드웨어 코히런트"에서만 자동.
+    //   pma    = cudaDevAttrPageableMemoryAccess — pageable 호스트 메모리
+    //            접근 가능(HMM 소프트웨어 마이그레이션 포함).
+    //   pmaHPT = ...UsesHostPageTables — GPU가 호스트 페이지테이블을
+    //            직접 쓰는 진짜 하드웨어 코히런스(GH200 NVLink-C2C/ATS).
+    // pmaHPT=1: 페이지폴트 없이 호스트 포인터 직접 접근 → native가 빠름.
+    // pma=1 & pmaHPT=0: HMM(x86+최신 드라이버) — 정합은 되나 PCIe
+    //            페이지폴트로 느림 → 자동은 copy 유지, native는 opt-in만.
     // env RGP_GPU_UNIFIED = 0(강제 copy) / 1(mapped 검증) / 2(강제 native)
-    int pma = 0;
+    int pma = 0, pmaHPT = 0;
     cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess, dev);
+    cudaDeviceGetAttribute
+    (
+        &pmaHPT, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev
+    );
+    gRgpCoherentHW = pmaHPT;   // 진단용 (호스트가 Info 출력)
     const char* env = getenv("RGP_GPU_UNIFIED");
     if (env && env[0] == '0')      { gRgpUnified = 0; }
     else if (env && env[0] == '2')
@@ -875,10 +888,16 @@ int rgpGpuInit(int deviceId)
         else { gRgpUnified = 2; }
     }
     else if (env && env[0] == '1') { gRgpUnified = 1; }
-    else                           { gRgpUnified = pma ? 2 : 0; }
+    else                           { gRgpUnified = pmaHPT ? 2 : 0; }
 
     return 0;
 }
+
+
+//- 진단: 감지된 하드웨어 코히런스 여부 (1 = NVLink-C2C/ATS류 진짜
+//  코히런트, 0 = discrete/HMM). rgpGpuUnifiedMode와 함께 GH200
+//  브링업 로그에 쓴다.
+int rgpGpuCoherentHW(void) { return gRgpCoherentHW; }
 
 
 int rgpGpuUnifiedMode(void)

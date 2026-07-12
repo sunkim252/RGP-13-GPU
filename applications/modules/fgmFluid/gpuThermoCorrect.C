@@ -121,7 +121,9 @@ void Foam::solvers::fgmFluid::armGpuThermo()
         << "    memory mode: "
         << (um == 2 ? "unified-native (coherent, zero-copy)"
           : um == 1 ? "unified-mapped (pinned zero-copy, validation)"
-          : "explicit-copy (discrete GPU)") << nl << endl;
+          : "explicit-copy (discrete GPU)")
+        << " [coherent HW: " << (rgpGpuCoherentHW() ? "yes" : "no")
+        << "]" << nl << endl;
 
     gpuArmed_ = true;
 }
