@@ -710,7 +710,7 @@ Foam::solvers::fgmFluid::varianceLengthSqr()
 }
 
 
-void Foam::solvers::fgmFluid::updateManifold()
+void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
 {
     // Re-arm the Tier-2 tabulated real-gas coefficient lookup if the mesh cell
     // count changed since it was last armed (runtime redistribution or AMR
@@ -932,11 +932,17 @@ void Foam::solvers::fgmFluid::updateManifold()
             const double* hw =
                 useH ? hcl->begin() : (useW ? Wcl->begin() : nullptr);
 
-            // RG_* D2H 다이어트는 철회: gpuThermo가 켜져 있어도 CPU
-            // mixture 경유의 산발적 he()/property 평가(예: 생성자 초기
-            // 시딩)가 호스트 RG 내부값을 읽는다 — rd0110(SRK 106종)
-            // 생성자에서 bM=0 sigFpe로 실증. 전 필드 D2H 유지.
-            rgpFgmHostCopySkip(0, 0);
+            // RG_*만의 D2H 다이어트는 철회(산발적 CPU mixture 평가가
+            // 호스트 RG를 읽음 — rd0110 생성자 bM=0 sigFpe로 실증).
+            // 대신 hostScatter=false(압력 보정자 중간 단계)일 때는
+            // fieldsOut 전체 D2H를 생략 — 디바이스 상주 SoA는 완전해
+            // 체인(thermo refresh/he 재시드)이 정상 소비하고, 호스트
+            // 값은 직전 풀-산포 상태로 유지된다(그 사이 소비자 없음).
+            rgpFgmHostCopySkip
+            (
+                hostScatter ? 0 : 0,
+                hostScatter ? 0 : gpuNFields_
+            );
 
             const int rc = rgpFgmEvaluate
             (
@@ -958,6 +964,8 @@ void Foam::solvers::fgmFluid::updateManifold()
             }
 
             // SoA 슬라이스 산포 (필드 순서는 아밍 때의 연접 순서와 동일)
+            if (hostScatter)
+            {
             const double* out = gpuFgmOut_.begin();
             const size_t bytes = nc*sizeof(double);
             label f = 0;
@@ -978,6 +986,7 @@ void Foam::solvers::fgmFluid::updateManifold()
             if (fillLeC)
             {
                 std::memcpy(LeCc->begin(), out + (f++)*nc, bytes);
+            }
             }
 
             gpuDone = true;

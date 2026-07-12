@@ -523,7 +523,10 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     std::chrono::steady_clock::time_point tPh, tTot;
     if (thermoTimings_) { tPh = tTot = std::chrono::steady_clock::now(); }
 
-    updateManifold();
+    // 마지막 outer(finalIteration)의 보정자만 풀 호스트 산포 — 중간
+    // outer의 산포값(T/Y/srcc/Le/RG)은 다음 predictor의 updateManifold
+    // 전까지 아무도 읽지 않으므로 D2H+산포를 생략(디바이스 SoA만 갱신)
+    updateManifold(solutionControl::finalIteration(mesh));
 
     if (thermoTimings_)
     {

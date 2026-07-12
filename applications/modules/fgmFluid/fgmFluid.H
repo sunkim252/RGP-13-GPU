@@ -350,7 +350,11 @@ private:
 
         //- Update gZ, look up the manifold, set inactive-species Yi and
         //  the cached PV source from the FGM table.
-        void updateManifold();
+        //- hostScatter=false: 디바이스 상주 SoA(체인 소비)만 갱신하고
+        //  호스트로의 fieldsOut D2H(~2.3GB@2.4M셀)와 산포를 생략 —
+        //  압력 보정자 중간 단계 전용(그 사이 호스트 T/Y/srcc/Le/RG
+        //  내부값 소비자가 없음; 마지막 outer는 항상 풀 산포)
+        void updateManifold(const bool hostScatter = true);
 
         //- Tier-2 setup: if the table carries RG_* coefficients and the
         //  mixture supports the tabulatedRealGasMixture hook, allocate the 13
