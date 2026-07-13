@@ -1,0 +1,44 @@
+# GH200(aarch64) 이식성 1차 점검: arm64 러너에서 CUDA aarch64 툴킷으로
+# Foam-free CUDA TU 4종을 실제 컴파일 (sm_90 + PTX — GH200 def와 동일 플래그).
+# GPU 실행은 불가(러너에 GPU 없음) — 컴파일 가능성 확정이 목적.
+name: arm64-cuda-smoke
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/thermoGPU/gpu/**'
+      - '.github/workflows/arm64-cuda-smoke.yml'
+
+jobs:
+  nvcc-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA 12.6 toolkit (arm64 sbsa) + OpenMPI headers
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-nvcc-12-6 cuda-cudart-dev-12-6 libopenmpi-dev
+          /usr/local/cuda-12.6/bin/nvcc --version
+
+      - name: Compile all Foam-free CUDA TUs (GH200 def flags)
+        run: |
+          cd src/thermoGPU
+          NVCC=/usr/local/cuda-12.6/bin/nvcc
+          FLAGS="-std=c++14 -O3 -fmad=false -Xcompiler -fPIC -Xcompiler -Wall \
+                 -gencode arch=compute_90,code=sm_90 \
+                 -gencode arch=compute_90,code=compute_90 \
+                 -DLIB_NAME=librgpThermoGPU.so -DlinuxArm64 \
+                 -DWM_ARCH_OPTION=64 -DWM_DP -DWM_LABEL_SIZE=32 \
+                 -I/usr/lib/aarch64-linux-gnu/openmpi/include -I."
+          set -e
+          for f in gpu/rgpKernels.cu gpu/rgpChemKernels.cu \
+                   gpu/rgpFgmKernels.cu gpu/rgpPEqnKernels.cu; do
+            echo "=== $f ==="
+            $NVCC $FLAGS -c $f -o /tmp/$(basename $f .cu).o
+          done
+          echo "ALL CUDA TUs COMPILE ON aarch64 (sm_90)"
+          ls -la /tmp/*.o
