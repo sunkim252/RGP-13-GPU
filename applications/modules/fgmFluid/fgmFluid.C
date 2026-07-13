@@ -123,6 +123,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuArmed_(false),
     gpuPEqn_(fgmTable_.lookupOrDefault<Switch>("gpuPEqn", false)),
     gpuPEqnCheck_(fgmTable_.lookupOrDefault<Switch>("gpuPEqnCheck", false)),
+    gpuDevChainNO_(fgmTable_.lookupOrDefault<Switch>("gpuDevChainNO", false)),
     gpuPEqnSolver_(fgmTable_.lookupOrDefault<word>("gpuPEqnSolver", "pcg")),
     gpuPEqnPrecon_
     (

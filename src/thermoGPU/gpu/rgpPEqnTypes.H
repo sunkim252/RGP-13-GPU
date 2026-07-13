@@ -300,7 +300,8 @@ int rgpSTEqnSolve
 int rgpPEqnNOArm
 (
     const double* dcsNO, double mdK,
-    const double* C3, const double* CfB3
+    const double* C3, const double* CfB3,
+    const double* magSf   /* [nf] devChain 비직교용 (null 허용) */
 );
 
 /*  은퇴한 디바이스 U-리미터의 dvec [3*nf] 해제 (호스트 가중치 상시

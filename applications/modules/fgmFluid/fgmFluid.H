@@ -280,6 +280,9 @@ protected:
         //- devChain 강등 래치 (VRAM 부족 시 1회 경고 후 CPU-prep 폴백)
         mutable bool gpuDevChainOff_ = false;
 
+        //- W6: devChain을 비직교에서도 활성 (fgmProperties, 기본 off)
+        Switch gpuDevChainNO_;
+
         //- 비직교(corrected) snGrad 스킴 감지 (아밍 시 설정) —
         //  GPU laplacian 면 계수(nonOrthDeltaCoeffs)·명시 보정 소스·
         //  pEqn 비직교 보정자 루프 활성화

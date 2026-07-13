@@ -136,6 +136,8 @@ namespace
         double *resCf = nullptr;                   // [3*nf] (MD시)
         double *resC3 = nullptr;                   // [3*nc] (MD시)
         double *resDcs = nullptr;                  // [nf]
+        double *magSf = nullptr;   // [nf] W6: devChain 비직교용 (호스트
+                                   // mesh.magSf() 1회 업로드 — sqrt ULP 회피)
         int resLoaded = 0;   // kf/Cf는 첫 Prep에서 lazy 업로드
         int resTried = 0;    // 캐시 할당 판단(첫 Prep) 완료 여부
     } gNO;
@@ -235,7 +237,8 @@ namespace
             &gPC.rAUf, &gPC.phiH, &gPC.rhof, &gPC.psis,
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld,
             &gNO.bCorr, &gNO.CfB3, &gNO.ownStage, &gNO.ownC3,
-            &gNO.resKf, &gNO.resCf, &gNO.resC3, &gNO.resDcs
+            &gNO.resKf, &gNO.resCf, &gNO.resC3, &gNO.resDcs,
+            &gNO.magSf
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gNO.hDcs.clear();
@@ -1525,6 +1528,18 @@ __global__ void stRelaxCellGather
 
 //- 비직교 보정: 면 보간 (CPU surfaceInterpolationScheme::interpolate
 //  1:1 — λ(P−N)+N; w*P+(1−w)*N 형태와 ULP가 다르므로 정확 재현)
+__global__ void noMulK
+(
+    const int nf, const double* __restrict__ a,
+    const double* __restrict__ b, double* __restrict__ out
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    out[f] = a[f]*b[f];
+}
+
+
 __global__ void noFaceInterp
 (
     const int nf,
@@ -3552,7 +3567,8 @@ int rgpSTEqnDump
 int rgpPEqnNOArm
 (
     const double* dcsNO, double mdK,
-    const double* C3, const double* CfB3
+    const double* C3, const double* CfB3,
+    const double* magSf
 )
 {
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
@@ -3601,6 +3617,19 @@ int rgpPEqnNOArm
         }
     }
     gNO.mdK = useMD ? mdK : -1;
+
+    // W6: magSf 상주 (devChain 비직교에서 gMsf=rAUf·magSf 디바이스 조합용)
+    if (magSf)
+    {
+        if (!gNO.magSf)
+        {
+            if ((e = cudaMalloc(&gNO.magSf, (size_t)nf*sizeof(double)))
+                != cudaSuccess) return pfail(e, "noArm/magSf malloc");
+        }
+        if ((e = cudaMemcpy(gNO.magSf, magSf, (size_t)nf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "noArm/magSf H2D");
+    }
 
     // 메시-불변 상주 캐시는 첫 Prep에서 lazy 판단 — 아밍 시점엔 UEqn
     // grad9 등 후속 정규 상주 할당이 아직이라, 여기서 잡으면 6GB
@@ -3694,8 +3723,27 @@ int rgpPEqnNOCorrPrep
         dPBN = rgpInPtr(pBNei, gNO.bCorr, (size_t)nbf, &e);
         if (e != cudaSuccess) return pfail(e, "noCorr/H2D pBN");
     }
-    const double* dGMsf = rgpInPtr(gMsf, gB.rAUf, (size_t)nf, &e);
-    if (e != cudaSuccess) return pfail(e, "noCorr/H2D gMsf");
+    // W6: gMsf==nullptr → devChain 디바이스 상주 rAUf(harmonic,
+    // pcPrepFace 산출)에 아밍-시 업로드된 magSf를 곱해 조합 —
+    // 호스트 A=trAUf·magSf와 동일 피연산자·동일 곱 (비트 규약 유지)
+    const double* dGMsf;
+    if (gMsf == nullptr)
+    {
+        if (!gPC.rAUf || !gNO.magSf)
+        {
+            snprintf(gPErr, sizeof(gPErr),
+                     "noCorr: devChain gMsf needs gPC.rAUf & magSf");
+            return -1;
+        }
+        rgppeqn::noMulK<<<nb(nf), BS>>>(nf, gPC.rAUf, gNO.magSf,
+                                        gB.rAUf);
+        dGMsf = gB.rAUf;
+    }
+    else
+    {
+        dGMsf = rgpInPtr(gMsf, gB.rAUf, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "noCorr/H2D gMsf");
+    }
 
     rgppeqn::noFaceInterp<<<nb(nf), BS>>>
         (nf, gM.own, gM.nei, gSTM.wLin, dP2, gB.flux);

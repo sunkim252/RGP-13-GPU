@@ -309,11 +309,17 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                     off += pCf.size();
                 }
             }
+            List<double> msf(nif);
+            {
+                const scalarField& m = mesh.magSf().primitiveField();
+                forAll(msf, f) { msf[f] = m[f]; }
+            }
             const int rcNO = rgpPEqnNOArm
             (
                 dno.begin(), mdK,
                 mdK >= 0 ? C3.begin() : nullptr,
-                mdK >= 0 ? CfB3.begin() : nullptr
+                mdK >= 0 ? CfB3.begin() : nullptr,
+                msf.begin()
             );
             if (rcNO == 0)
             {
@@ -582,8 +588,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // 영구 강등 — 나머지 스택은 그대로 GPU (6GB 카드 풀스택 실측)
     // 비직교 보정 활성 시 devChain 제외: 상주 체인은 보정 소스/플럭스
     // 보정을 모르므로 호스트-prep 경로가 정합 경로다
+    // W6: gpuDevChainNO on이면 비직교에서도 devChain 사용 (gMsf는
+    // 디바이스에서 rAUf·magSf 조합; 경계 재구성은 기존 호스트 유지)
     bool devChain =
-        gpuUEqn_ && gpuPEqn_ && !gpuDevChainOff_ && !gpuNonOrtho_;
+        gpuUEqn_ && gpuPEqn_ && !gpuDevChainOff_
+     && (!gpuNonOrtho_ || gpuDevChainNO_);
     if (devChain && rgpPCorrEnsure())
     {
         WarningInFunction
@@ -1316,7 +1325,16 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             //    gaussGrad 경계보정 → kf_b&gradB → limiter → A_b·corr ──
             if (gpuNOSrcDev_)
             {
-                const surfaceScalarField A(trAUf()*mesh.magSf());
+                // W6: devChain에선 trAUf 호스트본이 없음 — gMsf는
+                // 커널이 디바이스 상주 rAUf·magSf로 조합 (nullptr 전달)
+                tmp<surfaceScalarField> tA;
+                if (!devChain)
+                {
+                    tA = tmp<surfaceScalarField>
+                    (
+                        new surfaceScalarField(trAUf()*mesh.magSf())
+                    );
+                }
 
                 label nbfL = 0;
                 forAll(p.boundaryField(), patchi)
@@ -1372,7 +1390,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 (
                     p.primitiveField().begin(), pBF.begin(),
                     par ? pBN.begin() : nullptr,
-                    A.primitiveField().begin(),
+                    devChain ? nullptr : tA().primitiveField().begin(),
                     gpuNOKf3_.begin(),
                     gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
                     gpuNOLimitCoeff_, bG3.begin()
@@ -1489,8 +1507,51 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                         if (np == 0) continue;
                         const vectorField& kfb =
                             kf.boundaryField()[patchi];
-                        const scalarField& Ab =
-                            A.boundaryField()[patchi];
+                        // W6: devChain에선 A 전체가 없음 — 경계 슬라이스만
+                        // 동일 산술(1/interp(1/rAU)·magSf)로 재구성
+                        scalarField AbDev;
+                        if (devChain)
+                        {
+                            const fvPatchScalarField& rAUp =
+                                trAU().boundaryField()[patchi];
+                            const scalarField& msfb =
+                                mesh.magSf().boundaryField()[patchi];
+                            if (rAUp.coupled())
+                            {
+                                const scalarField lamA
+                                (
+                                    mesh.surfaceInterpolation::weights()
+                                        .boundaryField()[patchi]
+                                );
+                                const scalarField ri
+                                (
+                                    rAUp.patchInternalField()
+                                );
+                                const scalarField rn
+                                (
+                                    rAUp.patchNeighbourField()
+                                );
+                                AbDev.setSize(np);
+                                forAll(AbDev, k)
+                                {
+                                    AbDev[k] = msfb[k]/
+                                    (
+                                        lamA[k]*(1.0/ri[k])
+                                      + (1.0 - lamA[k])*(1.0/rn[k])
+                                    );
+                                }
+                            }
+                            else
+                            {
+                                AbDev = msfb/rAUp;
+                            }
+                        }
+                        const scalarField Ab
+                        (
+                            devChain
+                          ? AbDev
+                          : scalarField(tA().boundaryField()[patchi])
+                        );
 
                         if (pp.coupled())
                         {
@@ -1590,7 +1651,12 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     "pFaceFluxCorr", mesh,
                     dimensionedScalar
                     (
-                        A.dimensions()*p.dimensions()/dimLength, 0
+                        (
+                            devChain
+                          ? trAU().dimensions()*dimArea
+                          : tA().dimensions()
+                        )*p.dimensions()/dimLength,
+                        0
                     )
                 );
                 scalarField r(mesh.nCells());
