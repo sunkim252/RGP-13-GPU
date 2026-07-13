@@ -195,6 +195,14 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         }
     }
 
+    if (thermoTimings_)
+    {
+        Info<< "tp pre (conv+par-weights) = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tTot).count()
+            << " s" << endl;
+    }
+
     // --- FGM manifold update: gZ, composition Y_k, PV source (from Z, C) ---
     {
         const auto tManifold0 = std::chrono::steady_clock::now();
@@ -245,16 +253,28 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         dimensionedScalar(dimensionSet(1, -1, -1, 0, 0, 0, 0), 0),
         zeroGradientFvPatchScalarField::typeName
     );
+    std::chrono::steady_clock::time_point tLad;
+    if (thermoTimings_) { tLad = std::chrono::steady_clock::now(); }
     if (LADCoeff > 0)
     {
+        // GPU화 시도 철회 (2026-07-13): CPU cellMDLimited grad(rho)가
+        // 0.15-0.26s로 GPU gaussGrad 경로와 동급(이득 없음)인 데다
+        // 케이스 gradScheme(cellMDLimited)과 커널(무제한 gaussGrad)의
+        // 스킴 불일치로 CPU 1:1이 깨짐 — P1 계측으로 판명.
         const scalarField V23(pow(scalarField(mesh.V()), 2.0/3.0));
         Dart.primitiveFieldRef() =
             LADCoeff*V23
            *mag(U_)().primitiveField()
            *mag(fvc::grad(rho))().primitiveField();
-        Dart.correctBoundaryConditions();
         Info<< "LAD: Dart max = " << gMax(Dart.primitiveField())
             << " kg/(m s)" << endl;
+    }
+    if (thermoTimings_)
+    {
+        Info<< "tp LAD = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tLad).count()
+            << " s" << endl;
     }
 
     // Continuity-error compensation for the manifold scalars (Z, C, h).
@@ -276,6 +296,8 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     (
         pimple.dict().lookupOrDefault<Switch>("contErrCompensation", true)
     );
+    std::chrono::steady_clock::time_point tCE;
+    if (thermoTimings_) { tCE = std::chrono::steady_clock::now(); }
     const volScalarField contErr
     (
         "contErr",
@@ -287,8 +309,17 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
         )()
     );
 
+    if (thermoTimings_)
+    {
+        Info<< "tp contErr = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - tCE).count()
+            << " s" << endl;
+    }
+
     // --- Mixture-fraction transport (conserved scalar, no source) ---
-    std::chrono::steady_clock::time_point tZC;
+    std::chrono::steady_clock::time_point tZC, tH;
+    (void)tH;
     if (thermoTimings_) { tZC = std::chrono::steady_clock::now(); }
 
     // ZCGPU 공통 솔브: 조립(ddt+div[준비된 가중치]+Sp+laplacian)과
@@ -820,6 +851,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     if (fgmTable_.useEnthalpy())
     {
         volScalarField& h = hPtr_();
+        if (thermoTimings_) { tH = std::chrono::steady_clock::now(); }
         const volScalarField Dh("Dh", Deff("h"));
 
         if (gpuZC_)
@@ -993,6 +1025,13 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     {
         const auto tRefresh0 = std::chrono::steady_clock::now();
 
+        if (thermoTimings_)
+        {
+            Info<< "tp hEqn(+Dh) = "
+                << std::chrono::duration<double>
+                   (std::chrono::steady_clock::now() - tH).count()
+                << " s" << endl;
+        }
         if (gpuThermo_)
         {
             gpuThermoCorrect();
