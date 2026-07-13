@@ -2599,11 +2599,22 @@ int rgpPEqnSolve
                                               gB.x, gB.rA);
 
             iter++;
-            if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr, res)))
-                return rc;
-            greduce(res);
-            res /= normFactor;
-            if (converged(res)) break;
+            // W1: 잔차-노름 리덕션은 수렴판정 전용(alpha/beta 무관) —
+            // K반복마다만 D2H+Allreduce. 실행된 반복의 산술은 불변
+            // (p는 iterate-class 계약; 반복수가 최대 K-1 과잉될 뿐).
+            // 마지막 반복(maxIter 도달)에서는 반드시 판정해 finalRes 보장.
+            // 적응형: warm-start로 1~3반복 수렴하는 솔브가 K까지
+            // 과잉 진행하지 않도록 초반은 매회 판정, 장반복만 배치
+            const int kChk = 4;
+            if (iter < 8 || iter % kChk == 0 || iter >= maxIter)
+            {
+                if ((rc = reduceHost(nc, 1, gB.rA, nullptr, 0, nullptr,
+                                     res)))
+                    return rc;
+                greduce(res);
+                res /= normFactor;
+                if (converged(res)) break;
+            }
         }
     }
 

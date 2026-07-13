@@ -1759,6 +1759,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         //    매 패스 최신 p로 보정 소스·faceFluxCorrection 재계산 후
         //    재조립·재솔브. 직교(0회) 케이스는 1회 실행 = 기존과 동일 ──
         tmp<surfaceScalarField> tPCorrFace;
+        bool pcgFirstPass = true;   // W3: 외삽 초기추정은 첫 패스만
         while (pimple.correctNonOrthogonal())
         {
         scalarField srcNonOrtho;
@@ -1946,13 +1947,24 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         {
             rgpPEqnSetPrecon(gpuPEqnPrecon_ == "dic" ? 1 : 0);
 
+            // W3: 시간외삽 초기추정 x0 = 2·p^n − p^(n−1) — 솔버는 x0를
+            // 1회만 읽으므로(iterate-class) 반복수만 줄고 실행 산술은
+            // 불변. ddt용 p.oldTime()(아래 별도 인자)은 건드리지 않는다.
+            // 첫 스텝(oldTime==p)에서는 x0==p로 자동 무해.
+            scalarField pXtr(p.primitiveField());
+            if (pcgFirstPass)
+            {
+                pXtr += p.primitiveField() - p.oldTime().primitiveField();
+            }
+            pcgFirstPass = false;
+
             const int rc = rgpPEqnSolve
             (
                 dtInv, rdtCell, srcExtraArg,
                 devChain ? nullptr : trAUf().primitiveField().begin(),
                 devChain ? nullptr : tpsis().primitiveField().begin(),
                 p.oldTime().primitiveField().begin(),
-                p.primitiveField().begin(),
+                pXtr.begin(),
                 devChain ? nullptr : tphiHbyAv().primitiveField().begin(),
                 phiBA, bDiagA, bSrcA,
                 needRef, refCell, refValue,
