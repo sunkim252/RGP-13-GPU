@@ -392,7 +392,11 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
     // 이웃 셀 전역 인덱스는 processor-면 순서로 교환 (ParArm 순서와
     // 동일한 패치 순회).
     gpuPEqnNnz_ = 0;
-    if (gpuPEqnSolver_ == "amgx")
+    // W2: 융합 CG(RGP_CG_FUSED)는 CSR SpMV를 쓰므로 pcg에서도 아밍
+    const bool wantCsr =
+        (gpuPEqnSolver_ == "amgx")
+     || (getenv("RGP_CG_FUSED") && !Pstream::parRun());
+    if (wantCsr)
     {
         int nnz = 0;
         if (!Pstream::parRun())
@@ -1844,6 +1848,15 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         pcgXtrStamp = mesh.time().timeIndex();
         while (pimple.correctNonOrthogonal())
         {
+        // W3(F6): x0 — 매 패스 최신 p에서 생성; 외삽은 스텝 첫
+        // corrector의 첫 패스만 (F5). 후속 패스는 직전 해 그대로.
+        scalarField pXtr(p.primitiveField());
+        if (pcgFirstPass)
+        {
+            pXtr += p.primitiveField() - p.oldTime().primitiveField();
+        }
+        pcgFirstPass = false;
+
         scalarField srcNonOrtho;
         const double* srcExtraArg = amdSrc;
         if (gpuNonOrtho_)
@@ -1901,7 +1914,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     devChain ? nullptr
                   : tpsis().primitiveField().begin(),
                     p.oldTime().primitiveField().begin(),
-                    p.primitiveField().begin(),
+                    pXtr.begin(),
                     devChain ? nullptr
                   : tphiHbyAv().primitiveField().begin(),
                     phiBA, bDiagA, bSrcA,
@@ -1916,7 +1929,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                     devChain ? nullptr
                   : tpsis().primitiveField().begin(),
                     p.oldTime().primitiveField().begin(),
-                    p.primitiveField().begin(),
+                    pXtr.begin(),
                     devChain ? nullptr
                   : tphiHbyAv().primitiveField().begin(),
                     phiBA, bDiagA, bSrcA,
@@ -2029,16 +2042,6 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         {
             rgpPEqnSetPrecon(gpuPEqnPrecon_ == "dic" ? 1 : 0);
 
-            // W3: 시간외삽 초기추정 x0 = 2·p^n − p^(n−1) — 솔버는 x0를
-            // 1회만 읽으므로(iterate-class) 반복수만 줄고 실행 산술은
-            // 불변. ddt용 p.oldTime()(아래 별도 인자)은 건드리지 않는다.
-            // 첫 스텝(oldTime==p)에서는 x0==p로 자동 무해.
-            scalarField pXtr(p.primitiveField());
-            if (pcgFirstPass)
-            {
-                pXtr += p.primitiveField() - p.oldTime().primitiveField();
-            }
-            pcgFirstPass = false;
 
             const int rc = rgpPEqnSolve
             (

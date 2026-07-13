@@ -102,9 +102,15 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     std::chrono::steady_clock::time_point tTot;
     if (thermoTimings_) { tTot = std::chrono::steady_clock::now(); }
 
-    // W4: Deff 공통부(turb, mu)를 이 predictor 호출 스코프에서 1회만
-    // 계산 — updateManifold의 Deff("Z")와 아래 DZ/DC/Dh[/DW]가 재사용.
-    // rho/nut/mu는 이 함수 안에서 갱신되지 않으므로 비트-동일.
+    // W4(F8): Deff 공통부(turb, mu) 캐시 — RAII 가드로 함수 이탈
+    // 경로(향후 early return 포함)와 무관하게 반드시 해제. rho/mu/nut는
+    // 이 함수 스코프에서 불변이라 재사용이 비트-동일.
+    struct DeffCacheGuard
+    {
+        fgmFluid& s_;
+        DeffCacheGuard(fgmFluid& s) : s_(s) {}
+        ~DeffCacheGuard() { s_.DeffTurbC_.clear(); s_.DeffMuC_.clear(); }
+    } deffGuard(*this);
     DeffTurbC_ = tmp<volScalarField>
     (
         new volScalarField(rho*momentumTransport().nut()/Sct_)
@@ -1071,10 +1077,7 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             << " s" << endl;
     }
 
-    // W4: 캐시는 이 함수 스코프 한정 — rho/mu/nut가 밖에서 갱신되므로
-    // 무조건 해제 (timings 여부와 무관)
-    DeffTurbC_.clear();
-    DeffMuC_.clear();
+    // (해제는 deffGuard 소멸자가 담당 — F8)
 }
 
 

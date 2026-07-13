@@ -683,6 +683,123 @@ __global__ void csrSpmv
     y[i] = s;
 }
 
+//- W2 융합 CG 커널 (env RGP_CG_FUSED; 직렬+jacobi+CSR 전용) —
+//  스칼라(rArD/pAwA/res/rArDold)를 gB.red[0..3]에 디바이스 상주시켜
+//  반복당 호스트 동기를 res D2H 1회로 축소. 블록 리덕션+atomicAdd라
+//  합산 순서는 기존 reduceK와 다름 — 의도적 변화(스위치 뒤).
+//  red[0]=rArD, [1]=pAwA, [2]=res(|rA| 합), [3]=rArDold
+
+//- z=rA/diag(자코비) + rArD=Σz·rA 융합; beta용 rArDold 스왑 포함
+__global__ void fusedPrecondDot
+(
+    const int nc, const double* __restrict__ rA,
+    const double* __restrict__ diag, double* __restrict__ wA,
+    double* __restrict__ red
+)
+{
+    __shared__ double sh[256];
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    double v = 0.0;
+    if (i < nc)
+    {
+        const double z = rA[i]/diag[i];
+        wA[i] = z;
+        v = z*rA[i];
+    }
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int st = blockDim.x/2; st > 0; st >>= 1)
+    {
+        if (threadIdx.x < st) sh[threadIdx.x] += sh[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(&red[0], sh[0]);
+}
+
+//- pA = wA + beta*pA (beta = red[0]/red[3], iter0이면 0)
+__global__ void fusedDirUpdate
+(
+    const int nc, const int iter0, const double* __restrict__ wA,
+    const double* __restrict__ red, double* __restrict__ pA
+)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nc) return;
+    const double beta = iter0 ? 0.0 : red[0]/red[3];
+    pA[i] = wA[i] + beta*pA[i];
+}
+
+//- CSR SpMV + pAwA=Σ pA·(A·pA) 융합
+__global__ void fusedCsrSpmvDot
+(
+    const int nc, const int* __restrict__ rowPtr,
+    const int* __restrict__ colInd, const double* __restrict__ vals,
+    const double* __restrict__ pA, double* __restrict__ wA,
+    double* __restrict__ red
+)
+{
+    __shared__ double sh[256];
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    double v = 0.0;
+    if (i < nc)
+    {
+        double sum = 0.0;
+        const int e = rowPtr[i + 1];
+        for (int k = rowPtr[i]; k < e; k++)
+        {
+            sum += vals[k]*pA[colInd[k]];
+        }
+        wA[i] = sum;
+        v = pA[i]*sum;
+    }
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int st = blockDim.x/2; st > 0; st >>= 1)
+    {
+        if (threadIdx.x < st) sh[threadIdx.x] += sh[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(&red[1], sh[0]);
+}
+
+//- x/rA 갱신(alpha=red[0]/red[1]) + res=Σ|rA'| 융합 + rArDold 스왑/클리어
+__global__ void fusedCgUpdate
+(
+    const int nc, const double* __restrict__ pA,
+    const double* __restrict__ wA, double* __restrict__ x,
+    double* __restrict__ rA, double* __restrict__ red
+)
+{
+    __shared__ double sh[256];
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    // 특이(pAwA==0) 안전판 — 갱신 스킵 (기존 경로의 break에 상응)
+    const double alpha = (red[1] != 0.0) ? red[0]/red[1] : 0.0;
+    double v = 0.0;
+    if (i < nc)
+    {
+        x[i] += alpha*pA[i];
+        const double r = rA[i] - alpha*wA[i];
+        rA[i] = r;
+        v = fabs(r);
+    }
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int st = blockDim.x/2; st > 0; st >>= 1)
+    {
+        if (threadIdx.x < st) sh[threadIdx.x] += sh[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(&red[2], sh[0]);
+}
+
+//- 반복 준비: rArDold=rArD, rArD/pAwA/res 클리어 (단일 스레드)
+__global__ void fusedIterPrep(double* __restrict__ red)
+{
+    red[3] = red[0];
+    red[0] = 0.0; red[1] = 0.0; red[2] = 0.0;
+}
+
+
 //- 내부면 플럭스: faceH = upper*x_n - lower*x_o = -upper*(x_o - x_n)...
 //  대칭(lower=upper)이므로 faceH_f = upper_f*(x_n - x_o)
 __global__ void faceFlux
@@ -2581,7 +2698,40 @@ int rgpPEqnSolve
         return (r < tol) || (relTol > 0 && r <= relTol*(*initRes));
     };
 
-    if (!converged(res))
+    // ── W2 융합 CG (env RGP_CG_FUSED=1; 직렬+jacobi+CSR 한정) ──
+    static int cgFused = -1;
+    if (cgFused < 0)
+    {
+        const char* e2 = getenv("RGP_CG_FUSED");
+        cgFused = (e2 && e2[0] == '1') ? 1 : 0;
+    }
+    const bool useFused =
+        cgFused && gPrecon == 0 && gM.dVals && gM.dRowPtr
+     && gPar.totF == 0;
+    if (useFused && !converged(res))
+    {
+        while (iter < maxIter)
+        {
+            rgppeqn::fusedIterPrep<<<1, 1>>>(gB.red);
+            rgppeqn::fusedPrecondDot<<<nb(nc), BS>>>
+                (nc, gB.rA, gB.diag, gB.wA, gB.red);
+            rgppeqn::fusedDirUpdate<<<nb(nc), BS>>>
+                (nc, iter == 0 ? 1 : 0, gB.wA, gB.red, gB.pA);
+            rgppeqn::fusedCsrSpmvDot<<<nb(nc), BS>>>
+                (nc, gM.dRowPtr, gM.dColInd, gM.dVals, gB.pA, gB.wA,
+                 gB.red);
+            rgppeqn::fusedCgUpdate<<<nb(nc), BS>>>
+                (nc, gB.pA, gB.wA, gB.x, gB.rA, gB.red);
+            iter++;
+            // 반복당 유일한 호스트 동기: res 8B D2H
+            if ((e = cudaMemcpy(&res, gB.red + 2, sizeof(double),
+                                cudaMemcpyDeviceToHost)) != cudaSuccess)
+                return pfail(e, "cgFused/res D2H");
+            res /= normFactor;
+            if (converged(res)) break;
+        }
+    }
+    else if (!converged(res))
     {
         while (iter < maxIter)
         {
