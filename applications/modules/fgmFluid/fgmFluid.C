@@ -1228,6 +1228,19 @@ Foam::solvers::fgmFluid::leField(const word& var) const
 Foam::tmp<Foam::volScalarField>
 Foam::solvers::fgmFluid::Deff(const word& var)
 {
+    // W4: predictor 스코프 캐시(turb=rho·nut/Sct, mu) 재사용 —
+    // 피연산자 비트-동일, 합산식은 기존 그대로. 캐시 없으면 기존 경로.
+    const volScalarField* Lefld = leField(var);
+    const scalar Le = Le_.found(var) ? Le_[var] : 1.0;
+
+    if (DeffTurbC_.valid() && DeffMuC_.valid())
+    {
+        const volScalarField& turb = DeffTurbC_();
+        const volScalarField& mu = DeffMuC_();
+        if (Lefld != nullptr) { return mu/(*Lefld) + turb; }
+        return mu/Le + turb;
+    }
+
     // Turbulent subgrid contribution rho*nut/Sct [kg/m/s].
     const volScalarField turb(rho*momentumTransport().nut()/Sct_);
 
@@ -1235,13 +1248,11 @@ Foam::solvers::fgmFluid::Deff(const word& var)
     // tabulates Le_<var>, use the per-cell Le(Z,gZ,c[,chi]) (differential
     // diffusion baked in from the real-fluid flamelet transport); otherwise
     // fall back to the constant Le_ scalar (default 1, unity Lewis).
-    const volScalarField* Lefld = leField(var);
     if (Lefld != nullptr)
     {
         return thermo.mu()/(*Lefld) + turb;
     }
 
-    const scalar Le = Le_.found(var) ? Le_[var] : 1.0;
     return thermo.mu()/Le + turb;
 }
 

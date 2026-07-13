@@ -436,6 +436,14 @@ private:
         //  per-species differential diffusion.
         tmp<volScalarField> Deff(const word& var);
 
+        //- W4: Deff 공통부 캐시 — turb=rho·nut/Sct와 mu가 outer당
+        //  최대 5회(updateManifold의 Z + predictor의 Z/C/h[/W]) 동일
+        //  재계산되던 것을 thermophysicalPredictor 스코프에서 1회로.
+        //  피연산자만 재사용하고 합산식(mu/Le + turb)은 기존 그대로라
+        //  비트-동일. predictor 밖(다른 경로의 Deff 호출)은 비캐시.
+        mutable tmp<volScalarField> DeffTurbC_;
+        mutable tmp<volScalarField> DeffMuC_;
+
         //- Mixture-fraction variance mixing-length squared L^2 [m^2] per cell,
         //  auto-selected from the momentum-transport simulationType (LES filter
         //  width / RAS integral length / laminar zero). Used in the algebraic

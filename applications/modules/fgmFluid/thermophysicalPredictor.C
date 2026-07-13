@@ -102,6 +102,15 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
     std::chrono::steady_clock::time_point tTot;
     if (thermoTimings_) { tTot = std::chrono::steady_clock::now(); }
 
+    // W4: Deff 공통부(turb, mu)를 이 predictor 호출 스코프에서 1회만
+    // 계산 — updateManifold의 Deff("Z")와 아래 DZ/DC/Dh[/DW]가 재사용.
+    // rho/nut/mu는 이 함수 안에서 갱신되지 않으므로 비트-동일.
+    DeffTurbC_ = tmp<volScalarField>
+    (
+        new volScalarField(rho*momentumTransport().nut()/Sct_)
+    );
+    DeffMuC_ = tmp<volScalarField>(new volScalarField(thermo.mu()));
+
     tmp<fv::convectionScheme<scalar>> mvConvection;
     if (!gpuZC_ || gpuPEqnCheck_)   // check 모드: CPU 대조용으로도 구성
     {
@@ -1061,6 +1070,11 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
                (std::chrono::steady_clock::now() - tTot).count()
             << " s" << endl;
     }
+
+    // W4: 캐시는 이 함수 스코프 한정 — rho/mu/nut가 밖에서 갱신되므로
+    // 무조건 해제 (timings 여부와 무관)
+    DeffTurbC_.clear();
+    DeffMuC_.clear();
 }
 
 
