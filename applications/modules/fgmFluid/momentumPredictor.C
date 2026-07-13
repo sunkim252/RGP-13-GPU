@@ -267,7 +267,8 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             const vectorField& Uc = U.primitiveField();
             const vectorField& Uo = U.oldTime().primitiveField();
             #ifdef _OPENMP
-            #pragma omp parallel for schedule(static) num_threads(4)
+            #pragma omp parallel for schedule(static) \
+                num_threads(Pstream::parRun() ? 1 : 4)
             #endif
             for (label i = 0; i < nc; i++)
             {
@@ -774,7 +775,8 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                     << ", Final residual = " << resF[k]
                     << ", No Iterations " << iters[k] << endl;
                 #ifdef _OPENMP
-                #pragma omp parallel for schedule(static) num_threads(4)
+                #pragma omp parallel for schedule(static) \
+                num_threads(Pstream::parRun() ? 1 : 4)
                 #endif
                 for (label i = 0; i < nc; i++)
                 {

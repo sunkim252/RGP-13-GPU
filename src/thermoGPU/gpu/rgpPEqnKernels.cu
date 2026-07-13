@@ -1392,17 +1392,21 @@ __global__ void pcPsis
     psis[i] = psi[i]/rho[i];
 }
 
-//- phi 재구성: phi = rhof*(phiHbyAv + flux)
+//- phi 재구성: phi = rhof*(phiHbyAv + flux [− corrF])
+//  corrF = 비직교 면 보정 플럭스 (fvMatrix::flux 규약과 동일하게 차감;
+//  W6-F2: devChain 비직교에서 미차감 시 phi가 연속식과 불일치)
 __global__ void pcPhiRecon
 (
     const int nf, const double* __restrict__ rhof,
     const double* __restrict__ phiH, const double* flux,
+    const double* __restrict__ corrF,
     double* phiOut
 )
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nf) return;
-    phiOut[f] = rhof[f]*(phiH[f] + flux[f]);
+    const double c = corrF ? corrF[f] : 0.0;
+    phiOut[f] = rhof[f]*(phiH[f] + flux[f] - c);
 }
 
 //- U = HbyA − rAU*grad(p) (성분별 SoA out)
@@ -4541,15 +4545,19 @@ int rgpPCorrPrep
 }
 
 
-//- 솔브 후처리 v2: 플럭스 → phi = rhof*(phiHbyAv + flux)까지 디바이스
-int rgpPEqnFinish2(double* pOut, double* phiOut)
+//- 솔브 후처리 v2: 플럭스 → phi = rhof*(phiHbyAv + flux − corrF)
+//  useNOCorr != 0 이면 gST.lower(직전 NOCorrPrep의 면 보정 플럭스,
+//  pCorr 동안 유휴 계약)를 차감 — fvMatrix::flux와 일치 (W6-F2)
+int rgpPEqnFinish2(double* pOut, double* phiOut, int useNOCorr)
 {
     const int nc = gM.nCells, nf = gM.nIntFaces;
 
     rgppeqn::faceFlux<<<nb(nf), BS>>>(nf, gM.own, gM.nei, gB.upper,
                                       gB.x, gB.flux);
     rgppeqn::pcPhiRecon<<<nb(nf), BS>>>(nf, gPC.rhof, gPC.phiH,
-                                        gB.flux, gB.flux);
+                                        gB.flux,
+                                        useNOCorr ? gST.lower : nullptr,
+                                        gB.flux);
     cudaError_t e;
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "pcorr/finish launch");

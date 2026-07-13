@@ -309,8 +309,12 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                     off += pCf.size();
                 }
             }
-            List<double> msf(nif);
+            // F4: magSf 상주는 devChainNO 전용 — off면 아밍-시 VRAM
+            // 압박(6GB 카드 UEqn 밀어냄)을 만들지 않도록 미전달
+            List<double> msf;
+            if (gpuDevChainNO_)
             {
+                msf.setSize(nif);
                 const scalarField& m = mesh.magSf().primitiveField();
                 forAll(msf, f) { msf[f] = m[f]; }
             }
@@ -319,7 +323,7 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                 dno.begin(), mdK,
                 mdK >= 0 ? C3.begin() : nullptr,
                 mdK >= 0 ? CfB3.begin() : nullptr,
-                msf.begin()
+                gpuDevChainNO_ ? msf.begin() : nullptr
             );
             if (rcNO == 0)
             {
@@ -1543,7 +1547,14 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                             }
                             else
                             {
-                                AbDev = msfb/rAUp;
+                                // 호스트 trAUf_b = 1/interp(1/rAU)_b =
+                                // 1/(1/rAU_b) — ULP까지 동일하게 재현
+                                AbDev.setSize(np);
+                                forAll(AbDev, k)
+                                {
+                                    AbDev[k] =
+                                        (1.0/(1.0/rAUp[k]))*msfb[k];
+                                }
                             }
                         }
                         const scalarField Ab
@@ -1825,7 +1836,12 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         //    매 패스 최신 p로 보정 소스·faceFluxCorrection 재계산 후
         //    재조립·재솔브. 직교(0회) 케이스는 1회 실행 = 기존과 동일 ──
         tmp<surfaceScalarField> tPCorrFace;
-        bool pcgFirstPass = true;   // W3: 외삽 초기추정은 첫 패스만
+        // W3(F5): 외삽은 스텝의 첫 corrector 첫 패스만 — 이후
+        // corrector의 p는 이미 현재-시간 해라 재외삽이 워밍을 훼손
+        static label pcgXtrStamp = -1;
+        bool pcgFirstPass =
+            (mesh.time().timeIndex() != pcgXtrStamp);
+        pcgXtrStamp = mesh.time().timeIndex();
         while (pimple.correctNonOrthogonal())
         {
         scalarField srcNonOrtho;
@@ -2068,7 +2084,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             if (rgpPEqnFinish2
                 (
                     p.primitiveFieldRef().begin(),
-                    gpuPEqnFlux_.begin()
+                    gpuPEqnFlux_.begin(),
+                    (gpuNOSrcDev_ && tPCorrFace.valid()) ? 1 : 0
                 ))
             {
                 FatalErrorInFunction

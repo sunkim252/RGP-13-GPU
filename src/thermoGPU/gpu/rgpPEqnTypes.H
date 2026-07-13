@@ -236,7 +236,11 @@ int rgpPCorrPrep
     const double* psisOverride,
     double rDeltaT, const double* rdtCell, double rcDdtScale
 );
-int rgpPEqnFinish2(double* pOut, double* phiOut);
+int rgpPEqnFinish2
+(
+    double* pOut, double* phiOut,
+    int useNOCorr   /* 1 = gST.lower(NO 면 보정 플럭스) 차감 (W6) */
+);
 int rgpPCorrU(const double* pNew, const double* pB, double* U3out);
 
 /*  fvc::div(phi, q) — 직전 rgpSTWeights*가 준비한 multivariate
