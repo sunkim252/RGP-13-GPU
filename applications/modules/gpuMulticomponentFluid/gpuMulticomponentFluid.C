@@ -356,7 +356,8 @@ void Foam::solvers::gpuMulticomponentFluid::armGpuMesh()
             (
                 dno.begin(), mdK,
                 mdK >= 0 ? C3.begin() : nullptr,
-                mdK >= 0 ? CfB3.begin() : nullptr
+                mdK >= 0 ? CfB3.begin() : nullptr,
+                nullptr   // magSf: gmc는 devChainNO 미사용
             );
             if (rcNO == 0)
             {
