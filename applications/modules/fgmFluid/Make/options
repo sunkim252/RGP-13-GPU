@@ -1,4 +1,5 @@
 EXE_INC = \
+    -fopenmp \
     -I$(LIB_RGP13_SRC)/FGM \
     -I$(LIB_RGP13_SRC)/SRKchungTakaMixture \
     -I$(LIB_RGP13_SRC)/thermoGPU \
@@ -41,4 +42,5 @@ LIB_LIBS = \
     -lfvModels \
     -lfvConstraints \
     -lmeshTools \
-    -lsampling
+    -lsampling\
+    -lgomp

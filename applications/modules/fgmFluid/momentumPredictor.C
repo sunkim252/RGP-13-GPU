@@ -38,6 +38,11 @@ License
 #include "fvcDiv.H"
 #include "gpu/rgpPEqnTypes.H"
 
+// W7: SoA 게더/산포 병렬화 (순수 인덱싱 루프 한정)
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <chrono>
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
@@ -261,6 +266,9 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         {
             const vectorField& Uc = U.primitiveField();
             const vectorField& Uo = U.oldTime().primitiveField();
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static) num_threads(4)
+            #endif
             for (label i = 0; i < nc; i++)
             {
                 for (label k = 0; k < 3; k++)
@@ -765,6 +773,9 @@ void Foam::solvers::fgmFluid::momentumPredictor()
                     << ", Initial residual = " << res0[k]
                     << ", Final residual = " << resF[k]
                     << ", No Iterations " << iters[k] << endl;
+                #ifdef _OPENMP
+                #pragma omp parallel for schedule(static) num_threads(4)
+                #endif
                 for (label i = 0; i < nc; i++)
                 {
                     Uc[i][k] = U3out[k*nc + i];
