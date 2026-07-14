@@ -30,6 +30,9 @@ License
 #include "addToRunTimeSelectionTable.H"
 #include "tabulatedRealGasMixture.H"
 #include "Switch.H"
+#include "Pstream.H"
+#include "stringList.H"
+#include "OSspecific.H"
 #include "gpu/rgpFgmTypes.H"
 #include <cstring>
 #include <chrono>
@@ -139,6 +142,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuMeshStampTime_(-1),
     gpuPEqnArmed_(false),
     gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
+    gpuManifoldShare_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldShare", true)),
     gpuManifoldArmed_(false),
     gpuHeMode_(-1),
     gpuNFields_(0),
@@ -899,20 +903,127 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
                 );
             }
 
-            const int rc = rgpFgmUpload
-            (
-                fgmTable_.nZ(), fgmTable_.nGz(),
-                fgmTable_.nC(), fgmTable_.nChi(),
-                fgmTable_.Zaxis().begin(), fgmTable_.gZaxis().begin(),
-                fgmTable_.Caxis().begin(), fgmTable_.chiAxis().begin(),
-                gpuNFields_, flat.begin()
-            );
+            // 랭크 간 매니폴드 공유(CUDA IPC): 같은 GPU를 쓰는 랭크
+            // 그룹(호스트명+PCI busId)의 리더만 테이블을 올리고, 나머지는
+            // 리더의 디바이스 할당을 열어 공유(랭크당 테이블 중복 제거).
+            // 산술에는 전혀 관여하지 않는 할당 소유권 변경이므로 결과는
+            // 랭크별 업로드와 비트-동일. IPC 미지원(WSL)·임포트 실패는
+            // 랭크별 업로드로 폴백. 주의: 아래 gather/scatter는 분기와
+            // 무관하게 전 랭크가 같은 횟수로 지나야 한다(집합 연산).
+            bool ipcShared = false;
+            label ipcLeader = -1;
+            bool uploadDone = false;
+            int rc = -1;
+
+            if (Pstream::parRun() && gpuManifoldShare_)
+            {
+                char bus[64] = {0};
+                if (rgpFgmDevBusId(bus, sizeof(bus)) != 0)
+                {
+                    bus[0] = '\0';
+                }
+                stringList keys(Pstream::nProcs());
+                keys[Pstream::myProcNo()] =
+                    hostName() + ":" + string(bus);
+                Pstream::gatherList(keys);
+                Pstream::scatterList(keys);
+
+                ipcLeader = Pstream::myProcNo();
+                for (label r = 0; r < Pstream::nProcs(); r++)
+                {
+                    if (keys[r] == keys[Pstream::myProcNo()])
+                    {
+                        ipcLeader = r;
+                        break;
+                    }
+                }
+
+                // 리더: 업로드 + 핸들 익스포트 (성공 시에만 블롭 게시)
+                List<labelList> hAll(Pstream::nProcs());
+                if (ipcLeader == Pstream::myProcNo())
+                {
+                    rc = rgpFgmUpload
+                    (
+                        fgmTable_.nZ(), fgmTable_.nGz(),
+                        fgmTable_.nC(), fgmTable_.nChi(),
+                        fgmTable_.Zaxis().begin(),
+                        fgmTable_.gZaxis().begin(),
+                        fgmTable_.Caxis().begin(),
+                        fgmTable_.chiAxis().begin(),
+                        gpuNFields_, flat.begin()
+                    );
+                    uploadDone = true;
+
+                    unsigned char h[RGP_FGM_IPC_BLOB];
+                    if (rc == 0 && rgpFgmIpcSupported()
+                     && rgpFgmIpcExport(h) == 0)
+                    {
+                        labelList& mine = hAll[Pstream::myProcNo()];
+                        mine.setSize(RGP_FGM_IPC_BLOB);
+                        forAll(mine, i) { mine[i] = label(h[i]); }
+                    }
+                }
+                Pstream::gatherList(hAll);
+                Pstream::scatterList(hAll);
+
+                if
+                (
+                    ipcLeader != Pstream::myProcNo()
+                 && hAll[ipcLeader].size() == RGP_FGM_IPC_BLOB
+                )
+                {
+                    unsigned char h[RGP_FGM_IPC_BLOB];
+                    forAll(hAll[ipcLeader], i)
+                    {
+                        h[i] = static_cast<unsigned char>(hAll[ipcLeader][i]);
+                    }
+                    if
+                    (
+                        rgpFgmIpcImport
+                        (
+                            fgmTable_.nZ(), fgmTable_.nGz(),
+                            fgmTable_.nC(), fgmTable_.nChi(),
+                            gpuNFields_, h
+                        ) == 0
+                    )
+                    {
+                        rc = 0;
+                        uploadDone = true;
+                        ipcShared = true;
+                    }
+                    else
+                    {
+                        WarningInFunction
+                            << "manifold IPC import from rank " << ipcLeader
+                            << " failed (" << rgpFgmLastError()
+                            << ") -- falling back to per-rank upload"
+                            << endl;
+                    }
+                }
+            }
+
+            if (!uploadDone)
+            {
+                rc = rgpFgmUpload
+                (
+                    fgmTable_.nZ(), fgmTable_.nGz(),
+                    fgmTable_.nC(), fgmTable_.nChi(),
+                    fgmTable_.Zaxis().begin(), fgmTable_.gZaxis().begin(),
+                    fgmTable_.Caxis().begin(), fgmTable_.chiAxis().begin(),
+                    gpuNFields_, flat.begin()
+                );
+            }
 
             if (rc == 0)
             {
                 gpuManifoldArmed_ = true;
                 Info<< "fgmFluid: GPU manifold armed -- " << gpuNFields_
                     << " fields x " << nTot << " table entries" << nl << endl;
+                if (ipcShared)
+                {
+                    Pout<< "fgmFluid: manifold table IPC-shared from rank "
+                        << ipcLeader << nl << endl;
+                }
             }
             else
             {

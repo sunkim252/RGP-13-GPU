@@ -309,6 +309,12 @@ protected:
         //  16-코너 보간)를 CUDA로 오프로드. 'gpuManifold on;' (fgmProperties).
         Switch gpuManifold_;
 
+        //- 병렬에서 같은 GPU를 쓰는 랭크들이 매니폴드 테이블 디바이스
+        //  할당을 CUDA IPC로 공유(리더만 업로드, 랭크당 ~250MB 중복 제거).
+        //  IPC 미지원(WSL 등)이나 임포트 실패 시 랭크별 업로드로 폴백.
+        //  'gpuManifoldShare off;' (fgmProperties, 기본 on)
+        Switch gpuManifoldShare_;
+
         //- 테이블 업로드 완료 플래그 + 보간 출력 호스트 버퍼
         mutable bool gpuManifoldArmed_;
 

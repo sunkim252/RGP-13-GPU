@@ -55,6 +55,27 @@ const double* rgpFgmDevOutPtr(void);
 int rgpFgmDevNFields(void);
 int rgpFgmDevLastN(void);
 
+/*  랭크 간 매니폴드 공유(CUDA IPC). 핸들 블롭은 5개 할당
+    (Zax,Gax,Cax,Kax,tables) × 64B = 320B 고정.
+    Supported: cudaIpcGetMemHandle 프로브(캐시) — 단 WSL은 핸들 생성은
+    되지만 타 프로세스 open이 거부되므로, 최종 판정은 임포트 실패
+    폴백이 담당한다.
+    Export: 업로드 완료 상태에서만. Import: 기존 테이블 해제 후 리더의
+    할당을 열어 gT에 매핑(dims는 리더의 rgpFgmUpload와 동일해야 함).
+    임포트로 매핑된 포인터는 rgpFgmFree에서 cudaIpcCloseMemHandle로
+    닫는다(cudaFree 아님).                                             */
+#define RGP_FGM_IPC_BLOB 320
+int rgpFgmIpcSupported(void);
+int rgpFgmIpcExport(unsigned char* handles320);
+int rgpFgmIpcImport
+(
+    int nZ, int nG, int nC, int nK, int nFields,
+    const unsigned char* handles320
+);
+
+/*  현재 디바이스의 PCI busId 문자열 (랭크→GPU 그룹핑 키용) */
+int rgpFgmDevBusId(char* out, int cap);
+
 void rgpFgmFree(void);
 const char* rgpFgmLastError(void);
 

@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <string.h>
 #include <vector>
 
 namespace
@@ -30,6 +31,7 @@ namespace
         int nZ = 0, nG = 0, nC = 0, nK = 0, nFields = 0;
         double *Zax = nullptr, *Gax = nullptr, *Cax = nullptr,
                *Kax = nullptr, *tables = nullptr;
+        int imported = 0;   // 1 = IPC 임포트 매핑 (close, not free)
     } gT;
 
     struct FgmBuf
@@ -48,10 +50,19 @@ namespace
 
     void fgmFreeAll()
     {
-        double** ps[] = {&gT.Zax,&gT.Gax,&gT.Cax,&gT.Kax,&gT.tables,
-                         &gB.Z,&gB.C,&gB.rho,&gB.Lsqr,&gB.msg,&gB.Deff,
+        double** pt[] = {&gT.Zax,&gT.Gax,&gT.Cax,&gT.Kax,&gT.tables};
+        for (auto p : pt)
+        {
+            if (*p)
+            {
+                if (gT.imported) { cudaIpcCloseMemHandle(*p); }
+                else             { cudaFree(*p); }
+                *p = nullptr;
+            }
+        }
+        double** pb[] = {&gB.Z,&gB.C,&gB.rho,&gB.Lsqr,&gB.msg,&gB.Deff,
                          &gB.hw,&gB.gZ,&gB.chi,&gB.out};
-        for (auto p : ps) { if (*p) { cudaFree(*p); *p = nullptr; } }
+        for (auto p : pb) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gT = FgmDev(); gB = FgmBuf();
     }
 }
@@ -276,6 +287,83 @@ int rgpFgmUpload
                         cudaMemcpyHostToDevice);
         if (rc != cudaSuccess) { fgmFreeAll(); return ffail(rc, "fgm/memcpy"); }
     }
+    return 0;
+}
+
+
+static_assert
+(
+    sizeof(cudaIpcMemHandle_t) == 64 && RGP_FGM_IPC_BLOB == 5*64,
+    "IPC handle blob layout"
+);
+
+int rgpFgmIpcSupported(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    void* p = nullptr;
+    if (cudaMalloc(&p, 256) != cudaSuccess) { cached = 0; return 0; }
+    cudaIpcMemHandle_t h;
+    cached = (cudaIpcGetMemHandle(&h, p) == cudaSuccess) ? 1 : 0;
+    cudaFree(p);
+    return cached;
+}
+
+int rgpFgmIpcExport(unsigned char* handles320)
+{
+    if (!gT.tables || gT.imported)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr),
+                 "fgm/ipcExport: no owned table to export");
+        return -1;
+    }
+    double* ps[] = {gT.Zax, gT.Gax, gT.Cax, gT.Kax, gT.tables};
+    for (int k = 0; k < 5; k++)
+    {
+        cudaIpcMemHandle_t h;
+        const cudaError_t rc = cudaIpcGetMemHandle(&h, ps[k]);
+        if (rc != cudaSuccess) return ffail(rc, "fgm/ipcExport");
+        memcpy(handles320 + k*64, &h, 64);
+    }
+    return 0;
+}
+
+int rgpFgmIpcImport
+(
+    int nZ, int nG, int nC, int nK, int nFields,
+    const unsigned char* handles320
+)
+{
+    fgmFreeAll();
+    double** pd[] = {&gT.Zax, &gT.Gax, &gT.Cax, &gT.Kax, &gT.tables};
+    for (int k = 0; k < 5; k++)
+    {
+        cudaIpcMemHandle_t h;
+        memcpy(&h, handles320 + k*64, 64);
+        void* p = nullptr;
+        const cudaError_t rc =
+            cudaIpcOpenMemHandle(&p, h, cudaIpcMemLazyEnablePeerAccess);
+        if (rc != cudaSuccess)
+        {
+            // 부분 오픈 롤백 (이미 열린 것만 닫기)
+            gT.imported = 1;
+            fgmFreeAll();
+            return ffail(rc, "fgm/ipcImport");
+        }
+        *pd[k] = static_cast<double*>(p);
+    }
+    gT.nZ = nZ; gT.nG = nG; gT.nC = nC; gT.nK = nK; gT.nFields = nFields;
+    gT.imported = 1;
+    return 0;
+}
+
+int rgpFgmDevBusId(char* out, int cap)
+{
+    int dev = 0;
+    cudaError_t rc = cudaGetDevice(&dev);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/busId");
+    rc = cudaDeviceGetPCIBusId(out, cap, dev);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/busId");
     return 0;
 }
 
