@@ -1370,6 +1370,10 @@ int rgpPinHost(void* p, size_t bytes)
     if (e != cudaSuccess)
     {
         snprintf(gErr, sizeof(gErr), "pinHost: %s", cudaGetErrorString(e));
+        // 등록 실패의 sticky 에러 상태를 소거 — 안 하면 다음 커널 런치의
+        // cudaGetLastError 체크가 이 에러를 자기 것으로 오인해 정상
+        // evaluate가 FATAL로 죽는다(이중 등록 실측, 2026-07-16)
+        cudaGetLastError();
         return int(e);
     }
     return 0;

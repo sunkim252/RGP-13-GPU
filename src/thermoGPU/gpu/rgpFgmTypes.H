@@ -55,6 +55,17 @@ const double* rgpFgmDevOutPtr(void);
 int rgpFgmDevNFields(void);
 int rgpFgmDevLastN(void);
 
+/*  Y-다이어트 부분 게더: 마지막 evaluate SoA에서 부분집합 셀의 필드 행
+    [firstField, firstField+nF)를 압축 게더해 호스트로 내린다(hostOut
+    레이아웃 [nF][nSub]). cells는 SetRowGather로 1회 업로드(재호출 시
+    교체). FetchFields는 필드 슬라이스 전체 연속 D2H(폴백 복원용).
+    HostCopyActive: copy 스테이징 모드(D2H 존재) 여부 — zero-copy
+    (native) 모드면 0 (다이어트 무의미·비활성).                          */
+int rgpFgmSetRowGather(const int* cells, int n);
+int rgpFgmGatherRows(int firstField, int nF, double* hostOut);
+int rgpFgmFetchFields(int firstField, int nF, double* hostOut);
+int rgpFgmHostCopyActive(void);
+
 /*  랭크 간 매니폴드 공유(CUDA IPC). 핸들 블롭은 5개 할당
     (Zax,Gax,Cax,Kax,tables) × 64B = 320B 고정.
     Supported: cudaIpcGetMemHandle 프로브(캐시) — 단 WSL은 핸들 생성은

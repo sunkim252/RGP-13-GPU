@@ -27,6 +27,7 @@ License
 #include "localEulerDdtScheme.H"
 #include "fvcGrad.H"
 #include "DynamicList.H"
+#include "HashSet.H"
 #include "addToRunTimeSelectionTable.H"
 #include "tabulatedRealGasMixture.H"
 #include "Switch.H"
@@ -34,6 +35,7 @@ License
 #include "stringList.H"
 #include "OSspecific.H"
 #include "gpu/rgpFgmTypes.H"
+#include "gpu/rgpKernelTypes.H"
 #include <cstring>
 #include <chrono>
 
@@ -143,6 +145,9 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuPEqnArmed_(false),
     gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
     gpuManifoldShare_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldShare", true)),
+    gpuManifoldYDiet_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldYDiet", true)),
+    gpuYDietArmed_(false),
+    gpuHostYStale_(false),
     gpuManifoldArmed_(false),
     gpuHeMode_(-1),
     gpuNFields_(0),
@@ -1046,15 +1051,28 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
 
             // RG_*만의 D2H 다이어트는 철회(산발적 CPU mixture 평가가
             // 호스트 RG를 읽음 — rd0110 생성자 bM=0 sigFpe로 실증).
-            // 대신 hostScatter=false(압력 보정자 중간 단계)일 때는
-            // fieldsOut 전체 D2H를 생략 — 디바이스 상주 SoA는 완전해
-            // 체인(thermo refresh/he 재시드)이 정상 소비하고, 호스트
-            // 값은 직전 풀-산포 상태로 유지된다(그 사이 소비자 없음).
-            rgpFgmHostCopySkip
-            (
-                hostScatter ? 0 : 0,
-                hostScatter ? 0 : gpuNFields_
-            );
+            // hostScatter=false(압력 보정자 중간 단계)일 때는 fieldsOut
+            // 전체 D2H를 생략 — 디바이스 상주 SoA는 완전해 체인(thermo
+            // refresh/he 재시드)이 정상 소비하고, 호스트 값은 직전
+            // 풀-산포 상태로 유지된다(그 사이 소비자 없음).
+            //
+            // M1+M2 Y-다이어트: 풀 산포에서도 Y 블록(필드 [2, 2+nY))의
+            // 전체 D2H는 생략하고 경계-인접 셀만 부분 게더로 갱신
+            // (scatterTabYSubset). 호스트 내부 Y의 값-소비자는 경계 BC
+            // 평가(소유 셀 값)와 비체인 폴백(syncHostTabY 가드)뿐이라
+            // 비트-동일. srcPV/T/RG/Le는 per-outer CPU 소비가 있어 유지.
+            const label nYtab = Yref.size();
+            const bool yDiet =
+                gpuManifoldYDiet_ && hostScatter && nYtab > 0
+             && rgpFgmHostCopyActive();
+            if (!hostScatter)
+            {
+                rgpFgmHostCopySkip(0, gpuNFields_);
+            }
+            else if (yDiet)
+            {
+                rgpFgmHostCopySkip(2, nYtab);
+            }
 
             const int rc = rgpFgmEvaluate
             (
@@ -1083,9 +1101,18 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
             label f = 0;
             std::memcpy(srcc.begin(), out + (f++)*nc, bytes);
             std::memcpy(Tc.begin(),   out + (f++)*nc, bytes);
-            forAll(Yref, k)
+            if (yDiet)
             {
-                std::memcpy(Yref[k]->begin(), out + (f++)*nc, bytes);
+                f += nYtab;
+                scatterTabYSubset(Yref);
+            }
+            else
+            {
+                forAll(Yref, k)
+                {
+                    std::memcpy(Yref[k]->begin(), out + (f++)*nc, bytes);
+                }
+                gpuHostYStale_ = false;
             }
             forAll(RGref, k)
             {
@@ -1190,6 +1217,9 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
         }
     }
 
+    // CPU 폴백 루프는 호스트 Y를 직접 채우므로 stale 아님
+    if (!gpuDone) { gpuHostYStale_ = false; }
+
     if (thermoTimings_)
     {
         Info<< "manifold interp (" << (gpuDone ? "GPU" : "CPU") << ") = "
@@ -1292,6 +1322,96 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
                (std::chrono::steady_clock::now() - tSec).count()
             << " s" << endl;
     }
+}
+
+
+void Foam::solvers::fgmFluid::scatterTabYSubset(List<scalarField*>& Yref)
+{
+    if (!gpuYDietArmed_)
+    {
+        // 경계-인접(소유) 셀 목록: BC 평가(zeroGradient patchInternalField
+        // 등)가 읽는 유일한 내부 Y. 인렛 fixedValue는 내부값을 안 읽지만
+        // 포함해도 무해 — 전 패치 faceCells의 합집합.
+        labelHashSet bnd;
+        forAll(mesh.boundary(), patchi)
+        {
+            const labelUList& fc = mesh.boundary()[patchi].faceCells();
+            forAll(fc, i) { bnd.insert(fc[i]); }
+        }
+        gpuYDietCells_ = bnd.sortedToc();
+
+        List<int> ci(gpuYDietCells_.size());
+        forAll(ci, i) { ci[i] = int(gpuYDietCells_[i]); }
+        if (rgpFgmSetRowGather(ci.begin(), ci.size()) != 0)
+        {
+            WarningInFunction
+                << "Y-diet row-gather arming failed ("
+                << rgpFgmLastError()
+                << ") -- disabling gpuManifoldYDiet" << endl;
+            gpuManifoldYDiet_ = Switch(false);
+            gpuHostYStale_ = true;
+            syncHostTabY();   // 이번 산포는 전체 복원으로 보전
+            return;
+        }
+        gpuYDietArmed_ = true;
+        Info<< "fgmFluid: manifold Y-diet armed -- "
+            << gpuYDietCells_.size() << " boundary-adjacent cells of "
+            << mesh.nCells() << " (full Y D2H skipped)" << nl << endl;
+    }
+
+    const label nSub = gpuYDietCells_.size();
+    const label nY = Yref.size();
+    if (gpuYDietBuf_.size() < nY*nSub)
+    {
+        // pin은 pinGpuHostBuffers의 pinList가 담당 (여기서 직접 등록하면
+        // 이중 cudaHostRegister가 에러 상태를 남겨 다음 커널 런치 체크를
+        // 오염시킨다 — 실측 크래시로 확인)
+        gpuYDietBuf_.setSize(nY*nSub);
+    }
+
+    if (rgpFgmGatherRows(2, int(nY), gpuYDietBuf_.begin()) != 0)
+    {
+        WarningInFunction
+            << "Y-diet row gather failed (" << rgpFgmLastError()
+            << ") -- restoring full host Y" << endl;
+        gpuHostYStale_ = true;
+        syncHostTabY();
+        return;
+    }
+
+    forAll(Yref, k)
+    {
+        const double* src = gpuYDietBuf_.begin() + k*nSub;
+        scalarField& Yk = *Yref[k];
+        forAll(gpuYDietCells_, j) { Yk[gpuYDietCells_[j]] = src[j]; }
+    }
+    gpuHostYStale_ = true;   // 비경계 내부 셀은 stale (값-소비자 없음)
+}
+
+
+void Foam::solvers::fgmFluid::syncHostTabY()
+{
+    if (!gpuHostYStale_) return;
+
+    const label nc = mesh.nCells();
+    List<double> buf(nc);
+    forAll(tabSpecieIDs_, k)
+    {
+        if (rgpFgmFetchFields(2 + int(k), 1, buf.begin()) != 0)
+        {
+            WarningInFunction
+                << "host Y restore failed (" << rgpFgmLastError() << ")"
+                << endl;
+            return;
+        }
+        std::memcpy
+        (
+            Y_[tabSpecieIDs_[k]].primitiveFieldRef().begin(),
+            buf.begin(), nc*sizeof(double)
+        );
+        Y_[tabSpecieIDs_[k]].correctBoundaryConditions();
+    }
+    gpuHostYStale_ = false;
 }
 
 

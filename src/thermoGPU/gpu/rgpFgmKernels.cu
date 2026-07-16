@@ -48,6 +48,15 @@ namespace
     int gSkipFirst = 0;
     int gSkipN = 0;
 
+    // Y-다이어트 부분 게더 상태 (경계-인접 셀 인덱스 + 압축 출력 버퍼)
+    struct FgmRowGather
+    {
+        int* cells = nullptr;
+        int nSub = 0;
+        double* out = nullptr;
+        size_t cap = 0;
+    } gRW;
+
     void fgmFreeAll()
     {
         double** pt[] = {&gT.Zax,&gT.Gax,&gT.Cax,&gT.Kax,&gT.tables};
@@ -63,7 +72,9 @@ namespace
         double** pb[] = {&gB.Z,&gB.C,&gB.rho,&gB.Lsqr,&gB.msg,&gB.Deff,
                          &gB.hw,&gB.gZ,&gB.chi,&gB.out};
         for (auto p : pb) { if (*p) { cudaFree(*p); *p = nullptr; } }
-        gT = FgmDev(); gB = FgmBuf();
+        if (gRW.cells) { cudaFree(gRW.cells); }
+        if (gRW.out)   { cudaFree(gRW.out); }
+        gT = FgmDev(); gB = FgmBuf(); gRW = FgmRowGather();
     }
 }
 
@@ -237,6 +248,24 @@ __global__ void fgmKernel
         if (f == 0) { v *= srcScale*rho_l; }     // sourcePV [1/s] → 체적량
 
         outf[(size_t)f*nCells + celli] = v;
+    }
+}
+
+//- Y-다이어트: SoA의 필드 행 [firstField, firstField+nF)를 부분집합
+//  셀에서 압축 게더 (out 레이아웃 [nF][nSub] — 호스트 산포 루프 순서)
+__global__ void gatherRowsK
+(
+    const int nSub, const int* __restrict__ cells,
+    const int nF, const int firstField, const int nCells,
+    const double* __restrict__ soa, double* __restrict__ out
+)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= nSub) return;
+    const int c = cells[j];
+    for (int f = 0; f < nF; f++)
+    {
+        out[(size_t)f*nSub + j] = soa[(size_t)(firstField + f)*nCells + c];
     }
 }
 
@@ -508,6 +537,76 @@ void rgpFgmHostCopySkip(int first, int n)
 {
     gSkipFirst = first > 0 ? first : 0;
     gSkipN = n > 0 ? n : 0;
+}
+
+int rgpFgmSetRowGather(const int* cells, int n)
+{
+    if (gRW.cells) { cudaFree(gRW.cells); gRW.cells = nullptr; }
+    gRW.nSub = 0;
+    if (n <= 0 || !cells) return 0;
+    cudaError_t rc = cudaMalloc(&gRW.cells, (size_t)n*sizeof(int));
+    if (rc != cudaSuccess) return ffail(rc, "fgm/rowGather malloc");
+    rc = cudaMemcpy(gRW.cells, cells, (size_t)n*sizeof(int),
+                    cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+    {
+        cudaFree(gRW.cells); gRW.cells = nullptr;
+        return ffail(rc, "fgm/rowGather H2D");
+    }
+    gRW.nSub = n;
+    return 0;
+}
+
+int rgpFgmGatherRows(int firstField, int nF, double* hostOut)
+{
+    if (!gRW.cells || gRW.nSub <= 0)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr), "fgm/gatherRows: no cell subset");
+        return -1;
+    }
+    const double* soa = gB.outActive ? gB.outActive : gB.out;
+    if (!soa || gB.lastN <= 0)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr), "fgm/gatherRows: no SoA");
+        return -1;
+    }
+    const size_t need = (size_t)nF*gRW.nSub*sizeof(double);
+    if (gRW.cap < need)
+    {
+        if (gRW.out) { cudaFree(gRW.out); gRW.out = nullptr; gRW.cap = 0; }
+        cudaError_t rc = cudaMalloc(&gRW.out, need);
+        if (rc != cudaSuccess) return ffail(rc, "fgm/gatherRows malloc");
+        gRW.cap = need;
+    }
+    rgpfgm::gatherRowsK<<<(gRW.nSub + 255)/256, 256>>>
+        (gRW.nSub, gRW.cells, nF, firstField, gB.lastN, soa, gRW.out);
+    cudaError_t rc = cudaGetLastError();
+    if (rc != cudaSuccess) return ffail(rc, "fgm/gatherRows launch");
+    rc = cudaMemcpy(hostOut, gRW.out, need, cudaMemcpyDeviceToHost);
+    if (rc != cudaSuccess) return ffail(rc, "fgm/gatherRows D2H");
+    return 0;
+}
+
+int rgpFgmFetchFields(int firstField, int nF, double* hostOut)
+{
+    const double* soa = gB.outActive ? gB.outActive : gB.out;
+    if (!soa || gB.lastN <= 0)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr), "fgm/fetchFields: no SoA");
+        return -1;
+    }
+    const cudaError_t rc = cudaMemcpy
+    (
+        hostOut, soa + (size_t)firstField*gB.lastN,
+        (size_t)nF*gB.lastN*sizeof(double), cudaMemcpyDeviceToHost
+    );
+    if (rc != cudaSuccess) return ffail(rc, "fgm/fetchFields D2H");
+    return 0;
+}
+
+int rgpFgmHostCopyActive(void)
+{
+    return gRgpUnified != 2 ? 1 : 0;
 }
 
 int rgpFgmDevLastN(void) { return gB.lastN; }

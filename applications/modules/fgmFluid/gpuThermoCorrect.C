@@ -225,6 +225,9 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
     // ── gather: 내부 셀 (비체인 폴백만) ──────────────────────────────
     if (!chained)
     {
+        // Y-다이어트 중이면 호스트 내부 Y가 stale — SoA에서 먼저 복원
+        syncHostTabY();
+
         const scalarField& pc = pf.primitiveField();
         const scalarField& Tc = Tf.primitiveField();
         for (label i = 0; i < nInt; i++)
@@ -505,6 +508,9 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
     // ── gather: 내부 셀 (비체인 폴백만) ──────────────────────────────
     if (!chained)
     {
+        // Y-다이어트 중이면 호스트 내부 Y가 stale — SoA에서 먼저 복원
+        syncHostTabY();
+
         const scalarField& pc = pf.primitiveField();
         const scalarField& Tc = Tf.primitiveField();
         for (label i = 0; i < nInt; i++)
@@ -655,6 +661,7 @@ void Foam::solvers::fgmFluid::pinGpuHostBuffers()
     pinList(gpuUBuf_);
     pinList(gpuPEqnFlux_);
     pinList(gpuZCBuf_);
+    pinList(gpuYDietBuf_);
 
     // ⚠️ OF 필드(primitiveField)는 등록하지 않는다: rho_=thermo.rho(),
     // Z_=max(min(Z_,1),0) 류의 tmp-대입이 스토리지를 transfer(교체)해

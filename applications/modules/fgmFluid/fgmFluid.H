@@ -315,6 +315,18 @@ protected:
         //  'gpuManifoldShare off;' (fgmProperties, 기본 on)
         Switch gpuManifoldShare_;
 
+        //- M1+M2 전송 다이어트: 산포에서 Y 슬라이스(테이블 종, 필드
+        //  [2, 2+nY))의 전체 D2H·산포를 생략하고 경계-인접(소유) 셀만
+        //  부분 게더로 갱신. 호스트 내부 Y의 값-소비자는 경계 BC 평가
+        //  (소유 셀 값)와 비체인 폴백(syncHostTabY 가드)뿐이라 결과는
+        //  비트-동일. copy 스테이징 모드에서만 활성(zero-copy 제외).
+        //  'gpuManifoldYDiet off;' (fgmProperties, 기본 on)
+        Switch gpuManifoldYDiet_;
+        mutable bool gpuYDietArmed_;
+        mutable bool gpuHostYStale_;
+        mutable labelList gpuYDietCells_;
+        mutable List<double> gpuYDietBuf_;
+
         //- 테이블 업로드 완료 플래그 + 보간 출력 호스트 버퍼
         mutable bool gpuManifoldArmed_;
 
@@ -364,6 +376,17 @@ private:
         //  압력 보정자 중간 단계 전용(그 사이 호스트 T/Y/srcc/Le/RG
         //  내부값 소비자가 없음; 마지막 outer는 항상 풀 산포)
         void updateManifold(const bool hostScatter = true);
+
+        //- Y-다이어트 부분 산포: 경계-인접 셀의 Y만 디바이스 SoA에서
+        //  압축 게더해 갱신 (updateManifold 산포 블록 전용). 성공 시
+        //  gpuHostYStale_=true(내부 비경계 셀 stale), 실패 시 전체
+        //  복원으로 폴백.
+        void scatterTabYSubset(List<scalarField*>& Yref);
+
+        //- 비체인 폴백 가드: 호스트 테이블-종 Y가 stale이면 디바이스
+        //  SoA에서 전체 복원 (gpuThermoCorrect/gpuHeReseed의 비체인
+        //  경로가 호스트 내부 Y를 게더하기 전 호출)
+        void syncHostTabY();
 
         //- Tier-2 setup: if the table carries RG_* coefficients and the
         //  mixture supports the tabulatedRealGasMixture hook, allocate the 13
