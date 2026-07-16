@@ -4298,7 +4298,7 @@ int rgpUEqnPrep2
 }
 
 
-int rgpUEqnSolve
+int rgpUEqnSolvePrep
 (
     double dtInv, const double* rdtCell,
     const double* rho, const double* rhoOld,
@@ -4307,10 +4307,7 @@ int rgpUEqnSolve
     const double* srcExp3, const double* srcExtra3,
     const double* gradP3,
     const double* bDiag3, const double* bSrc3,
-    const int* solveCmpt,
-    double relaxAlpha, const double* bRelax3,
-    double tol, double relTol, int maxIter,
-    double* U3out, double* initRes3, double* finalRes3, int* iters3
+    double relaxAlpha, const double* bRelax3
 )
 {
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
@@ -4481,6 +4478,29 @@ int rgpUEqnSolve
             return pfail(e, "ueqn/H2D gradP");
     }
 
+    return 0;
+}
+
+
+/*  성분별 솔브 (Prep 이후). 디바이스 상주 상태와 호출자 유지 배열만
+    만지므로 워커 스레드에서 호출 가능 — 오버랩 전제: 이 사이 메인
+    스레드가 pEqn 계열(gB.x/rA/pA/wA/red 스크래치 공유)을 호출하지
+    않을 것 (tp pre/updateManifold는 fgm·thermo 버퍼만 사용해 안전). */
+int rgpUEqnSolveRun
+(
+    const int* solveCmpt,
+    double tol, double relTol, int maxIter,
+    double* U3out, double* initRes3, double* finalRes3, int* iters3
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gU.diag || !gU.assembled)
+    {
+        snprintf(gPErr, sizeof(gPErr), "ueqnRun: not assembled");
+        return -1;
+    }
+    cudaError_t e;
+
     // ── 성분별 솔브 ──────────────────────────────────────────────────
     for (int c = 0; c < 3; c++)
     {
@@ -4531,6 +4551,36 @@ int rgpUEqnSolve
     }
 
     return 0;
+}
+
+
+/*  기존 동기 진입점 (gmc 모듈 등 호환) = Prep + Run */
+int rgpUEqnSolve
+(
+    double dtInv, const double* rdtCell,
+    const double* rho, const double* rhoOld,
+    const double* U3old, const double* U3,
+    const double* phiInt, const double* w, const double* mu,
+    const double* srcExp3, const double* srcExtra3,
+    const double* gradP3,
+    const double* bDiag3, const double* bSrc3,
+    const int* solveCmpt,
+    double relaxAlpha, const double* bRelax3,
+    double tol, double relTol, int maxIter,
+    double* U3out, double* initRes3, double* finalRes3, int* iters3
+)
+{
+    const int rc = rgpUEqnSolvePrep
+    (
+        dtInv, rdtCell, rho, rhoOld, U3old, U3, phiInt, w, mu,
+        srcExp3, srcExtra3, gradP3, bDiag3, bSrc3, relaxAlpha, bRelax3
+    );
+    if (rc) return rc;
+    return rgpUEqnSolveRun
+    (
+        solveCmpt, tol, relTol, maxIter,
+        U3out, initRes3, finalRes3, iters3
+    );
 }
 
 

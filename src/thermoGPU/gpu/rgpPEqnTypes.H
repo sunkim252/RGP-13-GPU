@@ -217,6 +217,29 @@ int rgpUEqnSolve
     double* U3out, double* initRes3, double* finalRes3, int* iters3
 );
 
+/*  비동기 오버랩용 분할: Prep(H2D+조립+relax — 호스트 배열은 여기서만
+    읽히므로 반환 후 소멸 가능) + Run(성분별 BiCGStab — 디바이스 상주
+    상태와 호출자-유지 출력 배열만 사용, 워커 스레드 호출 가능).
+    Run과 겹치는 구간에서 메인 스레드는 pEqn 계열(gB 스크래치 공유)을
+    호출하지 말 것. rgpUEqnSolve = Prep+Run.                          */
+int rgpUEqnSolvePrep
+(
+    double dtInv, const double* rdtCell,
+    const double* rho, const double* rhoOld,
+    const double* U3old, const double* U3,
+    const double* phiInt, const double* w, const double* mu,
+    const double* srcExp3, const double* srcExtra3,
+    const double* gradP3,
+    const double* bDiag3, const double* bSrc3,
+    double relaxAlpha, const double* bRelax3
+);
+int rgpUEqnSolveRun
+(
+    const int* solveCmpt,
+    double tol, double relTol, int maxIter,
+    double* U3out, double* initRes3, double* finalRes3, int* iters3
+);
+
 /*  병렬: UEqn 인터페이스 계수 업로드 (성분 공유 스칼라, proc-면 연접,
     momentumPredictor가 조립 직전 호출 — 별도 디바이스 버퍼라 pEqn/ZC의
     rgpPEqnParCoeffs와 독립). rgpUEqnAH의 UNbr3는 fvMatrix::H()의

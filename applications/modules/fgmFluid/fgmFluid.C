@@ -148,6 +148,9 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuManifoldYDiet_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldYDiet", true)),
     gpuYDietArmed_(false),
     gpuHostYStale_(false),
+    gpuUEqnAsync_(fgmTable_.lookupOrDefault<Switch>("gpuUEqnAsync", false)),
+    gpuUEqnPending_(false),
+    gpuUEqnRc_(0),
     gpuManifoldArmed_(false),
     gpuHeMode_(-1),
     gpuNFields_(0),
@@ -419,7 +422,10 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 // * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
 
 Foam::solvers::fgmFluid::~fgmFluid()
-{}
+{
+    // 비동기 UEqn 워커가 살아 있으면 join (std::thread 소멸자 terminate 방지)
+    if (gpuUEqnThread_.joinable()) { gpuUEqnThread_.join(); }
+}
 
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //

@@ -515,6 +515,9 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
 
 void Foam::solvers::fgmFluid::correctPressurePEP()
 {
+    // 비동기 UEqn이 남아 있으면 합류 (U/HbyA/pEqn 스크래치 공유 방어)
+    joinUEqnSolve();
+
     volScalarField& rho(rho_);
     volScalarField& p(p_);
     volVectorField& U(U_);

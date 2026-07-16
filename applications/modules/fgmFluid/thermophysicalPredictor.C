@@ -218,6 +218,11 @@ void Foam::solvers::fgmFluid::thermophysicalPredictor()
             << " s" << endl;
     }
 
+    // 비동기 UEqn 합류 — updateManifold(CUDA) 이전이어야 한다: WSL2에서
+    // 두 스레드의 동시 CUDA 제출은 컨텍스트 경합으로 양쪽 다 수-배
+    // 느려짐(실측 join 15s, s/step 165). 오버랩 창 = tp pre(순수 CPU)만.
+    joinUEqnSolve();
+
     // --- FGM manifold update: gZ, composition Y_k, PV source (from Z, C) ---
     {
         const auto tManifold0 = std::chrono::steady_clock::now();

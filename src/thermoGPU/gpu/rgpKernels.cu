@@ -857,6 +857,13 @@ int rgpGpuInit(int deviceId)
     cudaError_t e = cudaSetDevice(dev);
     if (e != cudaSuccess) return fail(e, "rgpGpuInit/cudaSetDevice");
 
+    // 비동기 UEqn 오버랩용: 동기 대기를 spin(코어 점유) 대신 blocking으로
+    // — 워커 스레드의 per-iteration D2H 폴링이 CPU를 잡아먹어 메인의
+    // tp pre가 느려지는 경합 제거(21.4→23.2s 역전 실측). 컨텍스트 활성
+    // 전에만 유효; 이미 활성이면 에러만 소거하고 무해.
+    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    cudaGetLastError();
+
     // 기기 인식: native zero-copy는 "진짜 하드웨어 코히런트"에서만 자동.
     //   pma    = cudaDevAttrPageableMemoryAccess — pageable 호스트 메모리
     //            접근 가능(HMM 소프트웨어 마이그레이션 포함).

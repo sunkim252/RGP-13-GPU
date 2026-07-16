@@ -61,6 +61,9 @@ See also
 #include "multivariateScheme.H"
 #include "FGMTable.H"
 
+#include <thread>
+#include <chrono>
+
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 namespace Foam
@@ -327,6 +330,22 @@ protected:
         mutable labelList gpuYDietCells_;
         mutable List<double> gpuYDietBuf_;
 
+        //- 비동기 오버랩: UEqn 성분 솔브(rgpUEqnSolveRun)를 워커
+        //  스레드로 돌리고 메인은 tp pre/updateManifold(fgm·thermo
+        //  버퍼만 사용 — pEqn 스크래치와 분리)를 진행. U 소비 직전
+        //  (LAD/pCorr) joinUEqnSolve()로 합류해 산포·BC·K를 마무리.
+        //  직렬 전용(병렬은 bicgSolve의 전역 리덕션이 MPI 경유).
+        //  'gpuUEqnAsync off;' (fgmProperties, 기본 on)
+        Switch gpuUEqnAsync_;
+        mutable std::thread gpuUEqnThread_;
+        mutable bool gpuUEqnPending_;
+        mutable int gpuUEqnRc_;
+        mutable int gpuUEqnCmpt_[3];
+        mutable double gpuUEqnRes0_[3];
+        mutable double gpuUEqnResF_[3];
+        mutable int gpuUEqnIters_[3];
+        mutable std::chrono::steady_clock::time_point gpuUEqnT0_;
+
         //- 테이블 업로드 완료 플래그 + 보간 출력 호스트 버퍼
         mutable bool gpuManifoldArmed_;
 
@@ -382,6 +401,10 @@ private:
         //  gpuHostYStale_=true(내부 비경계 셀 stale), 실패 시 전체
         //  복원으로 폴백.
         void scatterTabYSubset(List<scalarField*>& Yref);
+
+        //- 비동기 UEqn 합류: 워커 스레드를 join하고 잔차 출력·U 산포·
+        //  BC 보정·K 갱신을 수행. 미발진 상태면 no-op (멱등).
+        void joinUEqnSolve();
 
         //- 비체인 폴백 가드: 호스트 테이블-종 Y가 stale이면 디바이스
         //  SoA에서 전체 복원 (gpuThermoCorrect/gpuHeReseed의 비체인

@@ -47,8 +47,61 @@ License
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
+void Foam::solvers::fgmFluid::joinUEqnSolve()
+{
+    if (!gpuUEqnPending_) return;
+    if (gpuUEqnThread_.joinable()) { gpuUEqnThread_.join(); }
+    gpuUEqnPending_ = false;
+
+    if (gpuUEqnRc_)
+    {
+        FatalErrorInFunction
+            << "rgpUEqnSolveRun: " << rgpPEqnLastError()
+            << exit(FatalError);
+    }
+
+    volVectorField& U(U_);
+    const label nc = mesh.nCells();
+    const double* U3out = gpuUBuf_.begin() + 6*nc;
+
+    vectorField& Uc = U.primitiveFieldRef();
+    for (label k = 0; k < 3; k++)
+    {
+        if (!gpuUEqnCmpt_[k]) continue;
+        Info<< "rgpBiCGStab: Solving for "
+            << word(U.name() + vector::componentNames[k])
+            << ", Initial residual = " << gpuUEqnRes0_[k]
+            << ", Final residual = " << gpuUEqnResF_[k]
+            << ", No Iterations " << gpuUEqnIters_[k] << endl;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) \
+        num_threads(Pstream::parRun() ? 1 : 4)
+        #endif
+        for (label i = 0; i < nc; i++)
+        {
+            Uc[i][k] = U3out[k*nc + i];
+        }
+    }
+
+    U.correctBoundaryConditions();
+    fvConstraints().constrain(U);
+    K = 0.5*magSqr(U);
+
+    if (thermoTimings_)
+    {
+        Info<< "momentum solve join (launch->join) = "
+            << std::chrono::duration<double>
+               (std::chrono::steady_clock::now() - gpuUEqnT0_).count()
+            << " s" << endl;
+    }
+}
+
+
 void Foam::solvers::fgmFluid::momentumPredictor()
 {
+    // 직전 outer의 비동기 솔브가 남아 있으면 먼저 합류 (방어)
+    joinUEqnSolve();
+
     std::chrono::steady_clock::time_point tTot;
     if (thermoTimings_) { tTot = std::chrono::steady_clock::now(); }
 
@@ -730,9 +783,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
               ? 1 : 0;
         }
 
-        double res0[3], resF[3];
-        int iters[3];
-        const int rc = rgpUEqnSolve
+        const int rcP = rgpUEqnSolvePrep
         (
             LTS ? 1.0 : 1.0/runTime.deltaTValue(),
             LTS
@@ -750,43 +801,52 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             (tsrcBulk.valid() || tCorrU.valid())
           ? srcX3 : nullptr /*LAD-bulk + 비직교 보정*/,
             nullptr /*gradP3*/,
-            bDiag3, bSrc3, solveCmpt,
+            bDiag3, bSrc3,
             relaxAlpha,
-            relaxAlpha > 0 ? bRelaxA.begin() : nullptr,
-            tol, rtol, maxIter,
-            U3out, res0, resF, iters
+            relaxAlpha > 0 ? bRelaxA.begin() : nullptr
         );
-        if (rc)
+        if (rcP)
         {
             FatalErrorInFunction
-                << "rgpUEqnSolve: " << rgpPEqnLastError()
+                << "rgpUEqnSolvePrep: " << rgpPEqnLastError()
                 << exit(FatalError);
         }
 
-        if (pimple.momentumPredictor())
-        {
-            vectorField& Uc = U.primitiveFieldRef();
-            for (label k = 0; k < 3; k++)
-            {
-                if (!solveCmpt[k]) continue;
-                Info<< "rgpBiCGStab: Solving for "
-                    << word(U.name() + vector::componentNames[k])
-                    << ", Initial residual = " << res0[k]
-                    << ", Final residual = " << resF[k]
-                    << ", No Iterations " << iters[k] << endl;
-                #ifdef _OPENMP
-                #pragma omp parallel for schedule(static) \
-                num_threads(Pstream::parRun() ? 1 : 4)
-                #endif
-                for (label i = 0; i < nc; i++)
-                {
-                    Uc[i][k] = U3out[k*nc + i];
-                }
-            }
+        for (label k = 0; k < 3; k++) { gpuUEqnCmpt_[k] = solveCmpt[k]; }
 
-            U.correctBoundaryConditions();
-            fvConstraints().constrain(U);
-            K = 0.5*magSqr(U);
+        // 비동기 오버랩: 성분 솔브(디바이스 상주만 접촉)를 워커로 —
+        // 메인은 tp pre/updateManifold를 진행하고 U 소비 직전
+        // joinUEqnSolve()에서 합류. Prep의 호스트 배열(wU/bDiag3/...)은
+        // 이미 소비돼 로컬 소멸 무해. U3out은 멤버(gpuUBuf_) 내부.
+        const bool async =
+            gpuUEqnAsync_ && !Pstream::parRun()
+         && pimple.momentumPredictor();
+
+        gpuUEqnT0_ = std::chrono::steady_clock::now();
+        if (async)
+        {
+            gpuUEqnPending_ = true;
+            gpuUEqnThread_ = std::thread
+            (
+                [this, U3out, tol, rtol, maxIter]()
+                {
+                    gpuUEqnRc_ = rgpUEqnSolveRun
+                    (
+                        gpuUEqnCmpt_, tol, rtol, maxIter,
+                        U3out, gpuUEqnRes0_, gpuUEqnResF_, gpuUEqnIters_
+                    );
+                }
+            );
+        }
+        else
+        {
+            gpuUEqnRc_ = rgpUEqnSolveRun
+            (
+                gpuUEqnCmpt_, tol, rtol, maxIter,
+                U3out, gpuUEqnRes0_, gpuUEqnResF_, gpuUEqnIters_
+            );
+            gpuUEqnPending_ = pimple.momentumPredictor();
+            joinUEqnSolve();
         }
 
         if (thermoTimings_)
@@ -794,7 +854,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             Info<< "momentum predictor total = "
                 << std::chrono::duration<double>
                    (std::chrono::steady_clock::now() - tTot).count()
-                << " s" << endl;
+                << " s" << (async ? " (solve async)" : "") << endl;
         }
         return;
     }
