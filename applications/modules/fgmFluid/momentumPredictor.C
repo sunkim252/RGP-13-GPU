@@ -75,7 +75,7 @@ void Foam::solvers::fgmFluid::joinUEqnSolve()
             << ", No Iterations " << gpuUEqnIters_[k] << endl;
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) \
-        num_threads(Pstream::parRun() ? 1 : 4)
+        num_threads(ompThreads())
         #endif
         for (label i = 0; i < nc; i++)
         {
@@ -321,7 +321,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             const vectorField& Uo = U.oldTime().primitiveField();
             #ifdef _OPENMP
             #pragma omp parallel for schedule(static) \
-                num_threads(Pstream::parRun() ? 1 : 4)
+                num_threads(ompThreads())
             #endif
             for (label i = 0; i < nc; i++)
             {

@@ -259,7 +259,7 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         }
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) \
-        num_threads(Pstream::parRun() ? 1 : 4)
+        num_threads(ompThreads())
         #endif
         for (label s = 0; s < n; s++)
         {
@@ -330,7 +330,7 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         scalarField& Cvc    = CvT.primitiveFieldRef();
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) \
-        num_threads(Pstream::parRun() ? 1 : 4)
+        num_threads(ompThreads())
         #endif
         for (label i = 0; i < nInt; i++)
         {
@@ -550,7 +550,7 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
         }
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) \
-        num_threads(Pstream::parRun() ? 1 : 4)
+        num_threads(ompThreads())
         #endif
         for (label s = 0; s < n; s++)
         {
@@ -602,7 +602,7 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
         scalarField& hec = he.primitiveFieldRef();
         #ifdef _OPENMP
         #pragma omp parallel for schedule(static) \
-        num_threads(Pstream::parRun() ? 1 : 4)
+        num_threads(ompThreads())
         #endif
         for (label i = 0; i < nInt; i++)
         {

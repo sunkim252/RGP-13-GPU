@@ -63,6 +63,7 @@ See also
 
 #include <thread>
 #include <chrono>
+#include <cstdlib>
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -411,6 +412,22 @@ private:
         //- 비동기 UEqn 합류: 워커 스레드를 join하고 잔차 출력·U 산포·
         //  BC 보정·K 갱신을 수행. 미발진 상태면 no-op (멱등).
         void joinUEqnSolve();
+
+        //- 게더/산포 복사 루프의 OpenMP 스레드 수 (결과는 스레드 수와
+        //  무관 — 반복 독립 복사 전용). 기본: 직렬 4, 병렬 1(클러스터
+        //  과다구독 방지). env RGP_OMP_THREADS로 재정의 — 로컬 소수
+        //  랭크(코어 여유) 런에서 랭크당 CPU 병렬화에 사용.
+        static inline int ompThreads()
+        {
+            static int n = -1;
+            if (n < 0)
+            {
+                const char* e = getenv("RGP_OMP_THREADS");
+                n = e ? atoi(e) : (Pstream::parRun() ? 1 : 4);
+                if (n < 1) { n = 1; }
+            }
+            return n;
+        }
 
         //- 비체인 폴백 가드: 호스트 테이블-종 Y가 stale이면 디바이스
         //  SoA에서 전체 복원 (gpuThermoCorrect/gpuHeReseed의 비체인
