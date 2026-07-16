@@ -740,6 +740,10 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
     {
         rearmRealGasCoeffTabulation();
         armedNCells_ = mesh.nCells();
+
+        // 리뷰 F3: 셀 수 변경 시 Y-diet 경계-소유 셀 목록도 stale —
+        // 재아밍 강제 (옛 라벨 게더/산포는 OOB·오염)
+        gpuYDietArmed_ = false;
     }
 
     // |grad(Z)|^2 for the algebraic variance closure and for the
@@ -1041,11 +1045,18 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
                 )
                 {
                     rgpFgmSoAOmitY(int(Yref.size()));
-                    Info<< "fgmFluid: manifold SoA Y-omit armed -- "
-                        << Yref.size() << " species re-interpolated by "
-                        << "the device chain (SoA "
-                        << label(Yref.size()*mesh.nCells()*8/1048576)
-                        << " MiB saved)" << nl << endl;
+                    if (rgpFgmSoAOmitted() > 0)   // copy 모드에서만 아밍됨
+                    {
+                        Info<< "fgmFluid: manifold SoA Y-omit armed -- "
+                            << Yref.size() << " species re-interpolated "
+                            << "by the device chain (SoA "
+                            << label
+                               (
+                                   scalar(Yref.size())*mesh.nCells()
+                                  *8/1048576
+                               )
+                            << " MiB saved)" << nl << endl;
+                    }
                 }
                 if (ipcShared)
                 {

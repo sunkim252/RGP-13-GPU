@@ -81,6 +81,11 @@ int rgpPEqnPreconColors(void);
     시 자동 무효화). 값이 실제로 스텝-불변임은 호출측이 보장할 것.     */
 void rgpPEqnInvarStamp(long pOldStamp, long rdtStamp);
 
+/*  P2(VRAM): UEqn grad9가 매니폴드 SoA 스크래치를 차용 중일 때, SoA
+    버퍼가 해제/재할당되면 fgm 쪽이 이 훅으로 차용을 무효화한다(다음
+    UEqn이 재차용 또는 자체 할당). 같은 .so 내 교차-TU 호출.          */
+void rgpUEqnScratchInvalidate(void);
+
 /*  검증용: 조립만 수행하고 diag(경계 포함)/upper/b(경계 포함)를 D2H.
     CPU fvMatrix 계수와의 비트-수준 대조에 사용.                       */
 int rgpPEqnAssembleDump

@@ -8,6 +8,7 @@
 \*---------------------------------------------------------------------------*/
 
 #include "rgpFgmTypes.H"
+#include "rgpPEqnTypes.H"   // rgpUEqnScratchInvalidate (P2 차용 무효화)
 #include "rgpStage.H"
 
 #include <cuda_runtime.h>
@@ -97,6 +98,10 @@ namespace
         gT = FgmDev(); gB = FgmBuf(); gRW = FgmRowGather();
         gBC = FgmBndBatch();
         gLsqrDecl = -1; gLsqrDev = -2;
+        gOmitY = 0;                              // 리뷰 F4: ABI 위생
+        gSV.mode4 = 0; gSV.chi0 = 0; gSV.hOx = 0;
+        gSV.hFuel = 0; gSV.Wlo = 0; gSV.Whi = 0;
+        rgpUEqnScratchInvalidate();   // P2: SoA 차용자 무효화
     }
 }
 
@@ -737,6 +742,8 @@ int rgpFgmEvaluate
     if (gRgpUnified != 2 && gB.outCap < need)
     {
         if (gB.out) cudaFree(gB.out);
+        gB.out = nullptr; gB.outCap = 0;   // malloc 실패 시 댕글링 방지
+        rgpUEqnScratchInvalidate();   // P2: SoA 차용자 무효화 (재할당)
         if ((rc = cudaMalloc(&gB.out, need*sizeof(double))) != cudaSuccess)
             return ffail(rc, "fgm/out");
         gB.outCap = need;
@@ -774,6 +781,14 @@ int rgpFgmEvaluate
     double* oGZ = rgpOutPtr(gZ, gB.gZ);
     double* oChi = rgpOutPtr(chiSt, gB.chi);
     double* oOut = rgpOutPtr(fieldsOut, gB.out);
+    if (gOmitY && oOut != gB.out)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr),
+                 "fgm: SoA omit armed but output is not the staging "
+                 "buffer (mapped/native aliasing) -- layout contract "
+                 "violation");
+        return -1;
+    }
 
     constexpr int bs = 128;
     rgpfgm::fgmKernel<<<(nCells + bs - 1)/bs, bs>>>
@@ -852,16 +867,38 @@ void rgpFgmLsqrStamp(long stamp)
 
 void rgpFgmSoAOmitY(int nY)
 {
+    // mapped(1)·native(2) 모드에선 커널 출력이 gB.out이 아닐 수 있어
+    // 컴팩트 레이아웃 계약이 깨진다(리뷰 F1: pin 후 풀-레이아웃 기록
+    // vs 컴팩트 소비 무음 오염) — 순수 copy 모드에서만 아밍.
+    if (nY > 0 && gRgpUnified != 0) { nY = 0; }
     if (nY != gOmitY)
     {
         gOmitY = (nY > 0) ? nY : 0;
         // 레이아웃 변경 → 기존 SoA 무효 (재할당 유도)
         if (gB.out) { cudaFree(gB.out); gB.out = nullptr; }
         gB.outCap = 0; gB.lastN = 0; gB.outActive = nullptr;
+        rgpUEqnScratchInvalidate();   // P2: SoA 차용자 무효화
     }
 }
 
 int rgpFgmSoAOmitted(void) { return gOmitY; }
+
+void* rgpFgmBorrowScratch(unsigned long long bytes)
+{
+    if (gB.out && gB.outCap*sizeof(double) >= bytes)
+    {
+        return gB.out;
+    }
+    return nullptr;
+}
+
+void rgpFgmScratchDirty(void)
+{
+    // 차용자 기록 직전 호출: SoA를 fail-closed 무효화 — 소비자 가드
+    // (lastN 체크)가 다음 evaluate 재기록 전 접근을 에러로 만든다
+    gB.lastN = 0;
+    gB.outActive = nullptr;
+}
 
 int rgpFgmGetStencilView(rgpFgmStencilView* v)
 {
@@ -998,7 +1035,11 @@ int rgpFgmGatherRows(int firstField, int nF, double* hostOut)
         snprintf(gFgmErr, sizeof(gFgmErr), "fgm/gatherRows: no SoA");
         return -1;
     }
-    const size_t need = (size_t)nF*gRW.nSub*sizeof(double);
+    const bool omitPath =
+        gOmitY && firstField >= 2 && firstField + nF <= 2 + gOmitY;
+    const size_t need =
+        (size_t)(omitPath ? (nF < 16 ? nF : 16) : nF)
+       *gRW.nSub*sizeof(double);
     if (gRW.cap < need)
     {
         if (gRW.out) { cudaFree(gRW.out); gRW.out = nullptr; gRW.cap = 0; }
@@ -1007,12 +1048,26 @@ int rgpFgmGatherRows(int firstField, int nF, double* hostOut)
         gRW.cap = need;
     }
 
-    // SoA-생략 모드에서 Y 범위 요청은 테이블 재보간으로 투명 전환
+    // SoA-생략 모드에서 Y 범위 요청은 테이블 재보간으로 투명 전환.
+    // P4: ≤16필드 청크로 버퍼·D2H 분할 (gRW.out 103→16MB급)
     if (gOmitY && firstField >= 2 && firstField + nF <= 2 + gOmitY)
     {
-        const int rc2 =
-            launchInterpFields(gRW.nSub, gRW.cells, firstField, nF, gRW.out);
-        if (rc2) return rc2;
+        constexpr int CH = 16;
+        for (int k0 = 0; k0 < nF; k0 += CH)
+        {
+            const int kn = (nF - k0 < CH) ? (nF - k0) : CH;
+            const int rc2 = launchInterpFields
+                (gRW.nSub, gRW.cells, firstField + k0, kn, gRW.out);
+            if (rc2) return rc2;
+            const cudaError_t rc3 = cudaMemcpy
+            (
+                hostOut + (size_t)k0*gRW.nSub, gRW.out,
+                (size_t)kn*gRW.nSub*sizeof(double),
+                cudaMemcpyDeviceToHost
+            );
+            if (rc3 != cudaSuccess) return ffail(rc3, "fgm/interp D2H");
+        }
+        return 0;
     }
     else if (gOmitY && firstField + nF > 2 && firstField < 2 + gOmitY)
     {

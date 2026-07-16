@@ -12,6 +12,7 @@
 \*---------------------------------------------------------------------------*/
 
 #include "rgpPEqnTypes.H"
+#include "rgpFgmTypes.H"   // rgpFgmBorrowScratch (P2)
 #include "rgpStage.H"
 
 #include <cuda_runtime.h>
@@ -87,6 +88,7 @@ namespace
         double *workDiag = nullptr, *workB = nullptr;
         double *H = nullptr;                          // [nc] 성분 작업
         double *grad9 = nullptr;                      // [9*nc] grad(U)
+        int grad9Borrowed = 0;   // P2: 매니폴드 SoA 차용 (해제 금지)
         double *src3 = nullptr, *gradP = nullptr;     // [3*nc]
         double *UB3 = nullptr, *bfx3 = nullptr;       // [3*nbf]
         double *bg9 = nullptr;                        // [9*nbf]
@@ -207,6 +209,9 @@ namespace
         // M4 스탬프 무효화 (버퍼 해제/재할당과 동기)
         gPOldDecl = -1; gPOldDev = -2;
         gRdtDecl = -1; gRdtDev = -2;
+
+        // P2: 차용 grad9는 fgm 소유 — free 금지, 포인터만 반납
+        if (gU.grad9Borrowed) { gU.grad9 = nullptr; gU.grad9Borrowed = 0; }
 
         int* ip[] = {gM.own, gM.nei, gM.bfc,
                      gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot,
@@ -2638,6 +2643,15 @@ void rgpPEqnInvarStamp(long pOldStamp, long rdtStamp)
     gRdtDecl = rdtStamp;
 }
 
+void rgpUEqnScratchInvalidate(void)
+{
+    if (gU.grad9Borrowed)
+    {
+        gU.grad9 = nullptr;
+        gU.grad9Borrowed = 0;
+    }
+}
+
 int rgpPEqnSetPrecon(int mode)
 {
     gPrecon = (mode == 1) ? 1 : 0;
@@ -3839,6 +3853,8 @@ static bool noStage3
     *e = cudaSuccess;
     if (gU.grad9 && (size_t)9*nc >= (size_t)2*nf)
     {
+        // P2: 차용 grad9를 kf/Cf 스테이징으로 클로버 — SoA 무효화
+        if (gU.grad9Borrowed) { rgpFgmScratchDirty(); }
         vx = gU.grad9;
         vy = gU.grad9 + (size_t)nf;
         vz = gB.flux;
@@ -4167,6 +4183,18 @@ int rgpUEqnGrad
         const size_t bc = (size_t)nc*sizeof(double);
         const size_t bf = (size_t)nf*sizeof(double);
         const size_t nb1 = (size_t)(nbf > 0 ? nbf : 1);
+
+        // P2(VRAM): grad9[9nc]는 매니폴드 SoA(컴팩트 17nc ≥ 9nc)를 차용
+        // — momentum 국면에 SoA는 죽어 있고 다음 evaluate가 전체
+        // 재기록한다 (docs/VRAM-PLAN-2026-07-16.md 스케줄 증명).
+        // 차용 실패(비-fgm 솔버/미아밍/용량 부족)는 자체 할당 폴백.
+        if (!gU.grad9)
+        {
+            double* bwd = reinterpret_cast<double*>
+                (rgpFgmBorrowScratch((size_t)9*nc*sizeof(double)));
+            if (bwd) { gU.grad9 = bwd; gU.grad9Borrowed = 1; }
+        }
+
         struct { double** d; size_t bytes; } al[] =
         {
             {&gU.diag, bc}, {&gU.upper, bf}, {&gU.lower, bf},
@@ -4201,6 +4229,8 @@ int rgpUEqnGrad
             return pfail(e, "ueqnGrad/H2D UB");
     }
 
+    // P2: 차용 grad9에 기록 시작 — SoA fail-closed 무효화 (리뷰 F2)
+    if (gU.grad9Borrowed) { rgpFgmScratchDirty(); }
     if ((e = cudaMemset(gU.grad9, 0, (size_t)9*nc*sizeof(double)))
         != cudaSuccess) return pfail(e, "ueqnGrad/memset");
     rgppeqn::uVecGradFace<<<nb(nf), BS>>>

@@ -88,6 +88,17 @@ int rgpFgmBndCoeffs
     비트-동일. rgpFgmGatherRows/FetchFields의 Y 범위 요청은 내부에서
     보간 경로로 투명 전환된다. 아밍 전에 1회 설정.                     */
 void rgpFgmSoAOmitY(int nY);
+
+/*  P2(VRAM): 스크래치 차용 — SoA 버퍼(gB.out)가 요청 크기 이상이면
+    그 포인터를 반환(소유권은 fgm; 해제 금지). 실제 안전 불변식(적대
+    리뷰로 교정): "모든 SoA 읽기(체인/게더/페치)는 같은 corrector
+    시퀀스에서 evaluate 전체 재기록이 선행". 차용자는 기록 직전에
+    rgpFgmScratchDirty()를 호출해 SoA를 fail-closed로 무효화해야 하며
+    (lastN=0 — 다음 evaluate가 복원), 위반 시 소비자 가드가 에러를
+    낸다(무음 오염 방지). SoA 해제/재할당 시엔 fgm이
+    rgpUEqnScratchInvalidate()로 차용자를 무효화한다.                  */
+void* rgpFgmBorrowScratch(unsigned long long bytes);
+void rgpFgmScratchDirty(void);
 int rgpFgmSoAOmitted(void);   /* 현재 omit 중인 nY (0=off) */
 
 /*  체인 재보간용 스텐실 뷰 (마지막 evaluate의 디바이스 입력/좌표 +
