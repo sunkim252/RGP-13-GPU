@@ -146,6 +146,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuManifold_(fgmTable_.lookupOrDefault<Switch>("gpuManifold", false)),
     gpuManifoldShare_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldShare", true)),
     gpuManifoldYDiet_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldYDiet", true)),
+    gpuManifoldSoADiet_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldSoADiet", true)),
     gpuYDietArmed_(false),
     gpuHostYStale_(false),
     gpuBndCoeffMode_(-1),
@@ -1031,6 +1032,21 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
                 gpuManifoldArmed_ = true;
                 Info<< "fgmFluid: GPU manifold armed -- " << gpuNFields_
                     << " fields x " << nTot << " table entries" << nl << endl;
+
+                // VRAM 다이어트: SoA에서 Y 블록 생략 (체인 재보간)
+                if
+                (
+                    gpuManifoldSoADiet_ && gpuManifoldYDiet_
+                 && rgpFgmHostCopyActive() && Yref.size() > 0
+                )
+                {
+                    rgpFgmSoAOmitY(int(Yref.size()));
+                    Info<< "fgmFluid: manifold SoA Y-omit armed -- "
+                        << Yref.size() << " species re-interpolated by "
+                        << "the device chain (SoA "
+                        << label(Yref.size()*mesh.nCells()*8/1048576)
+                        << " MiB saved)" << nl << endl;
+                }
                 if (ipcShared)
                 {
                     Pout<< "fgmFluid: manifold table IPC-shared from rank "
@@ -1069,16 +1085,17 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
             // 평가(소유 셀 값)와 비체인 폴백(syncHostTabY 가드)뿐이라
             // 비트-동일. srcPV/T/RG/Le는 per-outer CPU 소비가 있어 유지.
             const label nYtab = Yref.size();
+            const bool soaOmit = rgpFgmSoAOmitted() > 0;
             const bool yDiet =
-                gpuManifoldYDiet_ && hostScatter && nYtab > 0
+                (gpuManifoldYDiet_ || soaOmit) && hostScatter && nYtab > 0
              && rgpFgmHostCopyActive();
             if (!hostScatter)
             {
                 rgpFgmHostCopySkip(0, gpuNFields_);
             }
-            else if (yDiet)
+            else if (yDiet && !soaOmit)
             {
-                rgpFgmHostCopySkip(2, nYtab);
+                rgpFgmHostCopySkip(2, nYtab);   // omit이면 Y가 SoA에 없음
             }
 
             // M4: les(V^(2/3))·laminar(0)는 정적 메시에서 런-상수 —
@@ -1117,7 +1134,7 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
             std::memcpy(Tc.begin(),   out + (f++)*nc, bytes);
             if (yDiet)
             {
-                f += nYtab;
+                if (!soaOmit) { f += nYtab; }   // 컴팩트 SoA: RG가 슬롯 2
                 scatterTabYSubset(Yref);
             }
             else

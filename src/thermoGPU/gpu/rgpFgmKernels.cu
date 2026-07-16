@@ -52,6 +52,12 @@ namespace
     // 업로드). 버퍼 재할당·해제 시 무효화.
     long gLsqrDecl = -1, gLsqrDev = -2;
 
+    // VRAM 다이어트: SoA에서 Y 블록 생략 (0=off). 마지막 evaluate의
+    // coord4 파라미터를 보관해 체인 재보간 스텐실 뷰로 노출.
+    int gOmitY = 0;
+    struct { int mode4 = 0;
+             double chi0 = 0, hOx = 0, hFuel = 0, Wlo = 0, Whi = 0; } gSV;
+
     // Y-다이어트 부분 게더 상태 (경계-인접 셀 인덱스 + 압축 출력 버퍼)
     struct FgmRowGather
     {
@@ -147,7 +153,8 @@ __global__ void fgmKernel
     const double* __restrict__ msgf, const double* __restrict__ Defff,
     const double* __restrict__ hwf,
     double* __restrict__ gZf, double* __restrict__ chif,
-    double* __restrict__ outf
+    double* __restrict__ outf,
+    const int nOmitY   // >0: SoA에 Y[2, 2+nOmitY) 미저장 (컴팩트 슬롯)
 )
 {
     const int celli = blockIdx.x*blockDim.x + threadIdx.x;
@@ -227,6 +234,15 @@ __global__ void fgmKernel
     }
     for (int f = 0; f < nFields; f++)
     {
+        // 컴팩트 SoA: Y 블록은 계산·저장 생략 (체인이 재보간; 나머지
+        // 필드의 산술은 완전 독립이라 값 불변)
+        int slot = f;
+        if (nOmitY)
+        {
+            if (f >= 2 && f < 2 + nOmitY) { continue; }
+            if (f >= 2 + nOmitY) { slot = f - nOmitY; }
+        }
+
         const double c0000 = tables[base[0]  + f];
         const double c1000 = tables[base[1]  + f];
         const double c0100 = tables[base[2]  + f];
@@ -263,7 +279,7 @@ __global__ void fgmKernel
         double v = A*(1 - wK) + B*wK;
         if (f == 0) { v *= srcScale*rho_l; }     // sourcePV [1/s] → 체적량
 
-        outf[(size_t)f*nCells + celli] = v;
+        outf[(size_t)slot*nCells + celli] = v;
     }
 }
 
@@ -375,6 +391,152 @@ __global__ void fgmBndCoeffsK
         const double B   = b0*(1 - wC) + b1*wC;
 
         out[(size_t)f*nFaces + fi] = A*(1 - wK) + B*wK;
+    }
+}
+
+
+//- 16-코너 블렌드 (fgmKernel 본문과 동일 산술)
+__device__ inline double interp16
+(
+    const double* __restrict__ tables, const size_t base[16], const int f,
+    const double wZ, const double wG, const double wC, const double wK
+)
+{
+    const double c0000 = tables[base[0]  + f];
+    const double c1000 = tables[base[1]  + f];
+    const double c0100 = tables[base[2]  + f];
+    const double c1100 = tables[base[3]  + f];
+    const double c0010 = tables[base[4]  + f];
+    const double c1010 = tables[base[5]  + f];
+    const double c0110 = tables[base[6]  + f];
+    const double c1110 = tables[base[7]  + f];
+    const double c0001 = tables[base[8]  + f];
+    const double c1001 = tables[base[9]  + f];
+    const double c0101 = tables[base[10] + f];
+    const double c1101 = tables[base[11] + f];
+    const double c0011 = tables[base[12] + f];
+    const double c1011 = tables[base[13] + f];
+    const double c0111 = tables[base[14] + f];
+    const double c1111 = tables[base[15] + f];
+
+    const double a00 = c0000*(1 - wZ) + c1000*wZ;
+    const double a10 = c0100*(1 - wZ) + c1100*wZ;
+    const double a01 = c0010*(1 - wZ) + c1010*wZ;
+    const double a11 = c0110*(1 - wZ) + c1110*wZ;
+    const double a0  = a00*(1 - wG) + a10*wG;
+    const double a1  = a01*(1 - wG) + a11*wG;
+    const double A   = a0*(1 - wC) + a1*wC;
+
+    const double b00 = c0001*(1 - wZ) + c1001*wZ;
+    const double b10 = c0101*(1 - wZ) + c1101*wZ;
+    const double b01 = c0011*(1 - wZ) + c1011*wZ;
+    const double b11 = c0111*(1 - wZ) + c1111*wZ;
+    const double b0  = b00*(1 - wG) + b10*wG;
+    const double b1  = b01*(1 - wG) + b11*wG;
+    const double B   = b0*(1 - wC) + b1*wC;
+
+    return A*(1 - wK) + B*wK;
+}
+
+//- SoA-생략 Y 재보간용 셀 스텐실 재유도: 클램프·coord4는 fgmKernel과
+//  동일 식(gz는 저장값 = 커널이 브래킷에 쓴 값 그대로) → 비트-동일
+__device__ inline void cellStencilSaved
+(
+    const int celli, const int mode4,
+    const double chi0, const double hOx, const double hFuel,
+    const double Wlo, const double Whi,
+    const int nZ, const int nG, const int nC, const int nK,
+    const double* __restrict__ Zax, const double* __restrict__ Gax,
+    const double* __restrict__ Cax, const double* __restrict__ Kax,
+    const int nFields,
+    const double* __restrict__ Zf, const double* __restrict__ Cf,
+    const double* __restrict__ gZf, const double* __restrict__ chif,
+    const double* __restrict__ hwf,
+    size_t base[16],
+    double& wZo, double& wGo, double& wCo, double& wKo
+)
+{
+    const double Zcl = fMax(fMin(Zf[celli], 1.0), 0.0);
+    const double Ccl = fMax(Cf[celli], 0.0);
+    const double gz  = gZf[celli];
+    double coord4 = chi0;
+    if (mode4 == 1) { coord4 = chif[celli]; }
+    else if (mode4 == 2)
+    {
+        coord4 = hwf[celli] - ((1.0 - Zcl)*hOx + Zcl*hFuel);
+    }
+    else if (mode4 == 3)
+    {
+        coord4 = fMax(Wlo, fMin(Whi, hwf[celli]));
+    }
+
+    int iZ, iG, iC, iK;
+    bracket(Zax, nZ, Zcl, iZ, wZo);
+    bracket(Gax, nG, gz, iG, wGo);
+    bracket(Cax, nC, Ccl, iC, wCo);
+    bracket(Kax, nK, coord4, iK, wKo);
+    const int iZp = (nZ >= 2) ? (iZ + 1) : iZ;
+    const int iGp = (nG >= 2) ? (iG + 1) : iG;
+    const int iCp = (nC >= 2) ? (iC + 1) : iC;
+    const int iKp = (nK >= 2) ? (iK + 1) : iK;
+
+    int m = 0;
+    for (int dK = 0; dK < 2; dK++)
+    {
+        const int k = dK ? iKp : iK;
+        for (int dC = 0; dC < 2; dC++)
+        {
+            const int c = dC ? iCp : iC;
+            for (int dG = 0; dG < 2; dG++)
+            {
+                const int g = dG ? iGp : iG;
+                for (int dZ = 0; dZ < 2; dZ++)
+                {
+                    const int z = dZ ? iZp : iZ;
+                    base[m++] =
+                        ((((size_t)z*nG + g)*nC + c)*nK + k)
+                       *(size_t)nFields;
+                }
+            }
+        }
+    }
+}
+
+//- SoA-생략 시 부분집합/전체 셀의 테이블 필드 재보간 (Y-다이어트 게더·
+//  호스트 복원 대체). cells==nullptr이면 전 셀. out [nOut][n].
+__global__ void interpFieldsK
+(
+    const int n, const int* __restrict__ cells,
+    const int mode4,
+    const double chi0, const double hOx, const double hFuel,
+    const double Wlo, const double Whi,
+    const int nZ, const int nG, const int nC, const int nK,
+    const double* __restrict__ Zax, const double* __restrict__ Gax,
+    const double* __restrict__ Cax, const double* __restrict__ Kax,
+    const int nFields, const double* __restrict__ tables,
+    const double* __restrict__ Zf, const double* __restrict__ Cf,
+    const double* __restrict__ gZf, const double* __restrict__ chif,
+    const double* __restrict__ hwf,
+    const int firstF, const int nOut,
+    double* __restrict__ out
+)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const int celli = cells ? cells[j] : j;
+
+    size_t base[16];
+    double wZ, wG, wC, wK;
+    cellStencilSaved
+    (
+        celli, mode4, chi0, hOx, hFuel, Wlo, Whi,
+        nZ, nG, nC, nK, Zax, Gax, Cax, Kax, nFields,
+        Zf, Cf, gZf, chif, hwf, base, wZ, wG, wC, wK
+    );
+    for (int f = 0; f < nOut; f++)
+    {
+        out[(size_t)f*n + j] =
+            interp16(tables, base, firstF + f, wZ, wG, wC, wK);
     }
 }
 
@@ -549,6 +711,10 @@ int rgpFgmEvaluate
     gB.lastN = 0;
     gB.outActive = nullptr;
 
+    // 체인 재보간 스텐실 뷰용 coord4 파라미터 보관
+    gSV.mode4 = mode4; gSV.chi0 = chi0;
+    gSV.hOx = hOx; gSV.hFuel = hFuel; gSV.Wlo = Wlo; gSV.Whi = Whi;
+
     cudaError_t rc;
     // native(2)는 입력·출력 모두 호스트 포인터 직행(zero-copy) —
     // 스테이징 버퍼가 전혀 쓰이지 않으므로 할당 자체를 생략
@@ -566,7 +732,8 @@ int rgpFgmEvaluate
         gB.cap = nCells;
         gLsqrDev = -2;   // M4: 재할당 → 잔존본 무효
     }
-    const size_t need = (size_t)gT.nFields*nCells;
+    const int nStore = gT.nFields - gOmitY;
+    const size_t need = (size_t)nStore*nCells;
     if (gRgpUnified != 2 && gB.outCap < need)
     {
         if (gB.out) cudaFree(gB.out);
@@ -616,7 +783,8 @@ int rgpFgmEvaluate
         gT.nZ, gT.nG, gT.nC, gT.nK, gT.Zax, gT.Gax, gT.Cax, gT.Kax,
         gT.nFields, gT.tables,
         dZ, dC, dRho, dLsqr, dMsg, dDeff, dHw,
-        oGZ, oChi, oOut
+        oGZ, oChi, oOut,
+        (oOut == gB.out) ? gOmitY : 0   // zero-copy 출력은 풀 레이아웃
     );
     if ((rc = cudaGetLastError()) != cudaSuccess)
         return ffail(rc, "fgm/launch");
@@ -630,7 +798,7 @@ int rgpFgmEvaluate
     // 필드의 대역폭 절약; 디바이스 상주 SoA는 완전하므로 체인 무영향).
     if (oOut == gB.out && fieldsOut != nullptr)
     {
-        const int nF = gT.nFields;
+        const int nF = nStore;
         int s0 = gSkipFirst < nF ? gSkipFirst : nF;
         int s1 = gSkipFirst + gSkipN < nF ? gSkipFirst + gSkipN : nF;
         if (gSkipN <= 0) { s0 = nF; s1 = nF; }
@@ -680,6 +848,59 @@ void rgpFgmHostCopySkip(int first, int n)
 void rgpFgmLsqrStamp(long stamp)
 {
     gLsqrDecl = stamp;
+}
+
+void rgpFgmSoAOmitY(int nY)
+{
+    if (nY != gOmitY)
+    {
+        gOmitY = (nY > 0) ? nY : 0;
+        // 레이아웃 변경 → 기존 SoA 무효 (재할당 유도)
+        if (gB.out) { cudaFree(gB.out); gB.out = nullptr; }
+        gB.outCap = 0; gB.lastN = 0; gB.outActive = nullptr;
+    }
+}
+
+int rgpFgmSoAOmitted(void) { return gOmitY; }
+
+int rgpFgmGetStencilView(rgpFgmStencilView* v)
+{
+    if (!gT.tables || gB.lastN <= 0)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr), "fgm/stencilView: no state");
+        return -1;
+    }
+    v->nZ = gT.nZ; v->nG = gT.nG; v->nC = gT.nC; v->nK = gT.nK;
+    v->nFields = gT.nFields;
+    v->mode4 = gSV.mode4;
+    v->chi0 = gSV.chi0; v->hOx = gSV.hOx; v->hFuel = gSV.hFuel;
+    v->Wlo = gSV.Wlo; v->Whi = gSV.Whi;
+    v->Zax = gT.Zax; v->Gax = gT.Gax; v->Cax = gT.Cax; v->Kax = gT.Kax;
+    v->tables = gT.tables;
+    v->Z = gB.Z; v->C = gB.C; v->gZ = gB.gZ; v->chi = gB.chi;
+    v->hw = gB.hw;
+    return 0;
+}
+
+//- 공통 런처: 저장 좌표에서 테이블 필드 [firstF, firstF+nOut) 재보간
+static int launchInterpFields
+(
+    int n, const int* dCells, int firstF, int nOut, double* dOut
+)
+{
+    constexpr int bs = 128;
+    rgpfgm::interpFieldsK<<<(n + bs - 1)/bs, bs>>>
+    (
+        n, dCells, gSV.mode4, gSV.chi0, gSV.hOx, gSV.hFuel,
+        gSV.Wlo, gSV.Whi,
+        gT.nZ, gT.nG, gT.nC, gT.nK, gT.Zax, gT.Gax, gT.Cax, gT.Kax,
+        gT.nFields, gT.tables,
+        gB.Z, gB.C, gB.gZ, gB.chi, gB.hw,
+        firstF, nOut, dOut
+    );
+    const cudaError_t rc = cudaGetLastError();
+    if (rc != cudaSuccess) return ffail(rc, "fgm/interpFields launch");
+    return 0;
 }
 
 int rgpFgmBndCoeffs
@@ -785,11 +1006,33 @@ int rgpFgmGatherRows(int firstField, int nF, double* hostOut)
         if (rc != cudaSuccess) return ffail(rc, "fgm/gatherRows malloc");
         gRW.cap = need;
     }
-    rgpfgm::gatherRowsK<<<(gRW.nSub + 255)/256, 256>>>
-        (gRW.nSub, gRW.cells, nF, firstField, gB.lastN, soa, gRW.out);
-    cudaError_t rc = cudaGetLastError();
-    if (rc != cudaSuccess) return ffail(rc, "fgm/gatherRows launch");
-    rc = cudaMemcpy(hostOut, gRW.out, need, cudaMemcpyDeviceToHost);
+
+    // SoA-생략 모드에서 Y 범위 요청은 테이블 재보간으로 투명 전환
+    if (gOmitY && firstField >= 2 && firstField + nF <= 2 + gOmitY)
+    {
+        const int rc2 =
+            launchInterpFields(gRW.nSub, gRW.cells, firstField, nF, gRW.out);
+        if (rc2) return rc2;
+    }
+    else if (gOmitY && firstField + nF > 2 && firstField < 2 + gOmitY)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr),
+                 "fgm/gatherRows: mixed Y/non-Y range under SoA omit");
+        return -1;
+    }
+    else
+    {
+        // 컴팩트 슬롯 매핑 (비-Y 필드)
+        const int slotFirst =
+            (gOmitY && firstField >= 2 + gOmitY)
+          ? firstField - gOmitY : firstField;
+        rgpfgm::gatherRowsK<<<(gRW.nSub + 255)/256, 256>>>
+            (gRW.nSub, gRW.cells, nF, slotFirst, gB.lastN, soa, gRW.out);
+        cudaError_t rc = cudaGetLastError();
+        if (rc != cudaSuccess) return ffail(rc, "fgm/gatherRows launch");
+    }
+    const cudaError_t rc = cudaMemcpy(hostOut, gRW.out, need,
+                                      cudaMemcpyDeviceToHost);
     if (rc != cudaSuccess) return ffail(rc, "fgm/gatherRows D2H");
     return 0;
 }
@@ -802,9 +1045,36 @@ int rgpFgmFetchFields(int firstField, int nF, double* hostOut)
         snprintf(gFgmErr, sizeof(gFgmErr), "fgm/fetchFields: no SoA");
         return -1;
     }
+
+    // SoA-생략 모드에서 Y 범위 요청은 전-셀 테이블 재보간으로 전환
+    if (gOmitY && firstField >= 2 && firstField + nF <= 2 + gOmitY)
+    {
+        const size_t need = (size_t)nF*gB.lastN*sizeof(double);
+        if (gBC.capOut < need)
+        {
+            if (gBC.out)
+            {
+                cudaFree(gBC.out); gBC.out = nullptr; gBC.capOut = 0;
+            }
+            cudaError_t rc = cudaMalloc(&gBC.out, need);
+            if (rc != cudaSuccess) return ffail(rc, "fgm/fetch malloc");
+            gBC.capOut = need;
+        }
+        const int rc2 =
+            launchInterpFields(gB.lastN, nullptr, firstField, nF, gBC.out);
+        if (rc2) return rc2;
+        const cudaError_t rc = cudaMemcpy(hostOut, gBC.out, need,
+                                          cudaMemcpyDeviceToHost);
+        if (rc != cudaSuccess) return ffail(rc, "fgm/fetch D2H");
+        return 0;
+    }
+
+    const int slotFirst =
+        (gOmitY && firstField >= 2 + gOmitY)
+      ? firstField - gOmitY : firstField;
     const cudaError_t rc = cudaMemcpy
     (
-        hostOut, soa + (size_t)firstField*gB.lastN,
+        hostOut, soa + (size_t)slotFirst*gB.lastN,
         (size_t)nF*gB.lastN*sizeof(double), cudaMemcpyDeviceToHost
     );
     if (rc != cudaSuccess) return ffail(rc, "fgm/fetchFields D2H");

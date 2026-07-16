@@ -326,6 +326,12 @@ protected:
         //  비트-동일. copy 스테이징 모드에서만 활성(zero-copy 제외).
         //  'gpuManifoldYDiet off;' (fgmProperties, 기본 on)
         Switch gpuManifoldYDiet_;
+
+        //- VRAM 다이어트: 디바이스 SoA에서 Y 블록을 아예 저장하지 않고
+        //  (2.6M셀 106종 = 2.2GB) 체인이 테이블에서 재보간(동일 산술 =
+        //  비트-동일). gpuManifoldYDiet과 copy 모드 전제.
+        //  'gpuManifoldSoADiet off;' (fgmProperties, 기본 on)
+        Switch gpuManifoldSoADiet_;
         mutable bool gpuYDietArmed_;
         mutable bool gpuHostYStale_;
         mutable labelList gpuYDietCells_;

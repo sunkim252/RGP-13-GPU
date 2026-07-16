@@ -198,9 +198,11 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         if (tabRealGasCoeffs_)
         {
             cMap.setSize(13);
+            const label cOff =
+                rgpFgmSoAOmitted() > 0 ? 0 : tabSpecieIDs_.size();
             forAll(cMap, k)
             {
-                cMap[k] = 2 + tabSpecieIDs_.size() + k;
+                cMap[k] = 2 + cOff + k;
             }
         }
 
@@ -490,9 +492,11 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
         if (tabRealGasCoeffs_)
         {
             cMap.setSize(13);
+            const label cOff =
+                rgpFgmSoAOmitted() > 0 ? 0 : tabSpecieIDs_.size();
             forAll(cMap, k)
             {
-                cMap[k] = 2 + tabSpecieIDs_.size() + k;
+                cMap[k] = 2 + cOff + k;
             }
         }
 

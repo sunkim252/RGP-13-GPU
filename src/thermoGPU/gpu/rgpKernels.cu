@@ -370,7 +370,151 @@ struct YView
     const int*    map;
     const double* yh;
     size_t        stride;   // soa/yh 행 스트라이드 (= 체인 nCells)
+
+    // ⓒ SoA-생략(VRAM 다이어트) 모드: tab != null이면 map[s] >= 0의
+    //   Y를 fgm 테이블에서 셀 스텐실 재유도로 직접 보간 (fgmKernel과
+    //   동일 산술·동일 입력 → 비트-동일). 셀당 스텐실 1회 계산 후
+    //   전 종 공유 — rgpFgmKernels.cu의 cellStencilSaved와 1:1 유지.
+    const double* tab = nullptr;   // node-major tables
+    int tabNF = 0;                 // 테이블 필드 수 (노드 스트라이드)
+    int nZ = 0, nG = 0, nC = 0, nK = 0, mode4 = 0;
+    double chi0 = 0, hOx = 0, hFuel = 0, Wlo = 0, Whi = 0;
+    const double* Zax = nullptr; const double* Gax = nullptr;
+    const double* Cax = nullptr; const double* Kax = nullptr;
+    const double* Zf = nullptr; const double* Cf = nullptr;
+    const double* gZf = nullptr; const double* chif = nullptr;
+    const double* hwf = nullptr;
 };
+
+//- fMax/fMin·bracket·interp16: rgpFgmKernels.cu와 1:1 (별도 TU라 복제)
+__device__ inline double rgpsFMax(double a, double b)
+{ return (a > b) ? a : b; }
+__device__ inline double rgpsFMin(double a, double b)
+{ return (a < b) ? a : b; }
+
+__device__ inline void rgpsBracket
+(
+    const double* axis, const int n, double v, int& i, double& w
+)
+{
+    constexpr double VSMALL = 1e-300;
+    if (n <= 1) { i = 0; w = 0; return; }
+    if (v <= axis[0]) { i = 0; w = 0; return; }
+    if (v >= axis[n - 1]) { i = n - 2; w = 1; return; }
+    const double span = axis[n - 1] - axis[0];
+    int j = 1;
+    if (span > VSMALL)
+    {
+        j = int((v - axis[0])/span*(n - 1)) + 1;
+        j = max(1, min(j, n - 1));
+    }
+    while (j < n - 1 && axis[j] < v) { j++; }
+    while (j > 1 && axis[j - 1] >= v) { j--; }
+    i = j - 1;
+    const double d = axis[j] - axis[i];
+    w = (d > VSMALL) ? (v - axis[i])/d : 0.0;
+}
+
+__device__ inline double rgpsInterp16
+(
+    const double* __restrict__ tab, const size_t base[16], const int f,
+    const double wZ, const double wG, const double wC, const double wK
+)
+{
+    const double c0000 = tab[base[0]  + f];
+    const double c1000 = tab[base[1]  + f];
+    const double c0100 = tab[base[2]  + f];
+    const double c1100 = tab[base[3]  + f];
+    const double c0010 = tab[base[4]  + f];
+    const double c1010 = tab[base[5]  + f];
+    const double c0110 = tab[base[6]  + f];
+    const double c1110 = tab[base[7]  + f];
+    const double c0001 = tab[base[8]  + f];
+    const double c1001 = tab[base[9]  + f];
+    const double c0101 = tab[base[10] + f];
+    const double c1101 = tab[base[11] + f];
+    const double c0011 = tab[base[12] + f];
+    const double c1011 = tab[base[13] + f];
+    const double c0111 = tab[base[14] + f];
+    const double c1111 = tab[base[15] + f];
+    const double a00 = c0000*(1 - wZ) + c1000*wZ;
+    const double a10 = c0100*(1 - wZ) + c1100*wZ;
+    const double a01 = c0010*(1 - wZ) + c1010*wZ;
+    const double a11 = c0110*(1 - wZ) + c1110*wZ;
+    const double a0  = a00*(1 - wG) + a10*wG;
+    const double a1  = a01*(1 - wG) + a11*wG;
+    const double A   = a0*(1 - wC) + a1*wC;
+    const double b00 = c0001*(1 - wZ) + c1001*wZ;
+    const double b10 = c0101*(1 - wZ) + c1101*wZ;
+    const double b01 = c0011*(1 - wZ) + c1011*wZ;
+    const double b11 = c0111*(1 - wZ) + c1111*wZ;
+    const double b0  = b00*(1 - wG) + b10*wG;
+    const double b1  = b01*(1 - wG) + b11*wG;
+    const double B   = b0*(1 - wC) + b1*wC;
+    return A*(1 - wK) + B*wK;
+}
+
+//- 셀 스텐실 재유도 + Yc[] 채움 (ⓒ 모드; cellStencilSaved와 1:1)
+__device__ inline void rgpYFillFromTab
+(
+    const YView& v, const int n, const int celli, double* Yc
+)
+{
+    const double Zcl = rgpsFMax(rgpsFMin(v.Zf[celli], 1.0), 0.0);
+    const double Ccl = rgpsFMax(v.Cf[celli], 0.0);
+    const double gz  = v.gZf[celli];
+    double coord4 = v.chi0;
+    if (v.mode4 == 1) { coord4 = v.chif[celli]; }
+    else if (v.mode4 == 2)
+    {
+        coord4 = v.hwf[celli] - ((1.0 - Zcl)*v.hOx + Zcl*v.hFuel);
+    }
+    else if (v.mode4 == 3)
+    {
+        coord4 = rgpsFMax(v.Wlo, rgpsFMin(v.Whi, v.hwf[celli]));
+    }
+
+    int iZ, iG, iC, iK;
+    double wZ, wG, wC, wK;
+    rgpsBracket(v.Zax, v.nZ, Zcl, iZ, wZ);
+    rgpsBracket(v.Gax, v.nG, gz, iG, wG);
+    rgpsBracket(v.Cax, v.nC, Ccl, iC, wC);
+    rgpsBracket(v.Kax, v.nK, coord4, iK, wK);
+    const int iZp = (v.nZ >= 2) ? (iZ + 1) : iZ;
+    const int iGp = (v.nG >= 2) ? (iG + 1) : iG;
+    const int iCp = (v.nC >= 2) ? (iC + 1) : iC;
+    const int iKp = (v.nK >= 2) ? (iK + 1) : iK;
+
+    size_t base[16];
+    int m = 0;
+    for (int dK = 0; dK < 2; dK++)
+    {
+        const int k = dK ? iKp : iK;
+        for (int dC2 = 0; dC2 < 2; dC2++)
+        {
+            const int c = dC2 ? iCp : iC;
+            for (int dG = 0; dG < 2; dG++)
+            {
+                const int g = dG ? iGp : iG;
+                for (int dZ = 0; dZ < 2; dZ++)
+                {
+                    const int z = dZ ? iZp : iZ;
+                    base[m++] =
+                        ((((size_t)z*v.nG + g)*v.nC + c)*v.nK + k)
+                       *(size_t)v.tabNF;
+                }
+            }
+        }
+    }
+
+    for (int s = 0; s < n; s++)
+    {
+        const int ms = v.map[s];
+        Yc[s] = (ms >= 0)
+          ? rgpsInterp16(v.tab, base, ms, wZ, wG, wC, wK)
+          : v.yh[(size_t)(-1 - ms)*v.stride + celli];
+    }
+}
 
 __device__ inline double rgpYAt
 (
@@ -425,6 +569,11 @@ __global__ void rgpHaKernel
 
     // Y를 한 번만 글로벌에서 읽어 로컬로 (레이아웃 무관, 값 동일)
     double Yc[RGP_GPU_MAX_SPECIES];
+    if (yv.tab)   // SoA-생략: 셀 스텐실 재유도로 테이블에서 직접 보간
+    {
+        rgpYFillFromTab(yv, n, celli, Yc);
+    }
+    else
     for (int i = 0; i < n; i++) { Yc[i] = rgpYAt(yv, n, celli, i); }
 
     double sumY = 0.0, sumYoW = 0.0;
@@ -556,6 +705,11 @@ __global__ void rgpEvaluateKernel
     const double RR = kp.RR;
 
     double Yc[RGP_GPU_MAX_SPECIES];
+    if (yv.tab)   // SoA-생략: 셀 스텐실 재유도로 테이블에서 직접 보간
+    {
+        rgpYFillFromTab(yv, n, celli, Yc);
+    }
+    else
     for (int i = 0; i < n; i++) { Yc[i] = rgpYAt(yv, n, celli, i); }
 
     // ── 믹스처 몰질량 (specie 질량 블렌드: Wmix = ΣY / Σ(Y/W)) ─────────
@@ -1137,12 +1291,39 @@ static int chainPrepare
         tvOut->map = gBuf.cMap;
     }
 
-    *dTOut = fgmOut + (size_t)nCells;   // field 1 = T
+    *dTOut = fgmOut + (size_t)nCells;   // field 1 = T (컴팩트에서도 슬롯 1)
     yvOut->aos = nullptr;
     yvOut->soa = fgmOut;
     yvOut->map = gBuf.yMap;
     yvOut->yh = gBuf.yH;
     yvOut->stride = (size_t)nCells;
+
+    // SoA-생략(VRAM 다이어트): Y는 SoA에 없음 — 스텐실 뷰로 테이블
+    // 직접 보간 모드 활성 (map의 값은 그대로 테이블 필드 인덱스)
+    if (rgpFgmSoAOmitted() > 0)
+    {
+        rgpFgmStencilView sv;
+        if (rgpFgmGetStencilView(&sv))
+        {
+            snprintf(gErr, sizeof(gErr),
+                     "chain: stencil view unavailable under SoA omit");
+            return -1;
+        }
+        yvOut->soa = nullptr;
+        yvOut->tab = sv.tables;
+        yvOut->tabNF = sv.nFields;
+        yvOut->nZ = sv.nZ; yvOut->nG = sv.nG;
+        yvOut->nC = sv.nC; yvOut->nK = sv.nK;
+        yvOut->mode4 = sv.mode4;
+        yvOut->chi0 = sv.chi0; yvOut->hOx = sv.hOx;
+        yvOut->hFuel = sv.hFuel;
+        yvOut->Wlo = sv.Wlo; yvOut->Whi = sv.Whi;
+        yvOut->Zax = sv.Zax; yvOut->Gax = sv.Gax;
+        yvOut->Cax = sv.Cax; yvOut->Kax = sv.Kax;
+        yvOut->Zf = sv.Z; yvOut->Cf = sv.C;
+        yvOut->gZf = sv.gZ; yvOut->chif = sv.chi;
+        yvOut->hwf = sv.hw;
+    }
 
     return 0;
 }

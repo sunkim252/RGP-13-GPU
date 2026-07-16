@@ -81,6 +81,31 @@ int rgpFgmBndCoeffs
     int firstField, int nOut, double* hostOut
 );
 
+/*  VRAM 다이어트: SoA에서 Y 블록(테이블 종 nY 필드)을 아예 저장하지
+    않는다(2.6M셀 106종 = 2.2GB 절약; copy 모드 전용). 컴팩트 레이아웃
+    [srcPV, T, RG..., Le...]. 체인(thermo refresh/ha 재시드)은 아래
+    스텐실 뷰로 Y를 테이블에서 직접 재보간 — fgmKernel과 동일 산술이라
+    비트-동일. rgpFgmGatherRows/FetchFields의 Y 범위 요청은 내부에서
+    보간 경로로 투명 전환된다. 아밍 전에 1회 설정.                     */
+void rgpFgmSoAOmitY(int nY);
+int rgpFgmSoAOmitted(void);   /* 현재 omit 중인 nY (0=off) */
+
+/*  체인 재보간용 스텐실 뷰 (마지막 evaluate의 디바이스 입력/좌표 +
+    coord4 파라미터 + 테이블). 모든 포인터는 디바이스(copy 모드).      */
+typedef struct
+{
+    int nZ, nG, nC, nK, nFields;   /* 테이블 차원/필드 수 */
+    int mode4;
+    double chi0, hOx, hFuel, Wlo, Whi;
+    const double* Zax; const double* Gax;
+    const double* Cax; const double* Kax;
+    const double* tables;
+    const double* Z; const double* C;      /* 원시 입력 (클램프 전) */
+    const double* gZ; const double* chi;   /* 저장된 클로저 출력 */
+    const double* hw;                      /* mode 2/3 입력 (nullable) */
+} rgpFgmStencilView;
+int rgpFgmGetStencilView(rgpFgmStencilView* v);
+
 /*  M4: Lsqr(혼합길이²) 스탬프 — varModel les(순수 기하 V^(2/3))·laminar
     (0 상수)이고 정적 메시면 런-상수이므로, 같은 스탬프의 재업로드를
     생략하고 디바이스 잔존본을 재사용한다. -1=항상 업로드(RAS/동적
