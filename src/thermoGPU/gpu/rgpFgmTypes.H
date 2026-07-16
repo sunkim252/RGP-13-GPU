@@ -66,6 +66,12 @@ int rgpFgmGatherRows(int firstField, int nF, double* hostOut);
 int rgpFgmFetchFields(int firstField, int nF, double* hostOut);
 int rgpFgmHostCopyActive(void);
 
+/*  M4: Lsqr(혼합길이²) 스탬프 — varModel les(순수 기하 V^(2/3))·laminar
+    (0 상수)이고 정적 메시면 런-상수이므로, 같은 스탬프의 재업로드를
+    생략하고 디바이스 잔존본을 재사용한다. -1=항상 업로드(RAS/동적
+    메시). 버퍼 재할당 시 자동 무효화.                                 */
+void rgpFgmLsqrStamp(long stamp);
+
 /*  랭크 간 매니폴드 공유(CUDA IPC). 핸들 블롭은 5개 할당
     (Zax,Gax,Cax,Kax,tables) × 64B = 320B 고정.
     Supported: cudaIpcGetMemHandle 프로브(캐시) — 단 WSL은 핸들 생성은

@@ -74,6 +74,13 @@ int rgpPEqnParCoeffs(const double* bCoeffs);
 int rgpPEqnSetPrecon(int mode);
 int rgpPEqnPreconColors(void);
 
+/*  M4: 스텝-불변 조립 입력 스탬프. pOld(=p.oldTime)와 LTS rDeltaT는
+    preSolve에서 스텝당 1회만 갱신되므로, 호출측이 timeIndex를 스탬프로
+    선언하면 같은 스탬프의 재업로드를 생략하고 디바이스 잔존본을
+    재사용한다(copy 스테이징 모드 전용; -1=항상 업로드; 메시 재업로드
+    시 자동 무효화). 값이 실제로 스텝-불변임은 호출측이 보장할 것.     */
+void rgpPEqnInvarStamp(long pOldStamp, long rdtStamp);
+
 /*  검증용: 조립만 수행하고 diag(경계 포함)/upper/b(경계 포함)를 D2H.
     CPU fvMatrix 계수와의 비트-수준 대조에 사용.                       */
 int rgpPEqnAssembleDump

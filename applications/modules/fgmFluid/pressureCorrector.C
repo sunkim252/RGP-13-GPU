@@ -1320,6 +1320,13 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
           ? fv::localEulerDdt::localRDeltaT(mesh).primitiveField().begin()
           : nullptr;
 
+        // M4: p.oldTime()·rDeltaT는 preSolve에서 스텝당 1회 갱신 —
+        // timeIndex 스탬프로 같은 스텝 내 재업로드(12솔브)를 생략
+        rgpPEqnInvarStamp
+        (
+            long(mesh.time().timeIndex()), long(mesh.time().timeIndex())
+        );
+
         // 비직교 명시 보정 (gaussLaplacianScheme 1:1): M = pDDt − L 에서
         // L.source = −V·div(ΓmagSf·corr(p)) → M 소스 += div(·) (per-vol).
         // fluxRequired(p)라 faceFluxCorrection = ΓmagSf·corr(p)도 보존

@@ -174,6 +174,12 @@ namespace
 
     int gPrecon = 0;   // 0=Jacobi, 1=multicolour DIC
 
+    // M4: 스텝-불변 입력 스탬프 (pOld=p.oldTime, rdt=LTS rDeltaT — 둘 다
+    // preSolve에서 스텝당 1회 갱신). Decl=호출측 선언, Dev=디바이스
+    // 잔존본. 같으면 H2D 생략. -1=캐시 안 함. 메시 재업로드 시 무효화.
+    long gPOldDecl = -1, gPOldDev = -2;
+    long gRdtDecl = -1, gRdtDev = -2;
+
     //- 병렬 pEqn: processor 패치 halo 교환 + 전역 리덕션 상태.
     //  bC(=+pGamma*gbc, OF boundaryCoeffs 규약)는 솔브마다 갱신,
     //  SpMV가 y[fc] -= bC*x_nbr 로 인터페이스 기여를 더한다
@@ -198,6 +204,10 @@ namespace
 
     void pFreeAll()
     {
+        // M4 스탬프 무효화 (버퍼 해제/재할당과 동기)
+        gPOldDecl = -1; gPOldDev = -2;
+        gRdtDecl = -1; gRdtDev = -2;
+
         int* ip[] = {gM.own, gM.nei, gM.bfc,
                      gM.dDiagSlot, gM.dUpSlot, gM.dLoSlot,
                      gM.dRowPtr, gM.dColInd,
@@ -1923,12 +1933,19 @@ namespace
         return 0;
     }
 
-    //- LTS rDeltaT 스테이징: null이면 null 유지(균일 dtInv)
+    //- LTS rDeltaT 스테이징: null이면 null 유지(균일 dtInv).
+    //  M4: 스텝-불변 스탬프가 일치하면 디바이스 잔존본 재사용(copy 모드)
     const double* stageRdt(const double* rdtH, cudaError_t* e)
     {
         *e = cudaSuccess;
         if (!rdtH) return nullptr;
-        return rgpInPtr(rdtH, gB.rdt, (size_t)gM.nCells, e);
+        if (gRgpUnified != 2 && gRdtDecl != -1 && gRdtDecl == gRdtDev)
+        {
+            return gB.rdt;
+        }
+        const double* p = rgpInPtr(rdtH, gB.rdt, (size_t)gM.nCells, e);
+        if (*e == cudaSuccess && gRgpUnified != 2) { gRdtDev = gRdtDecl; }
+        return p;
     }
 
     //- 조립 공통부 (업로드 + diag/upper/b 완성). 0=성공.
@@ -1958,8 +1975,17 @@ namespace
         const double* dPsis = psis
             ? rgpInPtr(psis, gB.psis, (size_t)nc, &e) : gPC.psis;
         if (e != cudaSuccess) return pfail(e, "peqn/H2D psis");
-        const double* dPOld = rgpInPtr(pOld, gB.pOld, (size_t)nc, &e);
-        if (e != cudaSuccess) return pfail(e, "peqn/H2D pOld");
+        const double* dPOld;
+        if (gRgpUnified != 2 && gPOldDecl != -1 && gPOldDecl == gPOldDev)
+        {
+            dPOld = gB.pOld;   // M4: 스텝-불변 — 디바이스 잔존본 재사용
+        }
+        else
+        {
+            dPOld = rgpInPtr(pOld, gB.pOld, (size_t)nc, &e);
+            if (e != cudaSuccess) return pfail(e, "peqn/H2D pOld");
+            if (gRgpUnified != 2) { gPOldDev = gPOldDecl; }
+        }
         const double* dPhi = phiInt
             ? rgpInPtr(phiInt, gB.phiInt, (size_t)nf, &e) : gPC.phiH;
         if (e != cudaSuccess) return pfail(e, "peqn/H2D phi");
@@ -2605,6 +2631,12 @@ int rgpPEqnParCoeffs(const double* bCoeffs)
     return 0;
 }
 
+
+void rgpPEqnInvarStamp(long pOldStamp, long rdtStamp)
+{
+    gPOldDecl = pOldStamp;
+    gRdtDecl = rdtStamp;
+}
 
 int rgpPEqnSetPrecon(int mode)
 {
@@ -4210,6 +4242,7 @@ int rgpUEqnPrep2
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
 
     cudaError_t e;
+    gPOldDev = -2;   // M4: gB.pOld를 현재 p 스크래치로 클로버 — 캐시 무효
     struct { double* d; const double* s; size_t n; } up[] =
     {
         {gB.pOld, pHost, (size_t)nc}, {gST.bPsi, pB, (size_t)nbf},
@@ -4728,6 +4761,7 @@ int rgpPCorrU(const double* pNew, const double* pB, double* U3out)
     const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
 
     cudaError_t e;
+    gPOldDev = -2;   // M4: gB.pOld를 p_new 스크래치로 클로버 — 캐시 무효
     if ((e = cudaMemcpy(gB.pOld, pNew, (size_t)nc*sizeof(double),
                         cudaMemcpyHostToDevice)) != cudaSuccess)
         return pfail(e, "pcorrU/H2D p");

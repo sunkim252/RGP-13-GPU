@@ -1074,6 +1074,13 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
                 rgpFgmHostCopySkip(2, nYtab);
             }
 
+            // M4: les(V^(2/3))·laminar(0)는 정적 메시에서 런-상수 —
+            // 재업로드 생략 선언 (RAS/동적 메시는 -1 = 매번 업로드)
+            rgpFgmLsqrStamp
+            (
+                (varModel_ != varModel::ras && !mesh.dynamic()) ? 0L : -1L
+            );
+
             const int rc = rgpFgmEvaluate
             (
                 nc, mode4,

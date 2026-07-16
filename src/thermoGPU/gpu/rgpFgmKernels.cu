@@ -48,6 +48,10 @@ namespace
     int gSkipFirst = 0;
     int gSkipN = 0;
 
+    // M4: Lsqr 스탬프 (Decl=호출측 선언, Dev=디바이스 잔존본; -1=항상
+    // 업로드). 버퍼 재할당·해제 시 무효화.
+    long gLsqrDecl = -1, gLsqrDev = -2;
+
     // Y-다이어트 부분 게더 상태 (경계-인접 셀 인덱스 + 압축 출력 버퍼)
     struct FgmRowGather
     {
@@ -75,6 +79,7 @@ namespace
         if (gRW.cells) { cudaFree(gRW.cells); }
         if (gRW.out)   { cudaFree(gRW.out); }
         gT = FgmDev(); gB = FgmBuf(); gRW = FgmRowGather();
+        gLsqrDecl = -1; gLsqrDev = -2;
     }
 }
 
@@ -436,6 +441,7 @@ int rgpFgmEvaluate
                 return ffail(rc, "fgm/buf");
         }
         gB.cap = nCells;
+        gLsqrDev = -2;   // M4: 재할당 → 잔존본 무효
     }
     const size_t need = (size_t)gT.nFields*nCells;
     if (gRgpUnified != 2 && gB.outCap < need)
@@ -453,8 +459,17 @@ int rgpFgmEvaluate
     if (rc != cudaSuccess) return ffail(rc, "fgm/in C");
     const double* dRho = rgpInPtr(rho, gB.rho, n1, &rc);
     if (rc != cudaSuccess) return ffail(rc, "fgm/in rho");
-    const double* dLsqr = rgpInPtr(Lsqr, gB.Lsqr, n1, &rc);
-    if (rc != cudaSuccess) return ffail(rc, "fgm/in Lsqr");
+    const double* dLsqr;
+    if (gRgpUnified != 2 && gLsqrDecl != -1 && gLsqrDecl == gLsqrDev)
+    {
+        dLsqr = gB.Lsqr;   // M4: 기하-불변(정적 메시 LES/laminar) 재사용
+    }
+    else
+    {
+        dLsqr = rgpInPtr(Lsqr, gB.Lsqr, n1, &rc);
+        if (rc != cudaSuccess) return ffail(rc, "fgm/in Lsqr");
+        if (gRgpUnified != 2) { gLsqrDev = gLsqrDecl; }
+    }
     const double* dMsg = rgpInPtr(magSqrGradZ, gB.msg, n1, &rc);
     if (rc != cudaSuccess) return ffail(rc, "fgm/in msg");
     const double* dDeff = rgpInPtr(DeffZ, gB.Deff, n1, &rc);
@@ -537,6 +552,11 @@ void rgpFgmHostCopySkip(int first, int n)
 {
     gSkipFirst = first > 0 ? first : 0;
     gSkipN = n > 0 ? n : 0;
+}
+
+void rgpFgmLsqrStamp(long stamp)
+{
+    gLsqrDecl = stamp;
 }
 
 int rgpFgmSetRowGather(const int* cells, int n)
