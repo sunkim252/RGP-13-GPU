@@ -61,6 +61,14 @@ namespace
         size_t cap = 0;
     } gRW;
 
+    // 경계 RG 채움 배치 버퍼 (좌표 4벌 in + 계수 out, grow-only)
+    struct FgmBndBatch
+    {
+        double* in = nullptr;    // [4][nFaces]
+        double* out = nullptr;   // [nOut][nFaces]
+        size_t capIn = 0, capOut = 0;
+    } gBC;
+
     void fgmFreeAll()
     {
         double** pt[] = {&gT.Zax,&gT.Gax,&gT.Cax,&gT.Kax,&gT.tables};
@@ -78,7 +86,10 @@ namespace
         for (auto p : pb) { if (*p) { cudaFree(*p); *p = nullptr; } }
         if (gRW.cells) { cudaFree(gRW.cells); }
         if (gRW.out)   { cudaFree(gRW.out); }
+        if (gBC.in)    { cudaFree(gBC.in); }
+        if (gBC.out)   { cudaFree(gBC.out); }
         gT = FgmDev(); gB = FgmBuf(); gRW = FgmRowGather();
+        gBC = FgmBndBatch();
         gLsqrDecl = -1; gLsqrDev = -2;
     }
 }
@@ -255,6 +266,118 @@ __global__ void fgmKernel
         outf[(size_t)f*nCells + celli] = v;
     }
 }
+
+//- 경계면 RG 채움(Opt-2) 배치: 경계 좌표에서 테이블 필드
+//  [firstF, firstF+nOut)를 16-코너 보간 (클램프·coord4는 fillRG CPU
+//  루프와 1:1, 스텐실·블렌드는 fgmKernel과 동일 산술 → 비트-동일)
+__global__ void fgmBndCoeffsK
+(
+    const int nFaces, const int bmode,
+    const double hOx, const double hFuel,
+    const double Wlo, const double Whi,
+    const int nZ, const int nG, const int nC, const int nK,
+    const double* __restrict__ Zax, const double* __restrict__ Gax,
+    const double* __restrict__ Cax, const double* __restrict__ Kax,
+    const int nFields, const double* __restrict__ tables,
+    const double* __restrict__ Zb, const double* __restrict__ gZb,
+    const double* __restrict__ Cb, const double* __restrict__ c4b,
+    const int firstF, const int nOut,
+    double* __restrict__ out
+)
+{
+    const int fi = blockIdx.x*blockDim.x + threadIdx.x;
+    if (fi >= nFaces) return;
+
+    // fillRG 루프의 클램프 순서 1:1
+    const double Zcl = fMax(fMin(Zb[fi], 1.0), 0.0);
+    const double gz  = fMin(fMax(gZb[fi], 0.0), 1.0);
+    const double Ccl = fMax(Cb[fi], 0.0);
+    double coord4 = c4b[fi];
+    if (bmode == 2)
+    {
+        coord4 = c4b[fi] - ((1.0 - Zcl)*hOx + Zcl*hFuel);
+    }
+    else if (bmode == 3)
+    {
+        coord4 = fMax(Wlo, fMin(Whi, c4b[fi]));
+    }
+
+    int iZ, iG, iC, iK;
+    double wZ, wG, wC, wK;
+    bracket(Zax, nZ, Zcl, iZ, wZ);
+    bracket(Gax, nG, gz, iG, wG);
+    bracket(Cax, nC, Ccl, iC, wC);
+    bracket(Kax, nK, coord4, iK, wK);
+    const int iZp = (nZ >= 2) ? (iZ + 1) : iZ;
+    const int iGp = (nG >= 2) ? (iG + 1) : iG;
+    const int iCp = (nC >= 2) ? (iC + 1) : iC;
+    const int iKp = (nK >= 2) ? (iK + 1) : iK;
+
+    size_t idx[16];
+    int m = 0;
+    for (int dK = 0; dK < 2; dK++)
+    {
+        const int k = dK ? iKp : iK;
+        for (int dC = 0; dC < 2; dC++)
+        {
+            const int c = dC ? iCp : iC;
+            for (int dG = 0; dG < 2; dG++)
+            {
+                const int g = dG ? iGp : iG;
+                for (int dZ = 0; dZ < 2; dZ++)
+                {
+                    const int z = dZ ? iZp : iZ;
+                    idx[m++] = (((size_t)z*nG + g)*nC + c)*nK + k;
+                }
+            }
+        }
+    }
+    size_t base[16];
+    for (int m2 = 0; m2 < 16; m2++)
+    {
+        base[m2] = idx[m2]*(size_t)nFields;
+    }
+
+    for (int f = 0; f < nOut; f++)
+    {
+        const int ff = firstF + f;
+        const double c0000 = tables[base[0]  + ff];
+        const double c1000 = tables[base[1]  + ff];
+        const double c0100 = tables[base[2]  + ff];
+        const double c1100 = tables[base[3]  + ff];
+        const double c0010 = tables[base[4]  + ff];
+        const double c1010 = tables[base[5]  + ff];
+        const double c0110 = tables[base[6]  + ff];
+        const double c1110 = tables[base[7]  + ff];
+        const double c0001 = tables[base[8]  + ff];
+        const double c1001 = tables[base[9]  + ff];
+        const double c0101 = tables[base[10] + ff];
+        const double c1101 = tables[base[11] + ff];
+        const double c0011 = tables[base[12] + ff];
+        const double c1011 = tables[base[13] + ff];
+        const double c0111 = tables[base[14] + ff];
+        const double c1111 = tables[base[15] + ff];
+
+        const double a00 = c0000*(1 - wZ) + c1000*wZ;
+        const double a10 = c0100*(1 - wZ) + c1100*wZ;
+        const double a01 = c0010*(1 - wZ) + c1010*wZ;
+        const double a11 = c0110*(1 - wZ) + c1110*wZ;
+        const double a0  = a00*(1 - wG) + a10*wG;
+        const double a1  = a01*(1 - wG) + a11*wG;
+        const double A   = a0*(1 - wC) + a1*wC;
+
+        const double b00 = c0001*(1 - wZ) + c1001*wZ;
+        const double b10 = c0101*(1 - wZ) + c1101*wZ;
+        const double b01 = c0011*(1 - wZ) + c1011*wZ;
+        const double b11 = c0111*(1 - wZ) + c1111*wZ;
+        const double b0  = b00*(1 - wG) + b10*wG;
+        const double b1  = b01*(1 - wG) + b11*wG;
+        const double B   = b0*(1 - wC) + b1*wC;
+
+        out[(size_t)f*nFaces + fi] = A*(1 - wK) + B*wK;
+    }
+}
+
 
 //- Y-다이어트: SoA의 필드 행 [firstField, firstField+nF)를 부분집합
 //  셀에서 압축 게더 (out 레이아웃 [nF][nSub] — 호스트 산포 루프 순서)
@@ -557,6 +680,70 @@ void rgpFgmHostCopySkip(int first, int n)
 void rgpFgmLsqrStamp(long stamp)
 {
     gLsqrDecl = stamp;
+}
+
+int rgpFgmBndCoeffs
+(
+    int nFaces, int bmode,
+    double hOx, double hFuel, double Wlo, double Whi,
+    const double* Zb, const double* gZb, const double* Cb,
+    const double* c4b,
+    int firstField, int nOut, double* hostOut
+)
+{
+    if (nFaces <= 0 || nOut <= 0) return 0;
+    if (!gT.tables)
+    {
+        snprintf(gFgmErr, sizeof(gFgmErr), "fgm/bnd: tables not uploaded");
+        return -1;
+    }
+
+    cudaError_t rc;
+    const size_t needIn = (size_t)4*nFaces*sizeof(double);
+    const size_t needOut = (size_t)nOut*nFaces*sizeof(double);
+    if (gBC.capIn < needIn)
+    {
+        if (gBC.in) { cudaFree(gBC.in); gBC.in = nullptr; gBC.capIn = 0; }
+        if ((rc = cudaMalloc(&gBC.in, needIn)) != cudaSuccess)
+            return ffail(rc, "fgm/bnd inMalloc");
+        gBC.capIn = needIn;
+    }
+    if (gBC.capOut < needOut)
+    {
+        if (gBC.out) { cudaFree(gBC.out); gBC.out = nullptr; gBC.capOut = 0; }
+        if ((rc = cudaMalloc(&gBC.out, needOut)) != cudaSuccess)
+            return ffail(rc, "fgm/bnd outMalloc");
+        gBC.capOut = needOut;
+    }
+
+    const size_t bF = (size_t)nFaces*sizeof(double);
+    struct { const double* s; int slot; } up[] =
+    {
+        {Zb, 0}, {gZb, 1}, {Cb, 2}, {c4b, 3}
+    };
+    for (auto& u : up)
+    {
+        if ((rc = cudaMemcpy(gBC.in + (size_t)u.slot*nFaces, u.s, bF,
+                             cudaMemcpyHostToDevice)) != cudaSuccess)
+            return ffail(rc, "fgm/bnd H2D");
+    }
+
+    constexpr int bs = 128;
+    rgpfgm::fgmBndCoeffsK<<<(nFaces + bs - 1)/bs, bs>>>
+    (
+        nFaces, bmode, hOx, hFuel, Wlo, Whi,
+        gT.nZ, gT.nG, gT.nC, gT.nK, gT.Zax, gT.Gax, gT.Cax, gT.Kax,
+        gT.nFields, gT.tables,
+        gBC.in, gBC.in + nFaces, gBC.in + 2*(size_t)nFaces,
+        gBC.in + 3*(size_t)nFaces,
+        firstField, nOut, gBC.out
+    );
+    if ((rc = cudaGetLastError()) != cudaSuccess)
+        return ffail(rc, "fgm/bnd launch");
+    if ((rc = cudaMemcpy(hostOut, gBC.out, needOut,
+                         cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return ffail(rc, "fgm/bnd D2H");
+    return 0;
 }
 
 int rgpFgmSetRowGather(const int* cells, int n)

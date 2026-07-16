@@ -257,6 +257,10 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
             gpuP_[off + fi] = pp[fi];
             gpuT_[off + fi] = Tp[fi];
         }
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) \
+        num_threads(Pstream::parRun() ? 1 : 4)
+        #endif
         for (label s = 0; s < n; s++)
         {
             const fvPatchScalarField& Yp = Y_[s].boundaryField()[patchi];
@@ -324,6 +328,10 @@ void Foam::solvers::fgmFluid::gpuThermoCorrect()
         scalarField& kappac = kappaT.primitiveFieldRef();
         scalarField& Cpc    = CpT.primitiveFieldRef();
         scalarField& Cvc    = CvT.primitiveFieldRef();
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) \
+        num_threads(Pstream::parRun() ? 1 : 4)
+        #endif
         for (label i = 0; i < nInt; i++)
         {
             rhoc[i]   = gpuRho_[i];
@@ -540,6 +548,10 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
             gpuP_[off + fi] = pp[fi];
             gpuT_[off + fi] = Tp[fi];
         }
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) \
+        num_threads(Pstream::parRun() ? 1 : 4)
+        #endif
         for (label s = 0; s < n; s++)
         {
             const fvPatchScalarField& Yp = Y_[s].boundaryField()[patchi];
@@ -588,6 +600,10 @@ void Foam::solvers::fgmFluid::gpuHeReseed()
     volScalarField& he = thermo_.he();
     {
         scalarField& hec = he.primitiveFieldRef();
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) \
+        num_threads(Pstream::parRun() ? 1 : 4)
+        #endif
         for (label i = 0; i < nInt; i++)
         {
             hec[i] = gpuCp_[i];

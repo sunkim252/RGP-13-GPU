@@ -330,6 +330,12 @@ protected:
         mutable labelList gpuYDietCells_;
         mutable List<double> gpuYDietBuf_;
 
+        //- 경계 RG 채움(Opt-2)의 GPU 배치 상태: -1 미검증(첫 호출에서
+        //  CPU 경로와 비트 자가검증), 1 GPU 확정, 0 CPU 폴백(검증 실패
+        //  또는 커널 오류). 버퍼는 [Z|gZ|C|c4|out(13)]×nbf 연접.
+        mutable int gpuBndCoeffMode_;
+        mutable List<double> gpuBndBuf_;
+
         //- 비동기 오버랩: UEqn 성분 솔브(rgpUEqnSolveRun)를 워커
         //  스레드로 돌리고 메인은 tp pre/updateManifold(fgm·thermo
         //  버퍼만 사용 — pEqn 스크래치와 분리)를 진행. U 소비 직전

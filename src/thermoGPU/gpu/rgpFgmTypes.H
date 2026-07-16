@@ -66,6 +66,21 @@ int rgpFgmGatherRows(int firstField, int nF, double* hostOut);
 int rgpFgmFetchFields(int firstField, int nF, double* hostOut);
 int rgpFgmHostCopyActive(void);
 
+/*  경계면 RG 계수 채움(Opt-2)의 GPU 배치: 경계 좌표(Z,gZ,C,c4src)에서
+    테이블 필드 [firstField, firstField+nOut)를 16-코너 보간해 내린다
+    (hostOut [nOut][nFaces]). 클램프·coord4 변환은 CPU fillRG 루프와
+    1:1 (bmode 0=c4 직접(chi), 2=h→dh, 3=W 클램프). 산술은 fgmKernel과
+    동일 디바이스 함수 — 호출측이 첫 호출에서 CPU 경로와 비트 비교로
+    자가검증할 것.                                                     */
+int rgpFgmBndCoeffs
+(
+    int nFaces, int bmode,
+    double hOx, double hFuel, double Wlo, double Whi,
+    const double* Zb, const double* gZb, const double* Cb,
+    const double* c4b,
+    int firstField, int nOut, double* hostOut
+);
+
 /*  M4: Lsqr(혼합길이²) 스탬프 — varModel les(순수 기하 V^(2/3))·laminar
     (0 상수)이고 정적 메시면 런-상수이므로, 같은 스탬프의 재업로드를
     생략하고 디바이스 잔존본을 재사용한다. -1=항상 업로드(RAS/동적

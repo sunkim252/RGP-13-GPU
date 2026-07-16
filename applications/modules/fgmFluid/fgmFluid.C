@@ -148,6 +148,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuManifoldYDiet_(fgmTable_.lookupOrDefault<Switch>("gpuManifoldYDiet", true)),
     gpuYDietArmed_(false),
     gpuHostYStale_(false),
+    gpuBndCoeffMode_(-1),
     gpuUEqnAsync_(fgmTable_.lookupOrDefault<Switch>("gpuUEqnAsync", false)),
     gpuUEqnPending_(false),
     gpuUEqnRc_(0),
@@ -1263,6 +1264,142 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
         const volScalarField::Boundary& gZbf  = gZ_.boundaryField();
         const volScalarField::Boundary& Cbf   = C_.boundaryField();
         const volScalarField::Boundary& chibf = chi_st_.boundaryField();
+
+        // Opt-2G: 경계 좌표 게더 → GPU 배치 보간(fgmKernel과 동일 산술)
+        // → 산포. 첫 호출에서 CPU 경로와 비트 자가검증하고, 실패·오류는
+        // 영구 CPU 폴백 (nvcc/gcc FMA 축약 차이가 이 코드 형태에선 안
+        // 나타남이 셀 경로 T-비트 게이트로 입증돼 있으나, 기계별 재확인).
+        bool gpuBnd =
+            gpuManifoldArmed_ && gpuDone && gpuBndCoeffMode_ != 0;
+        if (gpuBnd)
+        {
+            label nbfT = 0;
+            forAll(Zbf, patchi) { nbfT += Zbf[patchi].size(); }
+            const label nCo = RGcoeffFields_.size();
+            const int bmode = useH ? 2 : (useW ? 3 : 0);
+
+            if (gpuBndBuf_.size() < (4 + nCo)*nbfT)
+            {
+                gpuBndBuf_.setSize((4 + nCo)*nbfT);
+            }
+            double* Zb  = gpuBndBuf_.begin();
+            double* gZb = Zb + nbfT;
+            double* Cb  = gZb + nbfT;
+            double* c4b = Cb + nbfT;
+            double* outB = c4b + nbfT;
+
+            label off = 0;
+            forAll(Zbf, patchi)
+            {
+                const fvPatchScalarField& Zp   = Zbf[patchi];
+                const fvPatchScalarField& gZp  = gZbf[patchi];
+                const fvPatchScalarField& Cp   = Cbf[patchi];
+                const fvPatchScalarField& chip = chibf[patchi];
+                const scalarField* hp =
+                    useH ? &hPtr_->boundaryField()[patchi] : nullptr;
+                const scalarField* Wp =
+                    useW ? &WPtr_->boundaryField()[patchi] : nullptr;
+                forAll(Zp, fi)
+                {
+                    Zb[off + fi] = Zp[fi];
+                    gZb[off + fi] = gZp[fi];
+                    Cb[off + fi] = Cp[fi];
+                    c4b[off + fi] =
+                        useH ? (*hp)[fi] : (useW ? (*Wp)[fi] : chip[fi]);
+                }
+                off += Zp.size();
+            }
+
+            const int firstF = 2 + int(tabSpecieIDs_.size());
+            if
+            (
+                rgpFgmBndCoeffs
+                (
+                    int(nbfT), bmode, hOxb, hFuelb, Wlo, Whi,
+                    Zb, gZb, Cb, c4b, firstF, int(nCo), outB
+                ) != 0
+            )
+            {
+                WarningInFunction
+                    << "boundary RG batch failed (" << rgpFgmLastError()
+                    << ") -- permanent CPU fallback" << endl;
+                gpuBndCoeffMode_ = 0;
+                gpuBnd = false;
+            }
+            else if (gpuBndCoeffMode_ < 0)
+            {
+                // 자가검증: 앞 1024개 면을 CPU 경로로 재계산해 비트 비교
+                const label nChk = min(label(1024), nbfT);
+                bool ok = true;
+                for (label f2 = 0; f2 < nChk && ok; f2++)
+                {
+                    const scalar Zcl =
+                        max(min(Zb[f2], scalar(1)), scalar(0));
+                    const scalar gz =
+                        min(max(gZb[f2], scalar(0)), scalar(1));
+                    const scalar Ccl = max(Cb[f2], scalar(0));
+                    scalar coord4 = c4b[f2];
+                    if (useH)
+                    {
+                        coord4 =
+                            c4b[f2]
+                          - ((scalar(1) - Zcl)*hOxb + Zcl*hFuelb);
+                    }
+                    else if (useW)
+                    {
+                        coord4 = max(Wlo, min(Whi, c4b[f2]));
+                    }
+                    fgmTable_.interpolateRealGasCoeffs
+                    (
+                        Zcl, gz, Ccl, coord4, RGcoeffBuf_
+                    );
+                    forAll(RGcoeffFields_, k)
+                    {
+                        if (RGcoeffBuf_[k] != outB[k*nbfT + f2])
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (ok)
+                {
+                    gpuBndCoeffMode_ = 1;
+                    Info<< "fgmFluid: boundary RG coeffs on GPU ("
+                        << nChk << " faces bit-identical to CPU)"
+                        << nl << endl;
+                }
+                else
+                {
+                    WarningInFunction
+                        << "boundary RG GPU/CPU bit mismatch -- "
+                        << "permanent CPU fallback" << endl;
+                    gpuBndCoeffMode_ = 0;
+                    gpuBnd = false;
+                }
+            }
+
+            if (gpuBnd)
+            {
+                off = 0;
+                forAll(Zbf, patchi)
+                {
+                    const label np = Zbf[patchi].size();
+                    forAll(RGcoeffFields_, k)
+                    {
+                        fvPatchScalarField& cf =
+                            RGcoeffFields_[k].boundaryFieldRef()[patchi];
+                        for (label fi = 0; fi < np; fi++)
+                        {
+                            cf[fi] = outB[k*nbfT + off + fi];
+                        }
+                    }
+                    off += np;
+                }
+            }
+        }
+
+        if (!gpuBnd)
         forAll(Zbf, patchi)
         {
             const fvPatchScalarField& Zp   = Zbf[patchi];
