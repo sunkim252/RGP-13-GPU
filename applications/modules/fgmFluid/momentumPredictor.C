@@ -36,6 +36,8 @@ License
 #include "localEulerDdtScheme.H"
 #include "snGradScheme.H"
 #include "fvcDiv.H"
+#include "fvcSnGrad.H"
+#include "fvcReconstruct.H"
 #include "gpu/rgpPEqnTypes.H"
 
 // W7: SoA 게더/산포 병렬화 (순수 인덱싱 루프 한정)
@@ -783,6 +785,27 @@ void Foam::solvers::fgmFluid::momentumPredictor()
               ? 1 : 0;
         }
 
+        // balanced-force: 면-재구성 압력구배를 호스트에서 계산해 gradP3
+        // 훅으로 업로드 — 디바이스 자체 Gauss grad(p)(Prep2 잔존본)를
+        // 대체. snGrad는 케이스 스킴(limited corrected)이라 pEqn
+        // 라플라시안 플럭스와 면-일관.
+        if (pGradRecon_)
+        {
+            const volVectorField gradPRec
+            (
+                fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+            );
+            const vectorField& gp = gradPRec.primitiveField();
+            gpuGradReconBuf_.setSize(3*nc);
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    gpuGradReconBuf_[k*nc + i] = gp[i][k];
+                }
+            }
+        }
+
         const int rcP = rgpUEqnSolvePrep
         (
             LTS ? 1.0 : 1.0/runTime.deltaTValue(),
@@ -800,7 +823,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             nullptr /*srcExp3*/,
             (tsrcBulk.valid() || tCorrU.valid())
           ? srcX3 : nullptr /*LAD-bulk + 비직교 보정*/,
-            nullptr /*gradP3*/,
+            pGradRecon_ ? gpuGradReconBuf_.begin() : nullptr /*gradP3*/,
             bDiag3, bSrc3,
             relaxAlpha,
             relaxAlpha > 0 ? bRelaxA.begin() : nullptr
@@ -921,11 +944,25 @@ void Foam::solvers::fgmFluid::momentumPredictor()
     {
         if (buoyancy.valid())
         {
+            if (pGradRecon_)
+            {
+                FatalErrorInFunction
+                    << "pGradRecon is not supported with buoyancy "
+                    << "(netForce path)" << exit(FatalError);
+            }
             solve
             (
                 UEqn
              ==
                 netForce()
+            );
+        }
+        else if (pGradRecon_)
+        {
+            // balanced-force: pEqn 플럭스와 면-일관인 재구성 구배
+            solve
+            (
+                UEqn == -fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
             );
         }
         else

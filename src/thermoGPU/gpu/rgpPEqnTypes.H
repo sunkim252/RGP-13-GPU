@@ -278,6 +278,12 @@ int rgpPEqnFinish2
 );
 int rgpPCorrU(const double* pNew, const double* pB, double* U3out);
 
+/*  balanced-force 변형: 호스트가 계산한 재구성 압력구배
+    reconstruct(snGrad(p)*magSf) [3nc SoA]를 업로드해 디바이스
+    pcUUpdate(U = HbyA − rAU*grad)만 수행. 디바이스 grad 커널·pB
+    스테이징 생략, gB.pOld 비접촉(M4 스탬프 보존).                    */
+int rgpPCorrUHostGrad(const double* grad3, double* U3out);
+
 /*  fvc::div(phi, q) — 직전 rgpSTWeights*가 준비한 multivariate
     가중치로 내부면·경계면 flux-div, 결과는 per-volume [nc] (D2H).
     mvConvection->fvcDiv(phi, q)와 1:1 (결합 min-리미터는 임의 필드에

@@ -4875,6 +4875,31 @@ int rgpPCorrU(const double* pNew, const double* pB, double* U3out)
 }
 
 
+//- balanced-force 변형: 호스트 재구성 구배(reconstruct(snGrad(p)*magSf),
+//  케이스 snGrad 스킴 그대로 — pEqn 라플라시안 플럭스와 면-일관)를
+//  업로드해 pcUUpdate만 수행. 디바이스 grad 커널·pB 스테이징 생략,
+//  gB.pOld 비접촉이라 M4 pOld 스탬프도 보존된다.
+int rgpPCorrUHostGrad(const double* grad3, double* U3out)
+{
+    const int nc = gM.nCells;
+
+    cudaError_t e;
+    if ((e = cudaMemcpy(gU.gradP, grad3, (size_t)3*nc*sizeof(double),
+                        cudaMemcpyHostToDevice)) != cudaSuccess)
+        return pfail(e, "pcorrUHG/H2D grad");
+
+    rgppeqn::pcUUpdate<<<nb(nc), BS>>>
+        (nc, gU.HbyA3, gU.rAU, gU.gradP, gU.src3);
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "pcorrUHG/launch");
+
+    if ((e = cudaMemcpy(U3out, gU.src3, (size_t)3*nc*sizeof(double),
+                        cudaMemcpyDeviceToHost)) != cudaSuccess)
+        return pfail(e, "pcorrUHG/D2H U");
+    return 0;
+}
+
+
 void rgpPEqnFree(void) { pFreeAll(); }
 
 const char* rgpPEqnLastError(void) { return gPErr; }

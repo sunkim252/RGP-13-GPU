@@ -2340,6 +2340,44 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         }
         double* pB = gpuUBuf_.begin() + 15*nc + 3*nbf;   // pB 슬롯 재사용
         double* U3out = gpuUBuf_.begin() + 6*nc;
+        if (pGradRecon_)
+        {
+            // balanced-force: 호스트 재구성 구배(케이스 snGrad 스킴 —
+            // pEqn 라플라시안 플럭스와 면-일관)를 업로드해 디바이스
+            // pcUUpdate만 수행. pB 스테이징 불필요, gB.pOld 비접촉
+            // (M4 스탬프 무효화 없음 — 기존 경로보다 엄격히 안전)
+            const volVectorField gradPRec
+            (
+                fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+            );
+            const vectorField& gp = gradPRec.primitiveField();
+            gpuGradReconBuf_.setSize(3*nc);
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    gpuGradReconBuf_[k*nc + i] = gp[i][k];
+                }
+            }
+            if (rgpPCorrUHostGrad(gpuGradReconBuf_.begin(), U3out))
+            {
+                FatalErrorInFunction
+                    << "rgpPCorrUHostGrad: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+            vectorField& Uc = U.primitiveFieldRef();
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
+                {
+                    if (mesh.solutionD()[k] == 1)
+                    {
+                        Uc[i][k] = U3out[k*nc + i];
+                    }
+                }
+            }
+        }
+        else
         {
             label off = 0;
             forAll(p.boundaryField(), patchi)
@@ -2367,24 +2405,30 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 }
                 off += pbf.size();
             }
-        }
-        if (rgpPCorrU(p.primitiveField().begin(), pB, U3out))
-        {
-            FatalErrorInFunction
-                << "rgpPCorrU: " << rgpPEqnLastError()
-                << exit(FatalError);
-        }
-        vectorField& Uc = U.primitiveFieldRef();
-        for (label i = 0; i < nc; i++)
-        {
-            for (label k = 0; k < 3; k++)
+
+            if (rgpPCorrU(p.primitiveField().begin(), pB, U3out))
             {
-                if (mesh.solutionD()[k] == 1)
+                FatalErrorInFunction
+                    << "rgpPCorrU: " << rgpPEqnLastError()
+                    << exit(FatalError);
+            }
+            vectorField& Uc = U.primitiveFieldRef();
+            for (label i = 0; i < nc; i++)
+            {
+                for (label k = 0; k < 3; k++)
                 {
-                    Uc[i][k] = U3out[k*nc + i];
+                    if (mesh.solutionD()[k] == 1)
+                    {
+                        Uc[i][k] = U3out[k*nc + i];
+                    }
                 }
             }
         }
+    }
+    else if (pGradRecon_)
+    {
+        // balanced-force: pEqn 플럭스와 면-일관인 재구성 구배
+        U = HbyA - rAAtU*fvc::reconstruct(fvc::snGrad(p)*mesh.magSf());
     }
     else
     {

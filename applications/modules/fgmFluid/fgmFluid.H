@@ -266,6 +266,16 @@ protected:
         Switch gpuUEqn_;
         mutable List<double> gpuUBuf_;    // SoA/경계 스테이징
 
+        //- balanced-force 압력구배: 셀 grad(p) 대신 면-재구성
+        //  reconstruct(snGrad(p)*magSf)를 모멘텀 소스와 pCorr U-보정에
+        //  사용 (VOF 계열 대밀도비 표준 — pEqn 라플라시안 플럭스와
+        //  면-일관 이산화). snGrad는 케이스 스킴(limited corrected)
+        //  그대로 호스트에서 계산 — GPU는 완성된 셀 필드만 소비
+        //  (UEqn: gradP3 훅 / pCorr: rgpPCorrUHostGrad).
+        //  'pGradRecon on;' (fgmProperties, 기본 off)
+        Switch pGradRecon_;
+        mutable List<double> gpuGradReconBuf_;   // [3nc] SoA 재사용 버퍼
+
         //- 호스트 버퍼/필드 page-lock 등록 완료 플래그 (스텝 2에서
         //  1회 — 모든 grow-only 버퍼가 최종 크기에 도달한 뒤)
         mutable bool gpuPinned_;

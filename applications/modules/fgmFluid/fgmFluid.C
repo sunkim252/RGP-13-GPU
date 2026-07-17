@@ -138,6 +138,7 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuZC_(fgmTable_.lookupOrDefault<Switch>("gpuZC", false)),
     gpuZCArmed_(false),
     gpuUEqn_(fgmTable_.lookupOrDefault<Switch>("gpuUEqn", false)),
+    pGradRecon_(fgmTable_.lookupOrDefault<Switch>("pGradRecon", false)),
     gpuPinned_(false),
     gpuMeshCells_(-1),
     gpuMeshFaces_(-1),
@@ -215,6 +216,13 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
         << "    Lewis numbers: " << Le_ << nl
         << "    control variables Z, C transported; thermo from FGM "
         << "composition + real-fluid EOS" << nl << endl;
+
+    if (pGradRecon_)
+    {
+        Info<< "fgmFluid: balanced-force pressure gradient ON -- "
+            << "momentum/pCorr use fvc::reconstruct(snGrad(p)*magSf)"
+            << nl << endl;
+    }
 
     // Auto-select the mixture-fraction variance closure from the momentum-
     // transport "simulationType" so the same FGM table serves LES (subgrid
