@@ -223,6 +223,21 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
         << "    control variables Z, C transported; thermo from FGM "
         << "composition + real-fluid EOS" << nl << endl;
 
+    // CPU-트리 호환: PIMPLE 딕셔너리의 faceGradP(동일 balanced-force,
+    // upstream 41b3300)를 pGradRecon 앨리어스로 흡수 — GPU 분기까지
+    // 일관 적용. (CPU-트리와 달리 아밍 구조상 스텝별 토글은 미지원 —
+    // 시작 시 1회 결정)
+    if
+    (
+        !pGradRecon_
+     && pimple.dict().lookupOrDefault<Switch>("faceGradP", false)
+    )
+    {
+        pGradRecon_ = true;
+        Info<< "fgmFluid: faceGradP (PIMPLE dict) -> pGradRecon alias"
+            << nl << endl;
+    }
+
     if (pGradRecon_)
     {
         Info<< "fgmFluid: balanced-force pressure gradient ON -- "

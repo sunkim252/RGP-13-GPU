@@ -28,6 +28,8 @@ License
 #include "fvmLaplacian.H"
 #include "fvcGrad.H"
 #include "fvcDiv.H"
+#include "fvcSnGrad.H"
+#include "fvcReconstruct.H"
 #include "zeroGradientFvPatchFields.H"
 #include "limitedSurfaceInterpolationScheme.H"
 #include "solutionControl.H"
@@ -973,7 +975,26 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         }
         else
         {
-            solve(UEqn == -fvc::grad(p));
+            // faceGradP: face-consistent pressure gradient in the momentum
+            // predictor, matching the pressureCorrector's balanced-force cell
+            // velocity update (see pressureCorrector.C). Default off.
+            const Switch faceGradP
+            (
+                pimple.dict().lookupOrDefault<Switch>("faceGradP", false)
+            );
+            if (faceGradP)
+            {
+                solve
+                (
+                    UEqn
+                 ==
+                   -fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+                );
+            }
+            else
+            {
+                solve(UEqn == -fvc::grad(p));
+            }
         }
 
         fvConstraints().constrain(U);
