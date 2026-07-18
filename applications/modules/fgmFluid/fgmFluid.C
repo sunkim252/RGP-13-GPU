@@ -727,9 +727,15 @@ Foam::solvers::fgmFluid::varianceLengthSqr()
             forAll(Lsqr, celli)
             {
                 // L^2 = (k^(3/2)/epsilon)^2 = k^3 / epsilon^2
+                // Cap L at a physical integral scale: with only the SMALL floor
+                // on epsilon, a near-zero epsilon (fresh RAS start, laminarising
+                // cell) makes L^2 = k^3/SMALL explode to non-physical values
+                // (L ~ 1e6 m), which drives Zvar/gZ out of the manifold bounds
+                // and FPEs downstream. Clip L to LmaxRAS (~ chamber scale).
+                const scalar LmaxRAS = 0.05; // m
                 const scalar kc = max(k[celli], scalar(0));
                 const scalar e2 = max(sqr(epsilon[celli]), SMALL);
-                Lsqr[celli] = pow3(kc)/e2;
+                Lsqr[celli] = min(pow3(kc)/e2, sqr(LmaxRAS));
             }
             break;
         }

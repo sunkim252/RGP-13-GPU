@@ -25,6 +25,7 @@ License
 
 #include "fgmFluid.H"
 #include "fvcSmooth.H"
+#include "upwind.H"
 
 // * * * * * * * * * * * * * Private Member Functions  * * * * * * * * * * * //
 
@@ -59,8 +60,38 @@ void Foam::solvers::fgmFluid::setRDeltaT()
             pimpleDict.lookupOrDefault<Switch>("volumetricCourant", false)
         );
 
+        // Density-consistent (upwind) volumetric Courant. The plain
+        // 'volumetricCourant' divides the mass flux phi by the LINEAR-
+        // interpolated face density rhof; but phi carries the UPWIND density,
+        // so at a sharp transcritical LOX/gas contact (rho 18 <-> 1343) the
+        // two disagree and phi/rhof retains an O(rho_ratio) over-restriction
+        // (measured maxCo_eff ~ 0.001 at the tangential-injection interface
+        // vs the target 0.2). Dividing by the UPWIND density instead gives
+        // phi/rho_up = the true kinematic face volumetric flux |U_f| A,
+        // removing the density-contrast amplification. Switch
+        // 'densityConsistentCourant' (default off), read each step.
+        const Switch densityConsistentCourant
+        (
+            pimpleDict.lookupOrDefault<Switch>("densityConsistentCourant", false)
+        );
+
         // Set the reciprocal time-step from the local Courant number
-        if (volumetricCourant)
+        if (densityConsistentCourant)
+        {
+            // Upwind face density (consistent with the density carried by the
+            // mass flux phi). Floored to guard a corrupted/near-zero rho.
+            const surfaceScalarField rhoUp
+            (
+                max
+                (
+                    upwind<scalar>(mesh, phi).interpolate(rho_),
+                    dimensionedScalar(dimDensity, scalar(1e-2))
+                )
+            );
+            rDeltaT.internalFieldRef() =
+                fvc::surfaceSum(mag(phi)/rhoUp)/((2*maxCo)*mesh.V());
+        }
+        else if (volumetricCourant)
         {
             // Face density floored: a corrupted/near-zero rho would make
             // the volumetric flux blow up (guard, not a physics clamp).
