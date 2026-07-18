@@ -210,10 +210,11 @@ inline Foam::scalar Foam::SRKGas<Specie>::rho
 template<class Specie>
 inline Foam::scalar Foam::SRKGas<Specie>::h
 (
-    const scalar p,
+    scalar p,
     const scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
     if (B <= 0)
     {
@@ -250,6 +251,7 @@ inline Foam::scalar Foam::SRKGas<Specie>::Cp
     scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     const scalar sqrtT = sqrt(T);
     const scalar aAlpha = coef1_ - coef2_*sqrtT + coef3_*T;
     const scalar daAlpha = -coef2_/(2*sqrtT) + coef3_;
@@ -280,10 +282,11 @@ inline Foam::scalar Foam::SRKGas<Specie>::Cp
 template<class Specie>
 inline Foam::scalar Foam::SRKGas<Specie>::e
 (
-    const scalar p,
+    scalar p,
     const scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     // e_departure = h_departure without the (Z-1) ideal-gas PV work term
     // Following the PengRobinsonGas pattern: e = h - RR*T*(Z-1)/W
     scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
@@ -320,6 +323,7 @@ inline Foam::scalar Foam::SRKGas<Specie>::Cv
     scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     // Cv = Cp - CpMCv, inline both to share a single Z(p,T) solve
     const scalar sqrtT = sqrt(T);
     const scalar aAlpha = coef1_ - coef2_*sqrtT + coef3_*T;
@@ -360,10 +364,11 @@ inline Foam::scalar Foam::SRKGas<Specie>::Cv
 template<class Specie>
 inline Foam::scalar Foam::SRKGas<Specie>::sp
 (
-    const scalar p,
+    scalar p,
     const scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     const scalar daAlpha = -coef2_/(2*sqrt(T)) + coef3_;
     scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
     if (B <= 0)
@@ -434,6 +439,8 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
     scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor at the root solver: the (p,T) cache
+    // key and every caller's B then use the same floored p (see rho()).
     // Tier-1: reuse the cubic root if (p,T) unchanged since the last solve
     // (rho/psi/Cp/mu/kappa all query Z at the same cell state).
     if (p == pZcache_ && T == TZcache_)
@@ -561,6 +568,7 @@ inline Foam::scalar Foam::SRKGas<Specie>::CpMCv
     scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     const scalar aAlpha = coef1_ - coef2_*sqrt(T) + coef3_*T;
     const scalar daAlpha = -coef2_/(2*sqrt(T)) + coef3_;
 
@@ -607,10 +615,11 @@ inline Foam::scalar Foam::SRKGas<Specie>::alphav
 template<class Specie>
 inline Foam::scalar Foam::SRKGas<Specie>::c2
 (
-    const scalar p,
+    scalar p,
     const scalar T
 ) const
 {
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     // Explicit speed of sound squared from Oefelein (AIAA 2019-0634) Eqs.
     // (88)-(91):
     //   c^2 = gamma * R * T / (Zp / Z)

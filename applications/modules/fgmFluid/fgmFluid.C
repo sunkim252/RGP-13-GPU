@@ -122,6 +122,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
 
     armedNCells_(-1),
 
+    armedYData_(nullptr),
+
     tabLewis_(false),
 
     gpuThermo_(fgmTable_.lookupOrDefault<Switch>("gpuThermo", false)),
@@ -592,11 +594,14 @@ void Foam::solvers::fgmFluid::setupRealGasCoeffTabulation()
         << "the O(n^2) calculateRealGas pair sum is skipped on internal cells"
         << nl << endl;
 
-    // Record the cell count the lookup was armed for. updateManifold() re-arms
-    // the cached mixture field pointers whenever mesh.nCells() later differs
-    // from this (a runtime redistribution / AMR refinement reallocates the
-    // fields, invalidating the address-range cell recovery in calcMixture).
+    // Record the cell count AND the Y_[0] data pointer the lookup was armed for.
+    // updateManifold() re-arms the cached mixture field pointers whenever either
+    // changes -- a runtime redistribution / AMR refinement reallocates the
+    // fields (invalidating the address-range cell recovery in calcMixture), and
+    // an equal-count redistribution moves the data pointer without changing the
+    // count, which the nCells guard alone would miss.
     armedNCells_ = mesh.nCells();
+    armedYData_ = Y_[0].primitiveField().begin();
 }
 
 
@@ -743,18 +748,28 @@ Foam::solvers::fgmFluid::varianceLengthSqr()
 void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
 {
     // Re-arm the Tier-2 tabulated real-gas coefficient lookup if the mesh cell
-    // count changed since it was last armed (runtime redistribution or AMR
-    // refinement reallocated the fields, invalidating the mixture's cached
-    // address-range cell recovery). Must run before any cell mixture is
-    // evaluated below. A no-op guard on a mesh that did not change, so the
-    // default (non-distributor) path stays bit-identical.
-    if (tabRealGasCoeffs_ && armedNCells_ != mesh.nCells())
+    // count changed OR the Y_[0] internal-field storage moved since it was last
+    // armed (runtime redistribution or AMR refinement reallocates the fields,
+    // invalidating the mixture's cached address-range cell recovery). The data-
+    // pointer test also catches an equal-count redistribution that the nCells
+    // guard alone would miss. Must run before any cell mixture is evaluated
+    // below. A no-op guard on a mesh that did not change, so the default
+    // (non-distributor) path stays bit-identical.
+    if
+    (
+        tabRealGasCoeffs_
+     && (
+            armedNCells_ != mesh.nCells()
+         || Y_[0].primitiveField().begin() != armedYData_
+        )
+    )
     {
         rearmRealGasCoeffTabulation();
         armedNCells_ = mesh.nCells();
+        armedYData_ = Y_[0].primitiveField().begin();
 
-        // 리뷰 F3: 셀 수 변경 시 Y-diet 경계-소유 셀 목록도 stale —
-        // 재아밍 강제 (옛 라벨 게더/산포는 OOB·오염)
+        // 리뷰 F3: 셀 수/스토리지 변경 시 Y-diet 경계-소유 셀 목록도
+        // stale — 재아밍 강제 (옛 라벨 게더/산포는 OOB·오염)
         gpuYDietArmed_ = false;
     }
 
