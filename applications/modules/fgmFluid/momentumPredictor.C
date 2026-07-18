@@ -785,23 +785,28 @@ void Foam::solvers::fgmFluid::momentumPredictor()
               ? 1 : 0;
         }
 
-        // balanced-force: 면-재구성 압력구배를 호스트에서 계산해 gradP3
-        // 훅으로 업로드 — 디바이스 자체 Gauss grad(p)(Prep2 잔존본)를
-        // 대체. snGrad는 케이스 스킴(limited corrected)이라 pEqn
-        // 라플라시안 플럭스와 면-일관.
+        // balanced-force: 면-재구성 압력구배 — 디바이스 recon 우선
+        // (gU.gradP 상주 → gradP3=nullptr로 소비), 강등 시 호스트 계산
+        // 후 gradP3 훅 업로드. snGrad는 케이스 스킴(limited corrected)
+        // 이라 pEqn 라플라시안 플럭스와 면-일관.
+        bool reconOnDevice = false;
         if (pGradRecon_)
         {
-            const volVectorField gradPRec
-            (
-                fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
-            );
-            const vectorField& gp = gradPRec.primitiveField();
-            gpuGradReconBuf_.setSize(3*nc);
-            for (label i = 0; i < nc; i++)
+            reconOnDevice = deviceReconGrad(false, nullptr);
+            if (!reconOnDevice)
             {
-                for (label k = 0; k < 3; k++)
+                const volVectorField gradPRec
+                (
+                    fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+                );
+                const vectorField& gp = gradPRec.primitiveField();
+                gpuGradReconBuf_.setSize(3*nc);
+                for (label i = 0; i < nc; i++)
                 {
-                    gpuGradReconBuf_[k*nc + i] = gp[i][k];
+                    for (label k = 0; k < 3; k++)
+                    {
+                        gpuGradReconBuf_[k*nc + i] = gp[i][k];
+                    }
                 }
             }
         }
@@ -823,7 +828,8 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             nullptr /*srcExp3*/,
             (tsrcBulk.valid() || tCorrU.valid())
           ? srcX3 : nullptr /*LAD-bulk + 비직교 보정*/,
-            pGradRecon_ ? gpuGradReconBuf_.begin() : nullptr /*gradP3*/,
+            (pGradRecon_ && !reconOnDevice)
+          ? gpuGradReconBuf_.begin() : nullptr /*gradP3*/,
             bDiag3, bSrc3,
             relaxAlpha,
             relaxAlpha > 0 ? bRelaxA.begin() : nullptr

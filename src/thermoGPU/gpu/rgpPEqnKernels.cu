@@ -142,7 +142,13 @@ namespace
                                    // mesh.magSf() 1회 업로드 — sqrt ULP 회피)
         int resLoaded = 0;   // kf/Cf는 첫 Prep에서 lazy 업로드
         int resTried = 0;    // 캐시 할당 판단(첫 Prep) 완료 여부
+        double *bMsf = nullptr;    // [nbf] 경계 magSf (recon SfHat용)
+        int reconArmed = 0;        // pGradRecon 디바이스 경로 아밍
     } gNO;
+
+    //- pGradRecon 디바이스 활성 시 rgpUEqnPrep2의 자체 Gauss grad(p)
+    //  생략 플래그 (recon이 gU.gradP를 직후 재기록 — 생략은 순수 절약)
+    static int gReconSkipPrep2 = 0;
 
     struct PBuf
     {
@@ -253,7 +259,7 @@ namespace
             &gPC.rhoOld, &gPC.Uold3, &gPC.phiOld,
             &gNO.bCorr, &gNO.CfB3, &gNO.ownStage, &gNO.ownC3,
             &gNO.resKf, &gNO.resCf, &gNO.resC3, &gNO.resDcs,
-            &gNO.magSf
+            &gNO.magSf, &gNO.bMsf
         };
         for (auto p : dp) { if (*p) { cudaFree(*p); *p = nullptr; } }
         gNO.hDcs.clear();
@@ -262,6 +268,8 @@ namespace
         gNO.mdK = -1;
         gNO.resLoaded = 0;
         gNO.resTried = 0;
+        gNO.reconArmed = 0;
+        gReconSkipPrep2 = 0;
 
         int* dic_i[] = {gDIC.colorOf, gDIC.colCells,
                         gDIC.fwdFace, gDIC.bwdFace};
@@ -1907,6 +1915,121 @@ __global__ void uDivV
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= nc) return;
     H[i] /= V[i];
+}
+
+
+//- pGradRecon: 내부면 ssf = snGrad(limited corrected)(p)*magSf —
+//  noFaceCorr와 동일 리미터 산술에 직교부(snGO)를 더하고 gMsf 대신
+//  magSf를 곱한다 (fvc::snGrad(p)*magSf 1:1)
+__global__ void bfSsfK
+(
+    const int nf, const int nc,
+    const int* __restrict__ own, const int* __restrict__ nei,
+    const double* __restrict__ wLin,
+    const double* __restrict__ kfx, const double* __restrict__ kfy,
+    const double* __restrict__ kfz,
+    const double* __restrict__ dcs,
+    const double* __restrict__ x, const double* __restrict__ msf,
+    const double* __restrict__ g3,
+    const double limitCoeff,
+    double* __restrict__ ssf
+)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nf) return;
+    const int o = own[f], n = nei[f];
+    const double w = wLin[f];
+    const double g0 = w*(g3[o] - g3[n]) + g3[n];
+    const double g1 =
+        w*(g3[(size_t)nc + o] - g3[(size_t)nc + n]) + g3[(size_t)nc + n];
+    const double g2 =
+        w*(g3[(size_t)2*nc + o] - g3[(size_t)2*nc + n])
+      + g3[(size_t)2*nc + n];
+    const double corr = kfx[f]*g0 + kfy[f]*g1 + kfz[f]*g2;
+
+    const double snGO = dcs[f]*(x[n] - x[o]);
+    double lim = 1.0;
+    if (limitCoeff >= 0.0)
+    {
+        const double a =
+            limitCoeff*fabs(snGO)
+           /((1.0 - limitCoeff)*fabs(corr) + 1e-15);
+        lim = (a < 1.0) ? a : 1.0;
+    }
+    ssf[f] = (snGO + lim*corr)*msf[f];
+}
+
+
+//- pGradRecon: 셀별 결정론 CSR 게더로
+//  recon = inv(surfaceSum(SfHat*Sf)) & surfaceSum(SfHat*ssf).
+//  surfaceSum은 부호 없는 합(1:1) — SfHat⊗Sf·SfHat·ssf 모두 짝수 대칭.
+//  inv/det는 OF TensorI.H 전사(성분·연산 순서 1:1, adjugate/det 성분별
+//  나눗셈), &는 행-우선 내적.
+__global__ void bfReconK
+(
+    const int nc, const int nf, const int nbf,
+    const int* __restrict__ cfPtr, const int* __restrict__ cfIdx,
+    const double* __restrict__ sf, const double* __restrict__ bSf,
+    const double* __restrict__ msf, const double* __restrict__ bMsf,
+    const double* __restrict__ ssf, const double* __restrict__ bSsf,
+    double* __restrict__ out3
+)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    double txx = 0.0, txy = 0.0, txz = 0.0;
+    double tyx = 0.0, tyy = 0.0, tyz = 0.0;
+    double tzx = 0.0, tzy = 0.0, tzz = 0.0;
+    double bx = 0.0, by = 0.0, bz = 0.0;
+    for (int j = cfPtr[c]; j < cfPtr[c + 1]; j++)
+    {
+        const int idx = cfIdx[j] >> 1;
+        if (idx < nf)
+        {
+            const double sx = sf[idx];
+            const double sy = sf[(size_t)nf + idx];
+            const double sz = sf[(size_t)2*nf + idx];
+            const double m = msf[idx];
+            const double hx = sx/m, hy = sy/m, hz = sz/m;
+            txx += hx*sx; txy += hx*sy; txz += hx*sz;
+            tyx += hy*sx; tyy += hy*sy; tyz += hy*sz;
+            tzx += hz*sx; tzy += hz*sy; tzz += hz*sz;
+            const double v = ssf[idx];
+            bx += hx*v; by += hy*v; bz += hz*v;
+        }
+        else
+        {
+            const int k = idx - nf;
+            const double sx = bSf[k];
+            const double sy = bSf[(size_t)nbf + k];
+            const double sz = bSf[(size_t)2*nbf + k];
+            const double m = bMsf[k];
+            const double hx = sx/m, hy = sy/m, hz = sz/m;
+            txx += hx*sx; txy += hx*sy; txz += hx*sz;
+            tyx += hy*sx; tyy += hy*sy; tyz += hy*sz;
+            tzx += hz*sx; tzy += hz*sy; tzz += hz*sz;
+            const double v = bSsf[k];
+            bx += hx*v; by += hy*v; bz += hz*v;
+        }
+    }
+    // det(t) — OF TensorI.H 순서 그대로
+    const double dett =
+        txx*tyy*tzz + txy*tyz*tzx
+      + txz*tyx*tzy - txx*tyz*tzy
+      - txy*tyx*tzz - txz*tyy*tzx;
+    // inv(t, dett) adjugate — 성분식·성분별 /dett (operator/ 1:1)
+    const double ixx = (tyy*tzz - tzy*tyz)/dett;
+    const double ixy = (txz*tzy - txy*tzz)/dett;
+    const double ixz = (txy*tyz - txz*tyy)/dett;
+    const double iyx = (tzx*tyz - tyx*tzz)/dett;
+    const double iyy = (txx*tzz - txz*tzx)/dett;
+    const double iyz = (tyx*txz - txx*tyz)/dett;
+    const double izx = (tyx*tzy - tyy*tzx)/dett;
+    const double izy = (txy*tzx - txx*tzy)/dett;
+    const double izz = (txx*tyy - tyx*txy)/dett;
+    out3[c]                = ixx*bx + ixy*by + ixz*bz;
+    out3[(size_t)nc + c]   = iyx*bx + iyy*by + iyz*bz;
+    out3[(size_t)2*nc + c] = izx*bx + izy*by + izz*bz;
 }
 
 } // namespace rgppeqn
@@ -4164,6 +4287,249 @@ int rgpPEqnNOCorrFinish
 }
 
 
+//- pGradRecon 디바이스 아밍: magSf(내부)·bMsf(경계) 상주 + VRAM
+//  프리플라이트. 실패 -2 = 호스트 recon 강등 (기능 동일).
+int rgpPGradReconArm(const double* magSf, const double* bMagSf)
+{
+    const int nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gNO.armed || !gSTM.cfPtr)
+    {
+        snprintf(gPErr, sizeof(gPErr), "reconArm: NO/CSR not armed");
+        return -1;
+    }
+    cudaError_t e;
+    size_t freeB = 0, totB = 0;
+    const size_t need =
+        ((gNO.magSf ? 0 : (size_t)nf) + (size_t)nbf
+         + (gNO.ownC3 || gNO.resC3 ? 0 : (size_t)3*gM.nCells))
+       *sizeof(double);
+    if (cudaMemGetInfo(&freeB, &totB) != cudaSuccess
+     || freeB < need + (size_t)256*1024*1024)
+    {
+        snprintf(gPErr, sizeof(gPErr), "reconArm: VRAM preflight");
+        return -2;
+    }
+    if (!gNO.magSf)
+    {
+        if ((e = cudaMalloc(&gNO.magSf, (size_t)nf*sizeof(double)))
+            != cudaSuccess) return pfail(e, "reconArm/magSf malloc");
+        if ((e = cudaMemcpy(gNO.magSf, magSf, (size_t)nf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "reconArm/magSf H2D");
+    }
+    if (nbf > 0 && !gNO.bMsf)
+    {
+        if ((e = cudaMalloc(&gNO.bMsf, (size_t)nbf*sizeof(double)))
+            != cudaSuccess) return pfail(e, "reconArm/bMsf malloc");
+        if ((e = cudaMemcpy(gNO.bMsf, bMagSf,
+                            (size_t)nbf*sizeof(double),
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
+            return pfail(e, "reconArm/bMsf H2D");
+    }
+    gNO.reconArmed = 1;
+    gReconSkipPrep2 = 1;
+    return 0;
+}
+
+
+//- pGradRecon 전반부 (NOCorrPrep 미러): p 업로드 → 결정론 grad
+//  (cellMDLimited) → 내부면 ssf=snGrad*magSf (gST.lower) → 경계셀
+//  grad D2H (호스트가 경계 ssf 계산). NOCorrPrep와 별칭 차이:
+//  C3는 gU.src3를 절대 별칭하지 않음 (momentum 국면에서 src3=dev2
+//  명시항이 살아 있음) — gNO.ownC3 자체 할당 고정.
+int rgpPGradReconPrep
+(
+    const double* pCell, const double* pBFace, const double* pBNei,
+    const double* kf3, const double* Cf3,
+    double limitCoeff, double* bGrad3Out
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gNO.reconArmed)
+    {
+        snprintf(gPErr, sizeof(gPErr), "reconPrep: not armed");
+        return -1;
+    }
+    cudaError_t e;
+    const double* dP2 = rgpInPtr(pCell, gB.pA, (size_t)nc, &e);
+    if (e != cudaSuccess) return pfail(e, "reconPrep/H2D p");
+    const double* dPBF = nbf > 0
+        ? rgpInPtr(pBFace, gST.bPsi, (size_t)nbf, &e) : gST.bPsi;
+    if (e != cudaSuccess) return pfail(e, "reconPrep/H2D pBF");
+    const double* dPBN = dPBF;
+    if (pBNei && nbf > 0)
+    {
+        dPBN = rgpInPtr(pBNei, gNO.bCorr, (size_t)nbf, &e);
+        if (e != cudaSuccess) return pfail(e, "reconPrep/H2D pBN");
+    }
+
+    rgppeqn::noFaceInterp<<<nb(nf), BS>>>
+        (nf, gM.own, gM.nei, gSTM.wLin, dP2, gB.flux);
+    rgppeqn::stGradGather<<<nb(nc), BS>>>
+        (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
+         gB.flux, dPBF, gM.V, gST.grad);
+
+    double *vx = nullptr, *vy = nullptr, *vz = nullptr;
+    if (!gNO.resKf && !noStage3(vx, vy, vz, &e))
+    {
+        snprintf(gPErr, sizeof(gPErr),
+                 "reconPrep/stage: %s", cudaGetErrorString(e));
+        return -2;
+    }
+    if (gNO.mdK >= 0)
+    {
+        if (!Cf3 || gNO.hC3.empty())
+        {
+            snprintf(gPErr, sizeof(gPErr), "reconPrep: Cf3/C3 required");
+            return -1;
+        }
+        const double* dC3;
+        if (gNO.resC3)
+        {
+            dC3 = gNO.resC3;
+        }
+        else
+        {
+            if (!gNO.ownC3)
+            {
+                if ((e = cudaMalloc(&gNO.ownC3,
+                                    (size_t)3*nc*sizeof(double)))
+                    != cudaSuccess)
+                    return pfail(e, "reconPrep/C3 malloc");
+            }
+            dC3 = rgpInPtr(gNO.hC3.data(), gNO.ownC3, (size_t)3*nc, &e);
+            if (e != cudaSuccess) return pfail(e, "reconPrep/C3 H2D");
+        }
+        const double *dCfx, *dCfy, *dCfz;
+        if (gNO.resCf)
+        {
+            if (!gNO.resLoaded)
+            {
+                if ((e = cudaMemcpy(gNO.resCf, Cf3,
+                                    (size_t)3*nf*sizeof(double),
+                                    cudaMemcpyHostToDevice))
+                    != cudaSuccess)
+                    return pfail(e, "reconPrep/resCf H2D");
+            }
+            dCfx = gNO.resCf;
+            dCfy = gNO.resCf + (size_t)nf;
+            dCfz = gNO.resCf + (size_t)2*nf;
+        }
+        else
+        {
+            dCfx = rgpInPtr(Cf3, vx, (size_t)nf, &e);
+            if (e != cudaSuccess) return pfail(e, "reconPrep/Cf H2D");
+            dCfy = rgpInPtr(Cf3 + (size_t)nf, vy, (size_t)nf, &e);
+            if (e != cudaSuccess) return pfail(e, "reconPrep/Cf H2D");
+            dCfz = rgpInPtr(Cf3 + (size_t)2*nf, vz, (size_t)nf, &e);
+            if (e != cudaSuccess) return pfail(e, "reconPrep/Cf H2D");
+        }
+        const double rk = (gNO.mdK < 1.0) ? (1.0/gNO.mdK - 1.0) : 0.0;
+        rgppeqn::noMDMinMax<<<nb(nc), BS>>>
+            (nc, nf, gSTM.cfPtr, gSTM.cfIdx, gM.own, gM.nei,
+             dP2, dPBN, rk, gST.rA0, gST.sA);
+        rgppeqn::noMDLimit<<<nb(nc), BS>>>
+            (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx,
+             dCfx, dCfy, dCfz, dC3, gNO.CfB3, gST.rA0, gST.sA,
+             gST.grad);
+    }
+    const double *dKfx, *dKfy, *dKfz, *dDcs;
+    if (gNO.resKf)
+    {
+        if (!gNO.resLoaded)
+        {
+            if ((e = cudaMemcpy(gNO.resKf, kf3,
+                                (size_t)3*nf*sizeof(double),
+                                cudaMemcpyHostToDevice)) != cudaSuccess)
+                return pfail(e, "reconPrep/resKf H2D");
+            gNO.resLoaded = 1;
+        }
+        dKfx = gNO.resKf;
+        dKfy = gNO.resKf + (size_t)nf;
+        dKfz = gNO.resKf + (size_t)2*nf;
+        dDcs = gNO.resDcs;
+    }
+    else
+    {
+        dKfx = rgpInPtr(kf3, vx, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "reconPrep/kf H2D");
+        dKfy = rgpInPtr(kf3 + (size_t)nf, vy, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "reconPrep/kf H2D");
+        dKfz = rgpInPtr(kf3 + (size_t)2*nf, vz, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "reconPrep/kf H2D");
+        dDcs = rgpInPtr(gNO.hDcs.data(), gB.upper, (size_t)nf, &e);
+        if (e != cudaSuccess) return pfail(e, "reconPrep/dcs H2D");
+    }
+    rgppeqn::bfSsfK<<<nb(nf), BS>>>
+        (nf, nc, gM.own, gM.nei, gSTM.wLin, dKfx, dKfy, dKfz, dDcs,
+         dP2, gNO.magSf, gST.grad, limitCoeff, gST.lower);
+    if (nbf > 0 && bGrad3Out)
+    {
+        if (!gU.rlxB)
+        {
+            if ((e = cudaMalloc(&gU.rlxB, (size_t)3*nbf*sizeof(double)))
+                != cudaSuccess) return pfail(e, "reconPrep/bg malloc");
+        }
+        rgppeqn::noBGather<<<nb(nbf), BS>>>
+            (nbf, nc, gM.bfc, gST.grad, gU.rlxB);
+        if ((e = cudaMemcpy(bGrad3Out, gU.rlxB,
+                            (size_t)3*nbf*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "reconPrep/bg D2H");
+    }
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "reconPrep/launch");
+    return 0;
+}
+
+
+//- pGradRecon 후반부: 경계 ssf 합류 → 셀별 재구성 → gU.gradP 상주.
+//  updateU != 0 이면 pcUUpdate(U = HbyA − rAU·recon) + U3out D2H.
+//  recon3Out != nullptr 이면 recon 자체도 D2H (자가검증 게이트용).
+int rgpPGradReconFinish
+(
+    const double* bSsf, int updateU, double* U3out, double* recon3Out
+)
+{
+    const int nc = gM.nCells, nf = gM.nIntFaces, nbf = gM.nBFaces;
+    if (!gNO.reconArmed)
+    {
+        snprintf(gPErr, sizeof(gPErr), "reconFin: not armed");
+        return -1;
+    }
+    cudaError_t e;
+    const double* dBSsf = gST.bPsi;
+    if (nbf > 0)
+    {
+        dBSsf = rgpInPtr(bSsf, gST.bPsi, (size_t)nbf, &e);
+        if (e != cudaSuccess) return pfail(e, "reconFin/H2D bSsf");
+    }
+    rgppeqn::bfReconK<<<nb(nc), BS>>>
+        (nc, nf, nbf, gSTM.cfPtr, gSTM.cfIdx, gSTM.sf, gSTM.bSf,
+         gNO.magSf, gNO.bMsf, gST.lower, dBSsf, gU.gradP);
+    if (recon3Out)
+    {
+        if ((e = cudaMemcpy(recon3Out, gU.gradP,
+                            (size_t)3*nc*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "reconFin/D2H recon");
+    }
+    if (updateU)
+    {
+        rgppeqn::pcUUpdate<<<nb(nc), BS>>>
+            (nc, gU.HbyA3, gU.rAU, gU.gradP, gU.src3);
+        if ((e = cudaGetLastError()) != cudaSuccess)
+            return pfail(e, "reconFin/launch");
+        if ((e = cudaMemcpy(U3out, gU.src3, (size_t)3*nc*sizeof(double),
+                            cudaMemcpyDeviceToHost)) != cudaSuccess)
+            return pfail(e, "reconFin/D2H U");
+    }
+    if ((e = cudaGetLastError()) != cudaSuccess)
+        return pfail(e, "reconFin/launch2");
+    return 0;
+}
+
+
 //- UEqn prep 1/2: grad(U) 디바이스 계산 + 경계셀 gradU 채집(D2H).
 //  UBuf 지연 할당도 여기서 (Solve보다 먼저 불리므로).
 int rgpUEqnGrad
@@ -4310,7 +4676,11 @@ int rgpUEqnPrep2
     }
     rgppeqn::uSrc3DivV<<<nb(nc), BS>>>(nc, gM.V, gU.src3);
 
-    // grad(p): 스칼라 Gauss linear (경계 값 포함)
+    // grad(p): 스칼라 Gauss linear (경계 값 포함).
+    // pGradRecon 디바이스 활성 시 생략 — momentum recon이 gU.gradP를
+    // 직후 재기록한다 (기록 순서: Prep2 → recon → SolvePrep(null))
+    if (!gReconSkipPrep2)
+    {
     if ((e = cudaMemset(gU.gradP, 0, (size_t)3*nc*sizeof(double)))
         != cudaSuccess) return pfail(e, "ueqnPrep/memset gp");
     rgppeqn::stGradFace<<<nb(nf), BS>>>
@@ -4321,6 +4691,7 @@ int rgpUEqnPrep2
             (nbf, nc, gM.bfc, gSTM.bSf, gST.bPsi, gU.gradP);
     }
     rgppeqn::stGradDivV<<<nb(nc), BS>>>(nc, gM.V, gU.gradP);
+    }
     if ((e = cudaGetLastError()) != cudaSuccess)
         return pfail(e, "ueqnPrep/launch");
 

@@ -128,7 +128,9 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuArmed_(false),
     gpuPEqn_(fgmTable_.lookupOrDefault<Switch>("gpuPEqn", false)),
     gpuPEqnCheck_(fgmTable_.lookupOrDefault<Switch>("gpuPEqnCheck", false)),
-    gpuDevChainNO_(fgmTable_.lookupOrDefault<Switch>("gpuDevChainNO", false)),
+    // M5 승격 (#73 게이트: devNO-vs-off 차이가 atomics 노이즈 바닥과
+    // 동급 — alphat 비트-동일): 비직교에서도 devChain 기본 사용
+    gpuDevChainNO_(fgmTable_.lookupOrDefault<Switch>("gpuDevChainNO", true)),
     gpuPEqnSolver_(fgmTable_.lookupOrDefault<word>("gpuPEqnSolver", "pcg")),
     gpuPEqnPrecon_
     (
@@ -139,6 +141,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     gpuZCArmed_(false),
     gpuUEqn_(fgmTable_.lookupOrDefault<Switch>("gpuUEqn", false)),
     pGradRecon_(fgmTable_.lookupOrDefault<Switch>("pGradRecon", false)),
+    gpuPGradReconState_(0),
+    gpuPGradReconGateDone_(false),
     gpuPinned_(false),
     gpuMeshCells_(-1),
     gpuMeshFaces_(-1),

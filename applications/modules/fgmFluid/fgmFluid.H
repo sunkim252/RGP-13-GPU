@@ -276,6 +276,12 @@ protected:
         Switch pGradRecon_;
         mutable List<double> gpuGradReconBuf_;   // [3nc] SoA 재사용 버퍼
 
+        //- pGradRecon 디바이스 경로 상태 (0 미시도 / 1 활성 / -1 강등).
+        //  첫 활성 호출에서 호스트 fvc 재계산과 비트 자가검증 —
+        //  불일치·실패 시 영구 호스트 recon 강등 (기능 동일)
+        mutable label gpuPGradReconState_;
+        mutable bool gpuPGradReconGateDone_;
+
         //- 호스트 버퍼/필드 page-lock 등록 완료 플래그 (스텝 2에서
         //  1회 — 모든 grow-only 버퍼가 최종 크기에 도달한 뒤)
         mutable bool gpuPinned_;
@@ -428,6 +434,13 @@ private:
         //- 비동기 UEqn 합류: 워커 스레드를 join하고 잔차 출력·U 산포·
         //  BC 보정·K 갱신을 수행. 미발진 상태면 no-op (멱등).
         void joinUEqnSolve();
+
+        //- pGradRecon 디바이스 경로: recon = reconstruct(snGrad(p)*magSf)
+        //  를 결정론 CSR 게더로 디바이스 계산해 gU.gradP에 상주.
+        //  updateU=true면 pcUUpdate(U=HbyA−rAU·recon)+U3out D2H까지.
+        //  경계 ssf는 호스트(proc halo 포함), 첫 호출에 비트 자가검증.
+        //  false 반환 = 미아밍/강등 — 호출자는 호스트 recon 경로 사용.
+        bool deviceReconGrad(const bool updateU, double* U3out) const;
 
         //- 게더/산포 복사 루프의 OpenMP 스레드 수 (결과는 스레드 수와
         //  무관 — 반복 독립 복사 전용). 기본: 직렬 4, 병렬 1(클러스터

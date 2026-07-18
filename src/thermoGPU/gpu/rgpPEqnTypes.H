@@ -370,6 +370,27 @@ int rgpPEqnNOCorrFinish
     const double* bCorr, double* srcOut, double* corrFOut
 );
 
+/*  pGradRecon 디바이스화: recon = inv(surfaceSum(SfHat*Sf)) &
+    surfaceSum(SfHat*snGrad(p)*magSf) 를 결정론 CSR 게더로 (fvc 1:1).
+    Arm: magSf/bMagSf 상주 (+VRAM 프리플라이트, -2 = 호스트 강등).
+         이후 rgpUEqnPrep2는 자체 Gauss grad(p)를 생략.
+    Prep: NOCorrPrep 미러 (grad + 내부면 ssf) + 경계셀 grad D2H —
+         호스트가 경계 ssf(orth+lim·corr)*magSf_b 계산 (proc halo 포함).
+    Finish: 경계 ssf 합류 → recon → gU.gradP 상주.
+         updateU != 0 → pcUUpdate + U3out D2H (pCorr용);
+         recon3Out != nullptr → recon 자체 D2H (자가검증 게이트용).    */
+int rgpPGradReconArm(const double* magSf, const double* bMagSf);
+int rgpPGradReconPrep
+(
+    const double* pCell, const double* pBFace, const double* pBNei,
+    const double* kf3, const double* Cf3,
+    double limitCoeff, double* bGrad3Out
+);
+int rgpPGradReconFinish
+(
+    const double* bSsf, int updateU, double* U3out, double* recon3Out
+);
+
 void rgpPEqnFree(void);
 const char* rgpPEqnLastError(void);
 

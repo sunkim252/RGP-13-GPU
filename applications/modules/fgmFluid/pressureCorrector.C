@@ -513,6 +513,330 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
 }
 
 
+//- pGradRecon 디바이스 경로: fvc::reconstruct(fvc::snGrad(p)*magSf) 1:1.
+//  내부(grad·ssf·재구성)는 디바이스 결정론 CSR, 경계 ssf만 호스트
+//  (proc halo 교환 포함 — NO-src 경계 규약 미러). 첫 호출에 호스트
+//  재계산과 비트 자가검증, 불일치·실패 시 영구 강등 후 false.
+bool Foam::solvers::fgmFluid::deviceReconGrad
+(
+    const bool updateU, double* U3out
+) const
+{
+    if (!(gpuUEqn_ && gpuPEqn_)) return false;
+    if (gpuPGradReconState_ < 0 || !gpuNOSrcDev_) return false;
+
+    const volScalarField& p = p_;
+    const label nc = mesh.nCells();
+    const label nif = mesh.nInternalFaces();
+    label nbf = 0;
+    forAll(p.boundaryField(), patchi)
+    {
+        nbf += p.boundaryField()[patchi].size();
+    }
+
+    // ── 아밍 (1회): magSf 내부/경계 상주 ──
+    if (gpuPGradReconState_ == 0)
+    {
+        List<double> msfL(nif);
+        {
+            const scalarField& m = mesh.magSf().primitiveField();
+            forAll(msfL, f) { msfL[f] = m[f]; }
+        }
+        List<double> bMsfL(max(nbf, label(1)), 0.0);
+        {
+            label off = 0;
+            forAll(mesh.boundary(), patchi)
+            {
+                const scalarField& mb =
+                    mesh.magSf().boundaryField()[patchi];
+                forAll(mb, k) { bMsfL[off + k] = mb[k]; }
+                off += mb.size();
+            }
+        }
+        const int rcA = rgpPGradReconArm(msfL.begin(), bMsfL.begin());
+        if (rcA)
+        {
+            WarningInFunction
+                << "pGradRecon device arm failed ("
+                << rgpPEqnLastError()
+                << ") -- host reconstruct retained" << endl;
+            gpuPGradReconState_ = -1;
+            return false;
+        }
+        gpuPGradReconState_ = 1;
+        Info<< "fgmFluid: pGradRecon on the device -- deterministic "
+            << "CSR reconstruct(snGrad(p)*magSf)" << nl << endl;
+    }
+
+    // ── 경계 배열 (NO-src 규약과 동일) ──
+    const bool par = Pstream::parRun();
+    List<double> pBF(max(nbf, label(1)), 0.0);
+    List<double> pBN(par ? max(nbf, label(1)) : label(0), 0.0);
+    {
+        label off = 0;
+        forAll(p.boundaryField(), patchi)
+        {
+            const fvPatchScalarField& pp = p.boundaryField()[patchi];
+            if (pp.coupled())
+            {
+                const scalarField lam
+                (
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi]
+                );
+                const scalarField pI(pp.patchInternalField());
+                forAll(pp, k)
+                {
+                    pBF[off + k] = lam[k]*pI[k] + (1.0 - lam[k])*pp[k];
+                    if (par) { pBN[off + k] = pp[k]; }
+                }
+            }
+            else
+            {
+                forAll(pp, k)
+                {
+                    pBF[off + k] = pp[k];
+                    if (par) { pBN[off + k] = pp[k]; }
+                }
+            }
+            off += pp.size();
+        }
+    }
+
+    List<double> bG3(3*max(nbf, label(1)), 0.0);
+    if
+    (
+        rgpPGradReconPrep
+        (
+            p.primitiveField().begin(), pBF.begin(),
+            par ? pBN.begin() : nullptr,
+            gpuNOKf3_.begin(),
+            gpuNOCf3_.size() ? gpuNOCf3_.begin() : nullptr,
+            gpuNOLimitCoeff_, bG3.begin()
+        )
+    )
+    {
+        WarningInFunction
+            << "rgpPGradReconPrep failed (" << rgpPEqnLastError()
+            << ") -- demoting to host reconstruct" << endl;
+        gpuPGradReconState_ = -1;
+        return false;
+    }
+
+    // ── coupled 이웃 grad halo 교환 (NO-src 미러) ──
+    label nParF = 0;
+    if (par)
+    {
+        forAll(p.boundaryField(), patchi)
+        {
+            if (p.boundaryField()[patchi].coupled())
+            {
+                nParF += p.boundaryField()[patchi].size();
+            }
+        }
+    }
+    List<vector> gradN(max(nParF, label(1)), Zero);
+    if (nParF > 0)
+    {
+        PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
+        label off = 0;
+        forAll(p.boundaryField(), patchi)
+        {
+            const fvPatchScalarField& pp = p.boundaryField()[patchi];
+            const label np = pp.size();
+            if (pp.coupled())
+            {
+                const processorFvPatch& prp =
+                    refCast<const processorFvPatch>
+                    (
+                        mesh.boundary()[patchi]
+                    );
+                List<vector> sv(np);
+                for (label k = 0; k < np; k++)
+                {
+                    sv[k] = vector
+                    (
+                        bG3[off + k],
+                        bG3[nbf + off + k],
+                        bG3[2*nbf + off + k]
+                    );
+                }
+                UOPstream toNbr(prp.neighbProcNo(), pBufs);
+                toNbr << sv;
+            }
+            off += np;
+        }
+        pBufs.finishedSends();
+        label offp = 0;
+        forAll(p.boundaryField(), patchi)
+        {
+            const fvPatchScalarField& pp = p.boundaryField()[patchi];
+            if (pp.coupled())
+            {
+                const processorFvPatch& prp =
+                    refCast<const processorFvPatch>
+                    (
+                        mesh.boundary()[patchi]
+                    );
+                List<vector> rv;
+                UIPstream fromNbr(prp.neighbProcNo(), pBufs);
+                fromNbr >> rv;
+                forAll(rv, k) { gradN[offp + k] = rv[k]; }
+                offp += pp.size();
+            }
+        }
+    }
+
+    // ── 경계 ssf = (orth + lim·corr)·magSf_b (fvc::snGrad 경계 1:1) ──
+    List<double> bSsf(max(nbf, label(1)), 0.0);
+    {
+        const surfaceVectorField& kf = mesh.nonOrthCorrectionVectors();
+        label off = 0;
+        label offp = 0;
+        forAll(p.boundaryField(), patchi)
+        {
+            const fvPatchScalarField& pp = p.boundaryField()[patchi];
+            const label np = pp.size();
+            if (np == 0) continue;
+            const vectorField& kfb = kf.boundaryField()[patchi];
+            const scalarField& msfb =
+                mesh.magSf().boundaryField()[patchi];
+
+            if (pp.coupled())
+            {
+                const scalarField lam
+                (
+                    mesh.surfaceInterpolation::weights()
+                        .boundaryField()[patchi]
+                );
+                const scalarField pdcb
+                (
+                    mesh.nonOrthDeltaCoeffs().boundaryField()[patchi]
+                );
+                const scalarField pI(pp.patchInternalField());
+                for (label k = 0; k < np; k++)
+                {
+                    const vector gI
+                    (
+                        bG3[off + k],
+                        bG3[nbf + off + k],
+                        bG3[2*nbf + off + k]
+                    );
+                    const vector gradF
+                    (
+                        lam[k]*gI + (1.0 - lam[k])*gradN[offp + k]
+                    );
+                    const scalar corrB = kfb[k] & gradF;
+                    const scalar snGb = pdcb[k]*(pp[k] - pI[k]);
+                    scalar lim = 1.0;
+                    if (gpuNOLimitCoeff_ >= 0)
+                    {
+                        lim = min
+                        (
+                            gpuNOLimitCoeff_*mag(snGb)
+                           /(
+                                (1.0 - gpuNOLimitCoeff_)*mag(corrB)
+                              + small
+                            ),
+                            scalar(1)
+                        );
+                    }
+                    bSsf[off + k] = (snGb + lim*corrB)*msfb[k];
+                }
+                offp += np;
+            }
+            else
+            {
+                const vectorField nHat(mesh.boundary()[patchi].nf());
+                const scalarField snG(pp.snGrad());
+                for (label k = 0; k < np; k++)
+                {
+                    const vector gI
+                    (
+                        bG3[off + k],
+                        bG3[nbf + off + k],
+                        bG3[2*nbf + off + k]
+                    );
+                    const vector gradB
+                    (
+                        gI + nHat[k]*(snG[k] - (nHat[k] & gI))
+                    );
+                    const scalar corrB = kfb[k] & gradB;
+                    scalar lim = 1.0;
+                    if (gpuNOLimitCoeff_ >= 0)
+                    {
+                        lim = min
+                        (
+                            gpuNOLimitCoeff_*mag(snG[k])
+                           /(
+                                (1.0 - gpuNOLimitCoeff_)*mag(corrB)
+                              + small
+                            ),
+                            scalar(1)
+                        );
+                    }
+                    bSsf[off + k] = (snG[k] + lim*corrB)*msfb[k];
+                }
+            }
+            off += np;
+        }
+    }
+
+    // ── 재구성 + (옵션) U 갱신; 첫 호출은 recon D2H로 자가검증 ──
+    const bool gate = !gpuPGradReconGateDone_;
+    List<double> reconChk(gate ? 3*nc : label(0));
+    if
+    (
+        rgpPGradReconFinish
+        (
+            bSsf.begin(), updateU ? 1 : 0, U3out,
+            gate ? reconChk.begin() : nullptr
+        )
+    )
+    {
+        WarningInFunction
+            << "rgpPGradReconFinish failed (" << rgpPEqnLastError()
+            << ") -- demoting to host reconstruct" << endl;
+        gpuPGradReconState_ = -1;
+        return false;
+    }
+
+    if (gate)
+    {
+        gpuPGradReconGateDone_ = true;
+        const volVectorField ref
+        (
+            fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+        );
+        const vectorField& rf = ref.primitiveField();
+        label nDiff = 0;
+        for (label i = 0; i < nc; i++)
+        {
+            for (label k = 0; k < 3; k++)
+            {
+                if (reconChk[k*nc + i] != rf[i][k]) { nDiff++; }
+            }
+        }
+        const label nDiffAll = returnReduce(nDiff, sumOp<label>());
+        if (nDiffAll == 0)
+        {
+            Info<< "fgmFluid: pGradRecon device self-check -- "
+                << "bit-identical to the host reconstruct" << nl << endl;
+        }
+        else
+        {
+            WarningInFunction
+                << "pGradRecon device self-check FAILED ("
+                << nDiffAll << " differing components) -- "
+                << "demoting to host reconstruct permanently" << endl;
+            gpuPGradReconState_ = -1;
+            return false;
+        }
+    }
+    return true;
+}
+
+
 void Foam::solvers::fgmFluid::correctPressurePEP()
 {
     // 비동기 UEqn이 남아 있으면 합류 (U/HbyA/pEqn 스크래치 공유 방어)
@@ -2342,28 +2666,30 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         double* U3out = gpuUBuf_.begin() + 6*nc;
         if (pGradRecon_)
         {
-            // balanced-force: 호스트 재구성 구배(케이스 snGrad 스킴 —
-            // pEqn 라플라시안 플럭스와 면-일관)를 업로드해 디바이스
-            // pcUUpdate만 수행. pB 스테이징 불필요, gB.pOld 비접촉
-            // (M4 스탬프 무효화 없음 — 기존 경로보다 엄격히 안전)
-            const volVectorField gradPRec
-            (
-                fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
-            );
-            const vectorField& gp = gradPRec.primitiveField();
-            gpuGradReconBuf_.setSize(3*nc);
-            for (label i = 0; i < nc; i++)
+            // balanced-force: 디바이스 recon(결정론 CSR, 자가검증 내장)
+            // 우선 — 강등 시 호스트 재구성 구배 업로드(rgpPCorrUHostGrad).
+            // 두 경로 모두 pB 스테이징 불필요, gB.pOld 비접촉
+            if (!deviceReconGrad(true, U3out))
             {
-                for (label k = 0; k < 3; k++)
+                const volVectorField gradPRec
+                (
+                    fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+                );
+                const vectorField& gp = gradPRec.primitiveField();
+                gpuGradReconBuf_.setSize(3*nc);
+                for (label i = 0; i < nc; i++)
                 {
-                    gpuGradReconBuf_[k*nc + i] = gp[i][k];
+                    for (label k = 0; k < 3; k++)
+                    {
+                        gpuGradReconBuf_[k*nc + i] = gp[i][k];
+                    }
                 }
-            }
-            if (rgpPCorrUHostGrad(gpuGradReconBuf_.begin(), U3out))
-            {
-                FatalErrorInFunction
-                    << "rgpPCorrUHostGrad: " << rgpPEqnLastError()
-                    << exit(FatalError);
+                if (rgpPCorrUHostGrad(gpuGradReconBuf_.begin(), U3out))
+                {
+                    FatalErrorInFunction
+                        << "rgpPCorrUHostGrad: " << rgpPEqnLastError()
+                        << exit(FatalError);
+                }
             }
             vectorField& Uc = U.primitiveFieldRef();
             for (label i = 0; i < nc; i++)
