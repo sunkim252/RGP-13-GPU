@@ -38,8 +38,6 @@ License
 #include "localEulerDdtScheme.H"
 #include "snGradScheme.H"
 #include "fvcDiv.H"
-#include "fvcSnGrad.H"
-#include "fvcReconstruct.H"
 #include "gpu/rgpPEqnTypes.H"
 
 // W7: SoA 게더/산포 병렬화 (순수 인덱싱 루프 한정)

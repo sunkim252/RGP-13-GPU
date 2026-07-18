@@ -208,9 +208,10 @@ __device__ double srkZ
 {
     const double aAlpha = coef1 - coef2*sqrt(T) + coef3*T;
 
+    const double pf = fmax(p, 1e4);   // EOS p-floor (upstream 34e2c5c 미러)
     const double RT = RR*T;
-    const double A = aAlpha*p/(RT*RT);
-    const double B = bM*p/RT;
+    const double A = aAlpha*pf/(RT*RT);
+    const double B = bM*pf/RT;
 
     const double a2 = -1.0;
     const double a1 = A - B - B*B;
@@ -309,17 +310,18 @@ __device__ void srkCpDepCpMCv
     double& cpMCv       // SRKGasI::CpMCv = R_mass*(M-N)^2/(M^2-A(2Z+B))
 )
 {
+    const double pfl = fmax(p, 1e4);   // EOS p-floor (upstream 34e2c5c 미러)
     const double sqrtT = sqrt(T);
     const double aAlpha = coef1 - coef2*sqrtT + coef3*T;
     const double daAlpha = -coef2/(2.0*sqrtT) + coef3;
     const double ddaAlpha = coef2/(4.0*T*sqrtT);
 
     const double RT = RR*T;
-    const double A = aAlpha*p/(RT*RT);
-    double B = bM*p/RT;
+    const double A = aAlpha*pfl/(RT*RT);
+    double B = bM*pfl/RT;
     if (B <= 0.0) { B = 1e-16; }
 
-    const double Zv = srkZ(p, T, bM, coef1, coef2, coef3, RR, stableRoot);
+    const double Zv = srkZ(pfl, T, bM, coef1, coef2, coef3, RR, stableRoot);
 
     const double M = (Zv*Zv + B*Zv)/(Zv - B);
     const double N = daAlpha*B/(bM*RR);
@@ -655,10 +657,12 @@ __global__ void rgpHaKernel
        + aJ[0])*T
       + aJ[5];
 
-    // ── SRKGas::h — EOS departure (raw p, CPU와 동일한 B floor/분기) ──
-    double B = bM*p/(RR*T);
+    // ── SRKGas::h — EOS departure (CPU와 동일: 진입 p-플로어(34e2c5c) +
+    //    기존 B floor/분기 유지; srkZ는 내부 플로어) ──
+    const double phf = fmax(p, 1e4);
+    double B = bM*phf/(RR*T);
     if (B <= 0.0) { B = 1e-16; }
-    const double Zv = srkZ(p, T, bM, coef1, coef2, coef3, RR, kp.stableRoot);
+    const double Zv = srkZ(phf, T, bM, coef1, coef2, coef3, RR, kp.stableRoot);
 
     double hDep;
     if (B == -Zv)
@@ -888,7 +892,9 @@ __global__ void rgpEvaluateKernel
     const double eta0 = (4.0785e-5)*sqrt(MM*T)*Fc/(Omegast*VcM23);
 
     const double rhoMolL = 1e-3*rho/Wmix;    // [mol/l]
-    const double Ych = rhoMolL*VcM/6.0;
+    // Y-CAP (upstream 41b3300 CPU 미러): packing 특이점(Y=1) 부호반전
+    // 가드 — off-매니폴드 상태에서만 발동. CPU min(Y,0.9) 1:1
+    const double Ych = fmin(rhoMolL*VcM/6.0, 0.9);
     const double oneMinusY = 1.0 - Ych;
     const double G1 = (1.0 - 0.5*Ych)/(oneMinusY*oneMinusY*oneMinusY);
 
@@ -924,7 +930,8 @@ __global__ void rgpEvaluateKernel
 
         muOut = 0.1*(etak + etap);           // [P] → [kg/m/s]
     }
-    muF[celli] = muOut;
+    // 양수 floor/ceiling (upstream 41b3300 CPU 미러 1:1)
+    muF[celli] = fmin(fmax(muOut, 1e-7), 0.05);
 
     // ── Chung kappa ───────────────────────────────────────────────────
     double kappaOut = 0.0;
@@ -984,7 +991,8 @@ __global__ void rgpEvaluateKernel
 
         kappaOut = 418.6798*(lamdak + lamdap);   // [cal/cm/s/K] → [W/m/K]
     }
-    kappaF[celli] = kappaOut;
+    // 양수 floor/ceiling (upstream 41b3300 CPU 미러 1:1)
+    kappaF[celli] = fmin(fmax(kappaOut, 1e-4), 1.0);
 }
 
 } // namespace rgp
