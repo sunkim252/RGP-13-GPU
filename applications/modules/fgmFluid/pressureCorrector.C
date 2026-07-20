@@ -318,11 +318,6 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                 const scalarField& m = mesh.magSf().primitiveField();
                 forAll(msf, f) { msf[f] = m[f]; }
             }
-            // NO-src 디바이스 경로는 ST 메시(CSR 게더·wLin·sf)를 전제.
-            // gpuZC/gpuUEqn이 모두 off인 구성(예: 6GB 카드 4랭크
-            // thermo+manifold+pEqn)에서는 아무도 아밍하지 않아
-            // NOCorrPrep 가드 FATAL — 여기서 명시 아밍 (멱등)
-            armGpuSTMesh();
             const int rcNO = rgpPEqnNOArm
             (
                 dno.begin(), mdK,
@@ -1414,8 +1409,12 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             }
         }
 
-        // ── 1회 아밍: 정적 메시 (owner/neigh, magSf*deltaCoeffs, V) ──
-        armGpuPEqnMesh();
+        // ── 1회 아밍: 정적 메시 + ST 메시(CSR 게더) ──
+        // NO-src 디바이스 경로(NOCorrPrep)가 gSTM을 전제하는데
+        // gpuZC/gpuUEqn 모두 off인 구성에선 아무도 ST를 아밍하지 않음.
+        // armGpuSTMesh가 내부에서 armGpuPEqnMesh를 먼저 호출(멱등)한 뒤
+        // ST 메시를 아밍한다 — armGpuPEqnMesh 내부 호출은 재귀라 금지.
+        armGpuSTMesh();
 
         // ── 경계 기여: pEqn = -laplacian(rAUf, p)의 경계 계수 ─────────
         //    diag += -pGamma*gic, source += +pGamma*gbc (fvm 부호 규약)
