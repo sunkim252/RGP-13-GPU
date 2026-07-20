@@ -318,6 +318,11 @@ void Foam::solvers::fgmFluid::armGpuPEqnMesh()
                 const scalarField& m = mesh.magSf().primitiveField();
                 forAll(msf, f) { msf[f] = m[f]; }
             }
+            // NO-src 디바이스 경로는 ST 메시(CSR 게더·wLin·sf)를 전제.
+            // gpuZC/gpuUEqn이 모두 off인 구성(예: 6GB 카드 4랭크
+            // thermo+manifold+pEqn)에서는 아무도 아밍하지 않아
+            // NOCorrPrep 가드 FATAL — 여기서 명시 아밍 (멱등)
+            armGpuSTMesh();
             const int rcNO = rgpPEqnNOArm
             (
                 dno.begin(), mdK,
