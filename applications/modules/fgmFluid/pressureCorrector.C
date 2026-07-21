@@ -1331,6 +1331,23 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     (
         pimple.dict().lookupOrDefault<scalar>("LADrhoCoeff", scalar(0))
     );
+    // ladOddEven (upstream b61de26): Jameson-type odd-even(체커보드) 압력
+    // 센서로 AMD를 게이팅 — 질량 확산이 스퓨리어스 계면 셀에만 작동하고
+    // 물리 LOX/가스 접촉·물리 제트는 안 건드림. |grad rho| 센서만으로는
+    // 둘 다 급구배라 구분 못 하지만, 압력은 실접촉에선 매끈(역학평형)·
+    // 스퓨리어스는 셀-셀 체커보드라 구분됨.
+    //   theta = |lap(p)|·V^⅔ / (|lap(p)|·V^⅔ + |grad(p)|·V^⅓ + eps) ∈[0,1)
+    // ~1 체커보드, ~0 매끈/정적. 게이트 on이면 LADrhoCoeff를 세게(2-4)
+    // 밀어 스파이크만 소산, 물리 벌크 95%는 무손상. default off, 매 스텝.
+    // (CPU와 동일 호스트 계산 — Dr은 srcCellExtra로 디바이스에 주입)
+    const Switch ladOddEven
+    (
+        pimple.dict().lookupOrDefault<Switch>("ladOddEven", false)
+    );
+    const scalar ladEpsPa
+    (
+        pimple.dict().lookupOrDefault<scalar>("ladEpsPa", scalar(1e3))
+    );
     volScalarField Dr
     (
         IOobject
@@ -1351,7 +1368,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         // Dimensionless density-gradient sensor in [0,1]: the relative rho
         // change across a cell, CAPPED at 1 so the spurious spike itself (huge
         // |grad rho|) cannot drive the coefficient past the diffusive-CFL limit.
-        const scalarField sensor
+        scalarField sensor
         (
             min
             (
@@ -1359,6 +1376,21 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
                 scalar(1)
             )
         );
+        if (ladOddEven)
+        {
+            const scalarField V23(V13*V13);
+            const scalarField d2p
+            (
+                mag(fvc::laplacian(p))().primitiveField()*V23     // 2차차분 [Pa]
+            );
+            const scalarField d1p
+            (
+                mag(fvc::grad(p))().primitiveField()*V13          // 1차차분 [Pa]
+            );
+            const scalarField theta(d2p/(d2p + d1p + ladEpsPa));
+            sensor *= theta;
+            Info<< "LAD-rho oddEven: theta max = " << gMax(theta) << endl;
+        }
         Dr.primitiveFieldRef() =
             LADrhoCoeff*V13*mag(U)().primitiveField()*sensor;
         Dr.correctBoundaryConditions();
