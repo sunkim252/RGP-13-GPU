@@ -864,10 +864,23 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     std::chrono::steady_clock::time_point tPh, tTot;
     if (thermoTimings_) { tPh = tTot = std::chrono::steady_clock::now(); }
 
+    // thermoPerCorrector (upstream 4f769e9): default true = per-corrector 리프레시
+    // 유지. false면 이 updateManifold+thermo correct를 outer당 1회로 hoist
+    // (pressureCorrector에서) → CPU에서 ~23% 빠름(FGM thermo가 s/step의 ~70%,
+    // 스텝당 4→1회). ★GPU(gpuThermo on)에선 false 쓰지 말 것: per-corrector SoA
+    // 재기록 불변식이 깨져 rgpFgmScratchDirty가 fail-closed로 막는다 — CPU 전용 노브.
+    const Switch thermoPerCorrector
+    (
+        pimple.dict().lookupOrDefault<Switch>("thermoPerCorrector", true)
+    );
+
     // 마지막 outer(finalIteration)의 보정자만 풀 호스트 산포 — 중간
     // outer의 산포값(T/Y/srcc/Le/RG)은 다음 predictor의 updateManifold
     // 전까지 아무도 읽지 않으므로 D2H+산포를 생략(디바이스 SoA만 갱신)
-    updateManifold(solutionControl::finalIteration(mesh));
+    if (thermoPerCorrector)
+    {
+        updateManifold(solutionControl::finalIteration(mesh));
+    }
 
     if (thermoTimings_)
     {
@@ -882,14 +895,17 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // updateManifold가 직전에 he를 T_table로 재시드하므로 CPU 경로의
     // he->T 역산은 T_table을 되돌려줄 뿐 — GPU 경로(역산 생략, (p,T,Y)
     // 일괄 물성)와 의미가 같다. 보정자당 1회 x nCorr회 호출되는 CPU
-    // calculate() 루프가 제거된다.
-    if (gpuThermo_)
+    // calculate() 루프가 제거된다. (thermoPerCorrector=false면 스킵 — hoist됨)
+    if (thermoPerCorrector)
     {
-        gpuThermoCorrect();
-    }
-    else
-    {
-        thermo_.correct();
+        if (gpuThermo_)
+        {
+            gpuThermoCorrect();
+        }
+        else
+        {
+            thermo_.correct();
+        }
     }
 
     if (thermoTimings_)
@@ -2875,6 +2891,27 @@ void Foam::solvers::fgmFluid::pressureCorrector()
         FatalErrorInFunction
             << "fgmFluid PEP pressure corrector does not support buoyant "
             << "(p_rgh) cases." << exit(FatalError);
+    }
+
+    // thermoPerCorrector=false: per-corrector FGM/EOS 리프레시를 여기서 outer당
+    // 1회만(표준 PIMPLE) — correctPressurePEP 내부 호출은 스킵된다(upstream 4f769e9).
+    // updateManifold(true)로 풀 산포. GPU(gpuThermo on)에선 SoA 불변식상 false 금지
+    // (2번째 보정자의 SoA 읽기에서 rgpFgmScratchDirty fail-closed).
+    const Switch thermoPerCorrector
+    (
+        pimple.dict().lookupOrDefault<Switch>("thermoPerCorrector", true)
+    );
+    if (!thermoPerCorrector)
+    {
+        updateManifold(true);
+        if (gpuThermo_)
+        {
+            gpuThermoCorrect();
+        }
+        else
+        {
+            thermo_.correct();
+        }
     }
 
     while (pimple.correct())
