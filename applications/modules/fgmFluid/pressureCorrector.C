@@ -1284,12 +1284,13 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
          || pimple.dict().lookupOrDefault<Switch>("pepRHS", false)
          || pimple.dict().lookupOrDefault<Switch>("psisFreezeOuter", false)
          || pimple.dict().lookupOrDefault<Switch>("psisTabulated", false)
-         || pimple.dict().lookupOrDefault<Switch>("psisSmooth", false);
+         || pimple.dict().lookupOrDefault<Switch>("psisSmooth", false)
+         || pimple.dict().lookupOrDefault<Switch>("psisAdvect", false);
         if (hostOnlyPEP && (gpuPEqn_ || gpuUEqn_))
         {
             FatalErrorInFunction
                 << "rootHysteresis/rhofUpwind/pepFull/pepAdvect/pepRHS/"
-                << "psisFreezeOuter/psisTabulated/psisSmooth are CPU-only "
+                << "psisFreezeOuter/psisTabulated/psisSmooth/psisAdvect are CPU-only "
                 << "knobs -- not supported with gpuPEqn/gpuUEqn"
                 << exit(FatalError);
         }
@@ -1592,6 +1593,18 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     (
         pimple.dict().lookupOrDefault<Switch>("psisTabulated", false)
     );
+    // psisSmooth (2026-07-24, upstream): iterative Laplacian-type smoothing
+    // (fvc::smooth, same operator as rDeltaTSmoothingCoeff) in place of the
+    // crude psisCapRatio floor. Mutually exclusive with psisCapRatio (takes
+    // precedence if on). Default off.
+    const Switch psisSmooth
+    (
+        pimple.dict().lookupOrDefault<Switch>("psisSmooth", false)
+    );
+    const scalar psisSmoothCoeff
+    (
+        pimple.dict().lookupOrDefault<scalar>("psisSmoothCoeff", 0.1)
+    );
     tmp<volScalarField> tpsis;
     if (!devChain)
     {
@@ -1677,6 +1690,9 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     );
     if (psisAdvect)
     {
+        // host-only (devChain은 위 hostOnlyPEP fatal 게이트로 배제)
+        volScalarField& psis = tpsis.ref();
+
         const dimensionedScalar psisTau
         (
             "psisTau",
@@ -1714,7 +1730,7 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
         volScalarField& psisStar =
             mesh.lookupObjectRef<volScalarField>("psisStar");
 
-        const surfaceScalarField phivPsis("phivPsis", phi/rhof);
+        const surfaceScalarField phivPsis("phivPsis", phi/trhof());
 
         fvScalarMatrix psisEqn
         (
