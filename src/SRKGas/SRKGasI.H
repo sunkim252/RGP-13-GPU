@@ -185,7 +185,40 @@ inline Foam::scalar Foam::SRKGas<Specie>::rho
     // solved p field (unlike the ping-ponging limitPressure clamp). Floor 1e4
     // Pa (0.1 bar); operating p = 5.25e6, so only near-/sub-zero cells are hit.
     p = max(p, scalar(1e4));
-    const scalar Zv = this->Z(p, T);
+
+    // Branch-consistent blend, for the SAME reason as h/Cp/e/sp/CpMCv above
+    // and -- critically -- to stay consistent with psi(). rho = p/(Zv R T)
+    // is NONLINEAR in Zv, so rho(w*Zmin+(1-w)*Zmax) != w*rho(Zmin)+
+    // (1-w)*rho(Zmax): blending at the Z level and blending at the rho level
+    // are different numbers. psi() below deliberately differences each branch
+    // against ITSELF and blends the two per-branch slopes with a frozen w, so
+    // it is the exact derivative of the rho-LEVEL blend. Taking rho from the
+    // Z-level blend instead would leave psi != (d rho/d p) of the rho the
+    // solver actually uses -- an inconsistency the pEqn (which couples the
+    // two through psis = psi/rho and correctRho(psi*dp)) has no way to
+    // absorb. Blend here so the pair is consistent by construction.
+    if (stableRoot_ && rootBlendTol_ > 0)
+    {
+        scalar Zmin, Zmax, lnPhiL, lnPhiV;
+        if (cubicBranches(p, T, Zmin, Zmax, lnPhiL, lnPhiV))
+        {
+            const scalar w = blendWeight(lnPhiL, lnPhiV);
+            return w*rhoFromZ(p, T, Zmin) + (1.0 - w)*rhoFromZ(p, T, Zmax);
+        }
+    }
+
+    return rhoFromZ(p, T, this->Z(p, T));
+}
+
+
+template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::rhoFromZ
+(
+    const scalar p,
+    const scalar T,
+    const scalar Zv
+) const
+{
     const scalar rhoSRK = p/(Zv*this->R()*T);
 
     // Peneloux volume translation: v_eff = v_SRK - c(T)  (molar basis).
@@ -208,24 +241,47 @@ inline Foam::scalar Foam::SRKGas<Specie>::rho
 
 
 template<class Specie>
-inline Foam::scalar Foam::SRKGas<Specie>::h
+inline Foam::scalar Foam::SRKGas<Specie>::blendWeight
 (
-    scalar p,
-    const scalar T
+    const scalar lnPhiL,
+    const scalar lnPhiV
 ) const
 {
-    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
+    const scalar dPhi = (lnPhiV - lnPhiL)/rootBlendTol_;
+    return 1.0/(1.0 + exp(-max(scalar(-60), min(scalar(60), dPhi))));
+}
+
+
+template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::hFromZ
+(
+    const scalar p,
+    const scalar T,
+    const scalar Zv
+) const
+{
     scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
     if (B <= 0)
     {
         B = 1e-16;
     }
 
+    // A branch with Zv <= B is below the co-volume (unphysical, log((Zv+B)/Zv)
+    // undefined/singular for Zv <= 0) -- this is exactly the branch that
+    // cubicBranches()/Z() reject via lnPhiL = GREAT, so it always carries
+    // ~zero blend weight. Evaluating the log here regardless (as the caller
+    // does, at BOTH Zmin and Zmax, before applying that weight) trips
+    // OpenFOAM's SIGFPE trap. Return the ideal-gas limit (zero departure);
+    // it is multiplied by a ~0 weight by the caller so the value itself
+    // doesn't matter, only that it stays finite.
+    if (Zv <= B)
+    {
+        return (Foam::constant::thermodynamic::RR*T*(Zv - 1))/this->W();
+    }
+
     const scalar sqrtT = sqrt(T);
     const scalar aAlpha = coef1_ - coef2_*sqrtT + coef3_*T;
     const scalar daAlpha = -coef2_/(2*sqrtT) + coef3_;
-
-    const scalar Zv = this->Z(p, T);
 
     if (B == -Zv)
     {
@@ -245,13 +301,36 @@ inline Foam::scalar Foam::SRKGas<Specie>::h
 
 
 template<class Specie>
-inline Foam::scalar Foam::SRKGas<Specie>::Cp
+inline Foam::scalar Foam::SRKGas<Specie>::h
 (
     scalar p,
-    scalar T
+    const scalar T
 ) const
 {
     p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
+
+    if (stableRoot_ && rootBlendTol_ > 0)
+    {
+        scalar Zmin, Zmax, lnPhiL, lnPhiV;
+        if (cubicBranches(p, T, Zmin, Zmax, lnPhiL, lnPhiV))
+        {
+            const scalar w = blendWeight(lnPhiL, lnPhiV);
+            return w*hFromZ(p, T, Zmin) + (1.0 - w)*hFromZ(p, T, Zmax);
+        }
+    }
+
+    return hFromZ(p, T, this->Z(p, T));
+}
+
+
+template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::CpFromZ
+(
+    const scalar p,
+    const scalar T,
+    const scalar Zv
+) const
+{
     const scalar sqrtT = sqrt(T);
     const scalar aAlpha = coef1_ - coef2_*sqrtT + coef3_*T;
     const scalar daAlpha = -coef2_/(2*sqrtT) + coef3_;
@@ -264,7 +343,13 @@ inline Foam::scalar Foam::SRKGas<Specie>::Cp
         B = 1e-16;
     }
 
-    const scalar Zv = this->Z(p, T);
+    // See hFromZ(): a branch with Zv <= B is unphysical/GREAT-fugacity and
+    // gets ~0 blend weight, but is still evaluated by the caller -- guard
+    // against the log()/division singularity rather than SIGFPE.
+    if (Zv <= B)
+    {
+        return 0;
+    }
 
     const scalar M = (sqr(Zv) + B*Zv)/(Zv - B);
     const scalar N = daAlpha*B/(b_*Foam::constant::thermodynamic::RR);
@@ -280,13 +365,36 @@ inline Foam::scalar Foam::SRKGas<Specie>::Cp
 
 
 template<class Specie>
-inline Foam::scalar Foam::SRKGas<Specie>::e
+inline Foam::scalar Foam::SRKGas<Specie>::Cp
 (
     scalar p,
-    const scalar T
+    scalar T
 ) const
 {
     p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
+
+    if (stableRoot_ && rootBlendTol_ > 0)
+    {
+        scalar Zmin, Zmax, lnPhiL, lnPhiV;
+        if (cubicBranches(p, T, Zmin, Zmax, lnPhiL, lnPhiV))
+        {
+            const scalar w = blendWeight(lnPhiL, lnPhiV);
+            return w*CpFromZ(p, T, Zmin) + (1.0 - w)*CpFromZ(p, T, Zmax);
+        }
+    }
+
+    return CpFromZ(p, T, this->Z(p, T));
+}
+
+
+template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::eFromZ
+(
+    const scalar p,
+    const scalar T,
+    const scalar Zv
+) const
+{
     // e_departure = h_departure without the (Z-1) ideal-gas PV work term
     // Following the PengRobinsonGas pattern: e = h - RR*T*(Z-1)/W
     scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
@@ -295,9 +403,9 @@ inline Foam::scalar Foam::SRKGas<Specie>::e
         B = 1e-16;
     }
 
-    const scalar Zv = this->Z(p, T);
-
-    if (B == -Zv)
+    // See hFromZ(): unphysical branch (~0 blend weight) -- avoid the
+    // log()/division singularity.
+    if (Zv <= B || B == -Zv)
     {
         // Departure vanishes
         return 0;
@@ -317,47 +425,72 @@ inline Foam::scalar Foam::SRKGas<Specie>::e
 
 
 template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::e
+(
+    scalar p,
+    const scalar T
+) const
+{
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
+
+    if (stableRoot_ && rootBlendTol_ > 0)
+    {
+        scalar Zmin, Zmax, lnPhiL, lnPhiV;
+        if (cubicBranches(p, T, Zmin, Zmax, lnPhiL, lnPhiV))
+        {
+            const scalar w = blendWeight(lnPhiL, lnPhiV);
+            return w*eFromZ(p, T, Zmin) + (1.0 - w)*eFromZ(p, T, Zmax);
+        }
+    }
+
+    return eFromZ(p, T, this->Z(p, T));
+}
+
+
+template<class Specie>
 inline Foam::scalar Foam::SRKGas<Specie>::Cv
 (
     scalar p,
     scalar T
 ) const
 {
-    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
-    // Cv = Cp - CpMCv, inline both to share a single Z(p,T) solve
-    const scalar sqrtT = sqrt(T);
-    const scalar aAlpha = coef1_ - coef2_*sqrtT + coef3_*T;
-    const scalar daAlpha = -coef2_/(2*sqrtT) + coef3_;
-    const scalar ddaAlpha = coef2_/(4*T*sqrtT);
-    const scalar A =
-        aAlpha*p/sqr(Foam::constant::thermodynamic::RR*T);
+    // Cv = Cp - CpMCv; both are already branch-blend-aware, so composing
+    // them here automatically inherits that consistency (no direct Zv use).
+    return this->Cp(p, T) - this->CpMCv(p, T);
+}
+
+
+template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::spFromZ
+(
+    const scalar p,
+    const scalar T,
+    const scalar Zv
+) const
+{
+    const scalar daAlpha = -coef2_/(2*sqrt(T)) + coef3_;
     scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
     if (B <= 0)
     {
         B = 1e-16;
     }
 
-    const scalar Zv = this->Z(p, T);
+    // See hFromZ(): unphysical branch (~0 blend weight) -- log(Zv-B) is
+    // singular/undefined here, avoid it.
+    if (Zv <= B)
+    {
+        return 0;
+    }
 
-    const scalar M = (sqr(Zv) + B*Zv)/(Zv - B);
-    const scalar N = daAlpha*B/(b_*Foam::constant::thermodynamic::RR);
-
-    const scalar MminusN = M - N;
-    const scalar Msq = sqr(M);
-    const scalar denom = Msq - A*(2*Zv + B);
-
-    // Cp (departure) contribution
-    const scalar CpVal =
+    return
     (
-        (T/b_)*ddaAlpha*log((Zv + B)/Zv)
-      + Foam::constant::thermodynamic::RR*sqr(MminusN)/denom
-      - Foam::constant::thermodynamic::RR
+        Foam::constant::thermodynamic::RR
+       *(
+            -log(p/Pstd)
+          + log(Zv - B)
+        )
+      - daAlpha/b_*log((Zv + B)/Zv)
     )/this->W();
-
-    // CpMCv contribution
-    const scalar CpMCvVal = this->R()*sqr(MminusN)/denom;
-
-    return CpVal - CpMCvVal;
 }
 
 
@@ -369,24 +502,18 @@ inline Foam::scalar Foam::SRKGas<Specie>::sp
 ) const
 {
     p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
-    const scalar daAlpha = -coef2_/(2*sqrt(T)) + coef3_;
-    scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
-    if (B <= 0)
+
+    if (stableRoot_ && rootBlendTol_ > 0)
     {
-        B = 1e-16;
+        scalar Zmin, Zmax, lnPhiL, lnPhiV;
+        if (cubicBranches(p, T, Zmin, Zmax, lnPhiL, lnPhiV))
+        {
+            const scalar w = blendWeight(lnPhiL, lnPhiV);
+            return w*spFromZ(p, T, Zmin) + (1.0 - w)*spFromZ(p, T, Zmax);
+        }
     }
 
-    const scalar Zv = this->Z(p, T);
-
-    return
-    (
-        Foam::constant::thermodynamic::RR
-       *(
-            -log(p/Pstd)
-          + log(Zv - B)
-        )
-      - daAlpha/b_*log((Zv + B)/Zv)
-    )/this->W();
+    return spFromZ(p, T, this->Z(p, T));
 }
 
 
@@ -425,10 +552,114 @@ inline Foam::scalar Foam::SRKGas<Specie>::psi
     // the real value is used here.
     p = max(p, scalar(1e4));   // RE-DIAGNOSIS TEST: EOS-internal p-floor (see rho())
     const scalar dp = 1e-3*p;
+
+    if (stableRoot_ && rootBlendTol_ > 0)
+    {
+        // Branch-consistent finite difference. A naive FD of the blended
+        // rho(p,T) (rho(p+dp)-rho(p))/dp re-evaluates the logistic weight w
+        // at BOTH p and p+dp independently; if the blend crossing (width
+        // ~rootBlendTol_ in lnPhi, which can correspond to a p-window far
+        // narrower than the fixed dp=1e-3*p step) falls between them, the FD
+        // effectively differences across the whole Zmin->Zmax jump instead
+        // of sampling the local slope -- an artificially huge/erratic psi
+        // that (via the globally-coupled elliptic pEqn) was observed to
+        // inflate the WHOLE-domain pressure field during the cold-start
+        // transient (2-3x nominal, PEP and LAD Spike Suppression wiki sec
+        // 14), even far from any near-critical cell. Fix: freeze the blend
+        // weight w at p, difference each branch (Zmin, Zmax) against ITSELF
+        // at p and p+dp (each branch is the analytic continuation of one
+        // cubic root and has no jump), then blend the two smooth per-branch
+        // psi's with the same frozen w -- never finite-differences across
+        // the crossing.
+        scalar Zmin0, Zmax0, lnPhiL0, lnPhiV0;
+        if (cubicBranches(p, T, Zmin0, Zmax0, lnPhiL0, lnPhiV0))
+        {
+            scalar Zmin1, Zmax1, lnPhiL1, lnPhiV1;
+            cubicBranches(p + dp, T, Zmin1, Zmax1, lnPhiL1, lnPhiV1);
+
+            const scalar dPhi = (lnPhiV0 - lnPhiL0)/rootBlendTol_;
+            const scalar w =
+                1.0/(1.0 + exp(-max(scalar(-60), min(scalar(60), dPhi))));
+
+            const scalar rhoMin0 = rhoFromZ(p, T, Zmin0);
+            const scalar rhoMin1 = rhoFromZ(p + dp, T, Zmin1);
+            const scalar rhoMax0 = rhoFromZ(p, T, Zmax0);
+            const scalar rhoMax1 = rhoFromZ(p + dp, T, Zmax1);
+
+            const scalar psiMin = (rhoMin1 - rhoMin0)/dp;
+            const scalar psiMax = (rhoMax1 - rhoMax0)/dp;
+            const scalar dRhodP = w*psiMin + (1.0 - w)*psiMax;
+            const scalar rho0 = w*rhoMin0 + (1.0 - w)*rhoMax0;
+
+            return max(dRhodP, 1e-3*rho0/p);
+        }
+        // Single real root at p: no blend possible here, fall through to
+        // the plain FD below (identical to the non-blended path).
+    }
+
     const scalar rho0 = this->rho(p, T);
     const scalar rho1 = this->rho(p + dp, T);
     const scalar dRhodP = (rho1 - rho0)/dp;
     return max(dRhodP, 1e-3*rho0/p);   // floor at 0.1% of rho/p
+}
+
+
+template<class Specie>
+inline bool Foam::SRKGas<Specie>::cubicBranches
+(
+    const scalar p,
+    const scalar T,
+    scalar& Zmin,
+    scalar& Zmax,
+    scalar& lnPhiL,
+    scalar& lnPhiV
+) const
+{
+    const scalar aAlpha = coef1_ - coef2_*sqrt(T) + coef3_*T;
+
+    const scalar A =
+        aAlpha*p/sqr(Foam::constant::thermodynamic::RR*T);
+    const scalar B = b_*p/(Foam::constant::thermodynamic::RR*T);
+
+    const scalar a2 = -1.0;
+    const scalar a1 = A - B - sqr(B);
+    const scalar a0 = -A*B;
+
+    const scalar Q = (3*a1 - a2*a2)/9.0;
+    const scalar Rl = (9*a2*a1 - 27*a0 - 2*a2*a2*a2)/54.0;
+
+    const scalar Q3 = Q*Q*Q;
+    const scalar D = Q3 + Rl*Rl;
+
+    if (D > 0)
+    {
+        const scalar D05 = sqrt(D);
+        scalar S = (Rl + D05 < 0) ? -cbrt(mag(Rl + D05)) : cbrt(Rl + D05);
+        scalar Tl = (D05 > Rl) ? -cbrt(mag(Rl - D05)) : cbrt(Rl - D05);
+        Zmin = Zmax = S + Tl - a2/3.0;
+        lnPhiL = lnPhiV = 0;
+        return false;
+    }
+
+    const scalar th = ::acos(max(scalar(-1), min(scalar(1), Rl/sqrt(-Q3))));
+    const scalar qm = 2*sqrt(-Q);
+    const scalar pi = constant::mathematical::pi;
+    const scalar r[3] =
+    {
+        qm*cos(th/3.0) - a2/3.0,
+        qm*cos((th + 2*pi)/3.0) - a2/3.0,
+        qm*cos((th + 4*pi)/3.0) - a2/3.0
+    };
+
+    Zmin = min(r[0], min(r[1], r[2]));
+    Zmax = max(r[0], max(r[1], r[2]));
+
+    lnPhiL =
+        (Zmin > B)
+      ? Zmin - 1 - log(Zmin - B) - (A/B)*log(1 + B/Zmin)
+      : GREAT;
+    lnPhiV = Zmax - 1 - log(Zmax - B) - (A/B)*log(1 + B/Zmax);
+    return true;
 }
 
 
@@ -515,7 +746,29 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
               : GREAT;                  // liquid root below co-volume: reject
             const scalar lnPhiV =
                 Zmax - 1 - log(Zmax - B) - (A/B)*log(1 + B/Zmax);
-            root = (lnPhiL <= lnPhiV) ? Zmin : Zmax;
+
+            if (rootBlendTol_ > 0)
+            {
+                // Smooth (logistic) blend across a ln(fugacity) deadband,
+                // instead of the hard argmin below. Near the Widom line,
+                // adjacent cells at nearly identical (T,p) can sit on
+                // opposite sides of lnPhiL == lnPhiV for p perturbations as
+                // small as 0.05-3%, so the hard switch flips the whole
+                // liquid/vapour branch (rho jump 2-5x) cell-to-cell -- a
+                // discontinuous-classifier artefact, not physics (see PEP
+                // and LAD Spike Suppression wiki secs 6-10). w in (0,1)
+                // interpolates Z smoothly liquid(Zmin)->vapour(Zmax) over a
+                // band of width ~rootBlendTol_ in lnPhi, collapsing to the
+                // exact hard switch far from the crossing.
+                const scalar dPhi = (lnPhiV - lnPhiL)/rootBlendTol_;
+                const scalar w =
+                    1.0/(1.0 + exp(-max(scalar(-60), min(scalar(60), dPhi))));
+                root = w*Zmin + (1.0 - w)*Zmax;
+            }
+            else
+            {
+                root = (lnPhiL <= lnPhiV) ? Zmin : Zmax;
+            }
         }
         else
         {
@@ -562,13 +815,13 @@ inline Foam::scalar Foam::SRKGas<Specie>::Z
 
 
 template<class Specie>
-inline Foam::scalar Foam::SRKGas<Specie>::CpMCv
+inline Foam::scalar Foam::SRKGas<Specie>::CpMCvFromZ
 (
-    scalar p,
-    scalar T
+    const scalar p,
+    const scalar T,
+    const scalar Zv
 ) const
 {
-    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
     const scalar aAlpha = coef1_ - coef2_*sqrt(T) + coef3_*T;
     const scalar daAlpha = -coef2_/(2*sqrt(T)) + coef3_;
 
@@ -580,12 +833,41 @@ inline Foam::scalar Foam::SRKGas<Specie>::CpMCv
         B = 1e-16;
     }
 
-    const scalar Zv = this->Z(p, T);
+    // See hFromZ(): unphysical branch (~0 blend weight) -- M = (...)/(Zv-B)
+    // is singular here, avoid it.
+    if (Zv <= B)
+    {
+        return 0;
+    }
 
     const scalar M = (sqr(Zv) + B*Zv)/(Zv - B);
     const scalar N = daAlpha*B/(b_*Foam::constant::thermodynamic::RR);
 
     return this->R()*sqr(M - N)/(sqr(M) - A*(2*Zv + B));
+}
+
+
+template<class Specie>
+inline Foam::scalar Foam::SRKGas<Specie>::CpMCv
+(
+    scalar p,
+    scalar T
+) const
+{
+    p = max(p, scalar(1e4)); // EOS p-floor (see Z()/rho())
+
+    if (stableRoot_ && rootBlendTol_ > 0)
+    {
+        scalar Zmin, Zmax, lnPhiL, lnPhiV;
+        if (cubicBranches(p, T, Zmin, Zmax, lnPhiL, lnPhiV))
+        {
+            const scalar w = blendWeight(lnPhiL, lnPhiV);
+            return
+                w*CpMCvFromZ(p, T, Zmin) + (1.0 - w)*CpMCvFromZ(p, T, Zmax);
+        }
+    }
+
+    return CpMCvFromZ(p, T, this->Z(p, T));
 }
 
 

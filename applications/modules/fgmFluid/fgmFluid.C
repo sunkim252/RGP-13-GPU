@@ -29,6 +29,7 @@ License
 #include "DynamicList.H"
 #include "HashSet.H"
 #include "addToRunTimeSelectionTable.H"
+#include "zeroGradientFvPatchFields.H"
 #include "tabulatedRealGasMixture.H"
 #include "Switch.H"
 #include "Pstream.H"
@@ -125,6 +126,10 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     armedYData_(nullptr),
 
     tabLewis_(false),
+
+    tabPsis_(false),
+
+    manifoldYFilled_(false),
 
     gpuThermo_(fgmTable_.lookupOrDefault<Switch>("gpuThermo", false)),
     gpuArmed_(false),
@@ -352,6 +357,19 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
     // each field carries the previous manifold update's Le (a one-iteration lag
     // that is immaterial: Le enters only the weak Deff->chi->source coupling and
     // converges over the outer correctors).
+    //
+    // The zeroGradient patch type is REQUIRED, not cosmetic (2026-07-26). The
+    // manifold fill loop writes primitiveFieldRef() (internal cells only) and
+    // relies on correctBoundaryConditions() for the patches -- but that is a
+    // no-op on the default "calculated" type, so with calculated patches the
+    // boundary values would stay frozen at the constructor value 1 forever.
+    // Deff() = mu/Le + turb is a volScalarField whose BOUNDARY field feeds
+    // fvm::laplacian(DZ,...) through the patch face values, so every wall and
+    // inlet face would silently diffuse at unity Lewis while the interior used
+    // the tabulated Le -- defeating Tier-4 differential diffusion exactly at
+    // the cryogenic wall where Le departs from 1 the most. The bug went
+    // unnoticed because 1 is a plausible-looking value; the same defect on
+    // psisTabField_ (initialised to 0) surfaced immediately as a 1/0 SIGFPE.
     if (fgmTable_.hasLeField("Z"))
     {
         LeZField_.reset
@@ -364,7 +382,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
                     IOobject::NO_READ, IOobject::NO_WRITE
                 ),
                 mesh,
-                dimensionedScalar(dimless, 1)
+                dimensionedScalar(dimless, 1),
+                zeroGradientFvPatchScalarField::typeName
             )
         );
     }
@@ -380,7 +399,8 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
                     IOobject::NO_READ, IOobject::NO_WRITE
                 ),
                 mesh,
-                dimensionedScalar(dimless, 1)
+                dimensionedScalar(dimless, 1),
+                zeroGradientFvPatchScalarField::typeName
             )
         );
     }
@@ -392,6 +412,68 @@ Foam::solvers::fgmFluid::fgmFluid(fvMesh& mesh)
             << (LeZField_.valid() ? "Le_Z " : "")
             << (LeCField_.valid() ? "Le_C" : "")
             << "] from the manifold drive Deff (rho*D = mu/Le)" << nl << endl;
+    }
+
+    // OPTIONAL UFPV chi-source table (2026-07-28): see chiSrcTable_ note in
+    // fgmFluid.H. Loaded when constant/fgmPropertiesChi exists (kill-switch:
+    // 'chiSourceTable false;' in fgmProperties). Must be a genuine chi-axis
+    // 4-D table -- an enthalpy/dilution 4th axis here would silently feed dh
+    // values into a chi lookup.
+    {
+        typeIOobject<IOdictionary> chiHeader
+        (
+            "fgmPropertiesChi",
+            mesh.time().constant(),
+            mesh,
+            IOobject::MUST_READ,
+            IOobject::NO_WRITE
+        );
+
+        if
+        (
+            fgmTable_.lookupOrDefault<Switch>("chiSourceTable", true)
+         && chiHeader.headerOk()
+        )
+        {
+            chiSrcTable_.reset(new FGMTable(mesh, "fgmPropertiesChi"));
+
+            if (!chiSrcTable_().hasChi())
+            {
+                FatalErrorInFunction
+                    << "fgmPropertiesChi must be a 4-D table whose 4th axis "
+                    << "is chi_st (found a 3-D table or an enthalpy/dilution "
+                    << "4th axis)." << exit(FatalError);
+            }
+
+            Info<< "fgmFluid: UFPV chi-source ACTIVE -- sourcePV from "
+                << "fgmPropertiesChi at the local chi_st (all thermo stays "
+                << "on the main table); cold gate 0.5(1+tanh((T-900)/150)), "
+                << "hard 0 below 600 K" << nl << endl;
+        }
+    }
+
+    // Optional pre-tabulated isentropic compressibility (2026-07-24): see
+    // fgmFluid.H psisTabField_ note and pressureCorrector.C psisTabulated.
+    if (fgmTable_.hasPsis())
+    {
+        psisTabField_.reset
+        (
+            new volScalarField
+            (
+                IOobject
+                (
+                    "FGM:psisTab", runTime.name(), mesh,
+                    IOobject::NO_READ, IOobject::NO_WRITE
+                ),
+                mesh,
+                dimensionedScalar(dimensionSet(-1, 1, 2, 0, 0, 0, 0), 0),
+                zeroGradientFvPatchScalarField::typeName
+            )
+        );
+        tabPsis_ = true;
+        Info<< "fgmFluid: tabulated psis (psisTab) ACTIVE -- per-cell "
+            << "isentropic compressibility from the manifold available for "
+            << "pressureCorrector's psisTabulated switch" << nl << endl;
     }
 
     // Tier-2: enable the tabulated real-gas coefficient lookup (allocates the
@@ -856,6 +938,12 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
     // manifold point per cell, so the 4-axis bracket is built once per cell
     // (makeStencil) and reused -- bit-identical to the per-field lookups.
     const List<scalar>& srcTbl = fgmTable_.sourcePVTable();
+
+    // UFPV chi-source hoists (see chiSrcTable_ decl): table + flat source
+    // list lifted out of the hot loop like every other table pointer here.
+    const bool chiSrc = chiSrcTable_.valid();
+    const List<scalar>* chiSrcTbl =
+        chiSrc ? &chiSrcTable_().sourcePVTable() : nullptr;
     const List<scalar>& Ttbl = fgmTable_.Ttable();
     if (Ttbl.empty())
     {
@@ -893,6 +981,26 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
     const List<scalar>* LeZtbl = fillLeZ ? &fgmTable_.LeTable("Z") : nullptr;
     const List<scalar>* LeCtbl = fillLeC ? &fgmTable_.LeTable("C") : nullptr;
 
+    // Hoist the tabulated psis field (2026-07-24) the same way as Le_Z/Le_C.
+    const bool fillPsis = psisTabField_.valid();
+    scalarField* psisTabc =
+        fillPsis ? &psisTabField_->primitiveFieldRef() : nullptr;
+    const List<scalar>* psisTbl =
+        fillPsis ? &fgmTable_.psisTable() : nullptr;
+
+    // The tabulated species Y_ are DERIVED, never transported. The mixture reads
+    // them only via compositionToX (mu/kappa use sumX==1, base thermo comes from
+    // the Opt-1 node blend), so on internal cells mu/kappa/rho/EOS are Y-value-
+    // independent and the 106-field Y interpolation -- the bulk of updateManifold
+    // -- is needed only for output. OPT-IN 'deferManifoldY' skips it except on
+    // the first call and write steps; a residual ~1e-5 (patch-face fallback /
+    // composition path) makes it non-bit-identical, negligible for LES but not
+    // enabled by default. Default (flag off) fills Y every call = bit-identical.
+    const bool deferY =
+        fgmTable_.lookupOrDefault<Switch>("deferManifoldY", false);
+    const bool fillY =
+        !deferY || !manifoldYFilled_ || mesh.time().writeTime();
+
     // Tabulated temperature: the FPV/FGM thermochemical state (T and the
     // composition) is a FUNCTION of the manifold coordinates (Z, gZ, c, chi)
     // -- it is LOOKED UP here, not advanced by a transported energy equation.
@@ -910,6 +1018,17 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
     // 한다. 경계면 처리와 he 재시드는 CPU에 남는다(v1).
     std::chrono::steady_clock::time_point tSec;
     if (thermoTimings_) { tSec = std::chrono::steady_clock::now(); }
+
+    // upstream 933cfe1(UFPV chi-source)/4f7804f(psisTab): 디바이스 manifold
+    // 커널은 이 테이블들을 모른다 — 조용한 물리 누락 대신 host 루프로
+    // fail-closed 강등 (1회 경고).
+    if (gpuManifold_ && (chiSrc || fillPsis))
+    {
+        WarningInFunction
+            << "UFPV chi-source / psisTab tables are host-only -- "
+            << "gpuManifold disabled" << endl;
+        gpuManifold_ = Switch(false);
+    }
 
     bool gpuDone = false;
     if (gpuManifold_)
@@ -1281,9 +1400,36 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
         srcc[celli] =
             sourcePVscale_*rho_l*fgmTable_.interpolate(srcTbl, st);
         Tc[celli] = fgmTable_.interpolate(Ttbl, st);
-        forAll(Yref, k)
+
+        // UFPV chi-source override: same (Z,gZ,c) but the TRUE local chi_st
+        // (the main stencil's 4th coordinate is dh on an enthalpy table).
+        // The chi table is adiabatic, so re-apply the identical cold-
+        // inertness gate add_enthalpy_axis.py baked into the dh table
+        // (T_IGN=900, DT_IGN=150, hard cutoff T_CUT=600), driven by the
+        // dh-consistent temperature just looked up -- cryogenic/heat-loss
+        // zones stay inert exactly as before.
+        if (chiSrc)
         {
-            (*Yref[k])[celli] = fgmTable_.interpolate(*Ytbl[k], st);
+            FGMTable::FGMStencil stChi;
+            chiSrcTable_().makeStencil(Zcl, gz, Ccl, chi_st, stChi);
+
+            scalar gate = 0.5*(scalar(1)
+                + tanh((Tc[celli] - scalar(900))/scalar(150)));
+            if (Tc[celli] < scalar(600))
+            {
+                gate = 0;
+            }
+
+            srcc[celli] =
+                sourcePVscale_*rho_l*gate
+               *chiSrcTable_().interpolate(*chiSrcTbl, stChi);
+        }
+        if (fillY)
+        {
+            forAll(Yref, k)
+            {
+                (*Yref[k])[celli] = fgmTable_.interpolate(*Ytbl[k], st);
+            }
         }
 
         // Tier-2: per-cell real-gas mixture coefficients.
@@ -1305,6 +1451,11 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
         {
             (*LeCc)[celli] = fgmTable_.interpolate(*LeCtbl, st);
         }
+
+        if (fillPsis)
+        {
+            (*psisTabc)[celli] = fgmTable_.interpolate(*psisTbl, st);
+        }
     }
 
     // CPU 폴백 루프는 호스트 Y를 직접 채우므로 stale 아님
@@ -1323,9 +1474,14 @@ void Foam::solvers::fgmFluid::updateManifold(const bool hostScatter)
     chi_st_.correctBoundaryConditions();
     if (fillLeZ) { LeZField_->correctBoundaryConditions(); }
     if (fillLeC) { LeCField_->correctBoundaryConditions(); }
-    forAll(tabSpecieIDs_, k)
+    if (fillPsis) { psisTabField_->correctBoundaryConditions(); }
+    if (fillY)
     {
-        Y_[tabSpecieIDs_[k]].correctBoundaryConditions();
+        forAll(tabSpecieIDs_, k)
+        {
+            Y_[tabSpecieIDs_[k]].correctBoundaryConditions();
+        }
+        manifoldYFilled_ = true;
     }
 
     // Opt-2: fill the patch-face real-gas coefficients from the manifold so the

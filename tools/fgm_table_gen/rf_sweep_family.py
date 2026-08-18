@@ -23,7 +23,7 @@ matrix (no Takahashi high-pressure correction -- Cantera has no HP-MC model),
 still on the SRK EOS. Comparing the two RF families isolates the MA-vs-MC
 closure difference at identical EOS/conditions.
 """
-import sys, time
+import os, sys, time
 from pathlib import Path
 
 import numpy as np
@@ -44,13 +44,19 @@ STAGE1_ONLY = "--stage1-only" in sys.argv
 if STAGE1_ONLY:
     sys.argv.remove("--stage1-only")
 SEED_RFMA = "--seed-rfma" in sys.argv
+SEED_DUALGAS = "--seed-dualgas" in sys.argv   # 2026-07-30: high-chi ladder
+if SEED_DUALGAS:
+    sys.argv.remove("--seed-dualgas")
 if SEED_RFMA:
     sys.argv.remove("--seed-rfma")
 if "--transport" in sys.argv:
     _i = sys.argv.index("--transport")
     TRANSPORT2 = sys.argv[_i+1]
     del sys.argv[_i:_i+2]
-OUT = HERE / ("data/flamelets_rf525" if TRANSPORT2 == "high-pressure-Chung"
+# 2026-07-30: 검증용 산출물이 정답(ground-truth) 패밀리에 섞이는 사고가
+# 있었으므로 출력 디렉터리를 env로 분리할 수 있게 한다(기본값 불변).
+OUT = HERE / os.environ.get("RF_OUT_DIR", "") if os.environ.get("RF_OUT_DIR") \
+    else HERE / ("data/flamelets_rf525" if TRANSPORT2 == "high-pressure-Chung"
               else "data/flamelets_rf525_MC")
 TAG = ("real-fluid-SRK-HPChung" if TRANSPORT2 == "high-pressure-Chung"
        else "real-fluid-SRK-MC")
@@ -226,9 +232,54 @@ def _seed_from_rfma(mdot):
     return f, gas
 
 
+def _seed_from_dualgas(mdot):
+    """High-chi ladder seeder (2026-07-30): the RF-MA family only covers
+    mdot<=1.02, but the dual-gas MA family (ideal structure, kinetic MA) spans
+    the whole mdot<=36 ladder at the SAME matched widths. Transplant that
+    profile onto a fresh SRK flame and hand it to stage 2 -- same logic as
+    _seed_from_rfma, different (ideal-structure) seed."""
+    import glob as _g
+    best, bp = None, None
+    for fp in _g.glob(str(HERE/"data/flamelets_dualgas_MA/flamelet_*.npz")):
+        a = np.load(fp); dm = abs(float(a["mdot"]) - mdot)
+        if best is None or dm < best:
+            best, bp = dm, fp
+    if best is None or best > 1e-3:
+        raise RuntimeError(f"no dual-gas seed within tol (nearest {best})")
+    a = np.load(bp)
+    f, gas = _new_srk_flame(mdot)
+    z = np.asarray(a["z"]); zrel = (z - z[0])/(z[-1] - z[0])
+    f.transport_model = "mixture-averaged"
+    f.set_initial_guess()
+    f.set_profile("T", zrel, np.asarray(a["T"]))
+    for k, sp in enumerate(gas.species_names):
+        key = f"Y_{sp}"
+        if key in a.files:
+            f.set_profile(sp, zrel, np.asarray(a[key]))
+    log(f"[mdot={mdot:g}] seed-dualgas from {Path(bp).name} "
+        f"(Tmax_seed={f.T.max():.0f}K, width={matched_width(mdot)*1e3:.2f}mm)")
+    return f, gas
+
+
 def solve_one(mdot, idx):
     t0 = time.time()
     f = gas = None
+    if SEED_DUALGAS:
+        try:
+            f, gas = _seed_from_dualgas(mdot)
+        except Exception as e:
+            log(f"[mdot={mdot:g}] seed-dualgas failed ({e})"); return
+        f.transport_model = TRANSPORT2
+        try:
+            f.solve(loglevel=0, refine_grid=True, auto=False)
+        except Exception as e:
+            log(f"[mdot={mdot:g}] stage2 noauto failed ({e}) -> auto=True")
+            f.solve(loglevel=0, auto=True)
+        log(f"[mdot={mdot:g}] stage2 {TRANSPORT2}: Tmax={f.T.max():.0f}K "
+            f"npts={f.grid.size} ({time.time()-t0:.0f}s)")
+        if f.T.max() < 1500:
+            log(f"[mdot={mdot:g}] EXTINGUISHED -- not saved"); return
+        save_family(f, gas, idx); return
     if SEED_RFMA:
         try:
             f, gas = _seed_from_rfma(mdot)

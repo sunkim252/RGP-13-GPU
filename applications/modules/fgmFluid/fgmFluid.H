@@ -98,6 +98,19 @@ protected:
         //- FGM (FPV) lookup table: (Z~, gZ, C~) -> omega_C, T, Y_k
         FGMTable fgmTable_;
 
+        //- OPTIONAL second manifold: (Z~, gZ, C~, chi_st) UFPV SOURCE table
+        //  (constant/fgmPropertiesChi). When present, sourcePV is looked up
+        //  here at the LOCAL chi_st instead of the main table -- giving the
+        //  source genuine strain response (weaker at high chi) where the
+        //  steady-family table applies its burning-branch value regardless
+        //  of strain. All THERMO (T, Y, RG_*, Le_*, psis) stays on the main
+        //  (Z,gZ,C,dh) table so the non-adiabatic transcritical path is
+        //  untouched; the chi table is adiabatic (800 K flamelet boundary)
+        //  and the solver re-applies the SAME cold-inertness gate the dh
+        //  table bakes in (add_enthalpy_axis.py: 0.5(1+tanh((T-900)/150)),
+        //  hard 0 below 600 K) using the dh-table temperature (2026-07-28).
+        autoPtr<FGMTable> chiSrcTable_;
+
         //- Mixture fraction Z~ (transported, no source)
         volScalarField Z_;
 
@@ -226,6 +239,25 @@ protected:
 
         //- True when at least one tabulated Lewis-number field is active.
         bool tabLewis_;
+
+        //- Optional per-cell pre-tabulated isentropic compressibility field,
+        //  filled from fgmTable_ each updateManifold (2026-07-24). Null unless
+        //  the table carries "psisTab"; when present, pressureCorrector's
+        //  psisTabulated switch reads this instead of the pointwise
+        //  thermo.psi()/(rho*thermo.gamma()) EOS evaluation -- a principled,
+        //  offline-smoothed alternative to the runtime psisCapRatio patch.
+        autoPtr<volScalarField> psisTabField_;
+
+        //- True when the tabulated psis field is active.
+        bool tabPsis_;
+
+        //- Set once the manifold species fields have been filled at least once.
+        //  The 106 tabulated Y_ are DERIVED (never transported) and the mixture
+        //  reads only tabulated aggregates (RG_*/Le + sumX==1), so the per-cell
+        //  Y interpolation -- the bulk of updateManifold -- only needs to run
+        //  for output. updateManifold() fills Y on the first call and on write
+        //  steps; otherwise it skips it (mu/kappa/rho/EOS stay bit-identical).
+        bool manifoldYFilled_;
 
         //- thermoGPU: offload the per-cell property refresh (the
         //  RhoFluidThermo::calculate() loop -- Cp/Cv/psi/rho/mu/kappa at the

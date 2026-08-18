@@ -28,8 +28,10 @@ License
 #include "fvmLaplacian.H"
 #include "fvcGrad.H"
 #include "fvcDiv.H"
+#include "fvcLaplacian.H"
 #include "fvcSnGrad.H"
 #include "fvcReconstruct.H"
+#include "safeReconstruct.H"
 #include "zeroGradientFvPatchFields.H"
 #include "limitedSurfaceInterpolationScheme.H"
 #include "solutionControl.H"
@@ -888,6 +890,77 @@ void Foam::solvers::fgmFluid::momentumPredictor()
         return;
     }
 
+    // --- Korteweg capillary stress (transcritical density interface) --------
+    // NOBLE (physics-restoring) alternative to the ad-hoc LAD/limitU regulari-
+    // sation: restores the surface-tension-like force that a fully conservative
+    // real-fluid code OMITS at the transcritical contact. Jofre & Urzay, Prog.
+    // Energy Combust. Sci. 82 (2021) 100877: the SRK thermodynamic pressure
+    // genuinely dips O(10-100 bar) across the diffuse LOX/gas interface (Maxwell
+    // loop); in reality this is balanced by the Korteweg (van der Waals square-
+    // gradient) stress
+    //   tau_K = [lambda*rho*lap(rho) + 0.5*lambda*|grad(rho)|^2] I
+    //         - lambda*grad(rho) (x) grad(rho)
+    // whose divergence reduces by the standard identity to the body force
+    //   f_K = div(tau_K) = lambda * rho * grad(lap(rho))          [N/m^3]
+    // Added as a momentum source (RHS). It self-localises to the interface
+    // (grad(lap(rho)) ~ 0 in smooth regions) so, unlike LAD, it does not diffuse
+    // the resolved turbulence, and it OPPOSES the spurious force at the root
+    // instead of damping the resulting velocity -- so limitU can be relaxed.
+    // lambda [m^7/(kg s^2)] calibrated to the resolved interface thickness
+    // (regularised: the true 5 nm interface is unresolvable). Default 0 = off.
+    //
+    // BALANCED-FORCE (2026-07-22): grad(lap(rho)) is reconstructed FROM the face
+    // snGrad -- reconstruct(snGrad(lap(rho))*magSf) -- NOT the Green-Gauss cell
+    // grad. This is the SAME discrete operator the faceGradP cell-velocity update
+    // uses for -grad(p) (reconstruct(snGrad(p)*magSf), see pressureCorrector.C).
+    // With the naive cell grad, the Korteweg body force and the face-consistent
+    // pressure gradient live on DIFFERENT stencils, so at the transcritical
+    // interface they do not cancel discretely and a residual parasitic velocity
+    // survives (the classic surface-tension spurious-current defect; Francois
+    // et al., JCP 213 (2006) 141; interFoam). Matching the operators makes
+    // -snGrad(p) + lambda*rho*snGrad(lap(rho)) cancel face-by-face at mechanical
+    // equilibrium, so the reconstructed cell velocity sees zero net force at the
+    // interface -- the pressure dip is balanced, not merely opposed. Requires
+    // faceGradP=true (asserted below) for the operators to match.
+    const scalar kortewegLambda
+    (
+        pimple.dict().lookupOrDefault<scalar>("kortewegLambda", scalar(0))
+    );
+    volVectorField fKorteweg
+    (
+        IOobject
+        (
+            "fKorteweg",
+            mesh.time().name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        mesh,
+        dimensionedVector(dimForce/dimVolume, Zero),
+        zeroGradientFvPatchVectorField::typeName
+    );
+    if (kortewegLambda != 0)
+    {
+        const dimensionedScalar lambdaK
+        (
+            "lambdaK",
+            dimensionSet(-1, 7, -2, 0, 0, 0, 0),
+            kortewegLambda
+        );
+        // balanced-force: reconstruct grad(lap(rho)) from the face snGrad so it
+        // shares the faceGradP -grad(p) stencil (see header note above).
+        // safeReconstruct (not fvc::reconstruct): AMR hanging-node cells can
+        // singularize the reconstruction tensor -- see safeReconstruct.H.
+        const volScalarField lapRho(fvc::laplacian(rho));
+        fKorteweg =
+            lambdaK*rho
+           *safeReconstruct(fvc::snGrad(lapRho)*mesh.magSf(), fvc::grad(lapRho));
+        fKorteweg.correctBoundaryConditions();
+        Info<< "Korteweg: |fK| max = "
+            << gMax(mag(fKorteweg)().primitiveField()) << " N/m^3" << endl;
+    }
+
     tUEqn =
     (
         fvm::ddt(rho, U) + fvm::div(phi, U)
@@ -895,6 +968,7 @@ void Foam::solvers::fgmFluid::momentumPredictor()
       + momentumTransport->divDevTau(U)
      ==
         fvModels().source(rho, U)
+      + fKorteweg
     );
     fvVectorMatrix& UEqn = tUEqn.ref();
 
@@ -982,11 +1056,14 @@ void Foam::solvers::fgmFluid::momentumPredictor()
             );
             if (faceGradP)
             {
+                // safeReconstruct: see safeReconstruct.H (AMR hanging-node
+                // singular-tensor SIGFPE guard, 2026-07-23). Falls back to
+                // the same fvc::grad(p) the non-faceGradP branch below uses.
                 solve
                 (
                     UEqn
                  ==
-                   -fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+                   -safeReconstruct(fvc::snGrad(p)*mesh.magSf(), fvc::grad(p))
                 );
             }
             else

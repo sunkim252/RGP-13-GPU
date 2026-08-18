@@ -149,6 +149,14 @@ class SRKGas
         //  saturation-line h discontinuity does not feed an h->T Newton solve.
         static bool stableRoot_;
 
+        //- Optional ln(fugacity) deadband [-] for a smooth (logistic) blend
+        //  across the minimum-fugacity root switch, instead of the hard
+        //  argmin above. 0 (default) preserves the exact hard switch. Set by
+        //  'rootBlendTol <scalar>;' in any species' rfProperties (static,
+        //  global, same convention as stableRoot_). See SRKGasI.H::Z() for
+        //  the rationale and blend formula.
+        static scalar rootBlendTol_;
+
 
     // Private Member Functions
 
@@ -165,6 +173,79 @@ class SRKGas
             const scalar T,
             const scalar Zv
         ) const;
+
+        //- Cubic-root branches at (p,T), bypassing the Tier-1 (p,T) cache
+        //  and the stableRoot_/rootBlendTol_ selection logic. Returns true
+        //  (and sets Zmin/Zmax/lnPhiL/lnPhiV) iff the cubic has three real
+        //  roots (D <= 0); returns false (Zmin=Zmax=the single real root)
+        //  otherwise. Shared by Z() and the branch-consistent psi().
+        inline bool cubicBranches
+        (
+            const scalar p,
+            const scalar T,
+            scalar& Zmin,
+            scalar& Zmax,
+            scalar& lnPhiL,
+            scalar& lnPhiV
+        ) const;
+
+        //- Peneloux-corrected density from an already-selected Z (bypasses
+        //  Z(p,T)); shared by rho() and the branch-consistent psi().
+        inline scalar rhoFromZ
+        (
+            const scalar p,
+            const scalar T,
+            const scalar Zv
+        ) const;
+
+        //- Logistic blend weight (liquid-branch fraction, in [0,1]) from the
+        //  two branch fugacities, consistent with the selection in Z().
+        //  Only meaningful when rootBlendTol_ > 0 and cubicBranches() found
+        //  three real roots.
+        inline scalar blendWeight
+        (
+            const scalar lnPhiL,
+            const scalar lnPhiV
+        ) const;
+
+        // Branch-explicit property evaluations. Each analytic property
+        // formula below is derived by implicit differentiation of the SRK
+        // cubic's characteristic equation and is only mathematically valid
+        // when Zv is an ACTUAL root of that cubic. A rootBlendTol_-blended
+        // Z (see Z()) is a weighted average of two roots, not a root itself
+        // -- plugging it into these formulas directly gives meaningless
+        // results (this was the real, broader cause behind the rootBlendTol
+        // cold-start pressure-overshoot bug: not just psi(), but Cp/CpMCv/
+        // h/e/sp/Xterm/lnPhi ALL did this). The public entry points below
+        // instead evaluate the *FromZ variant at Zmin and at Zmax separately
+        // and blend the two (both individually valid, since Zmin/Zmax are
+        // themselves genuine roots) with the same weight used for Z().
+
+        inline scalar hFromZ
+        (
+            const scalar p, const scalar T, const scalar Zv
+        ) const;
+
+        inline scalar CpFromZ
+        (
+            const scalar p, const scalar T, const scalar Zv
+        ) const;
+
+        inline scalar eFromZ
+        (
+            const scalar p, const scalar T, const scalar Zv
+        ) const;
+
+        inline scalar CpMCvFromZ
+        (
+            const scalar p, const scalar T, const scalar Zv
+        ) const;
+
+        inline scalar spFromZ
+        (
+            const scalar p, const scalar T, const scalar Zv
+        ) const;
+
 
 
 public:

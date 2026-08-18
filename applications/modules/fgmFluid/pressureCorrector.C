@@ -45,11 +45,16 @@ Description
 #include "fvcGrad.H"
 #include "fvcSnGrad.H"
 #include "fvcReconstruct.H"
+#include "safeReconstruct.H"
+#include "fvcSmooth.H"
 #include "fvcVolumeIntegrate.H"
 #include "fvmDiv.H"
 #include "fvmLaplacian.H"
 #include "fvcLaplacian.H"
 #include "fvcAverage.H"
+#include "fvmDdt.H"
+#include "fvmSup.H"
+#include "upwind.H"
 #include "zeroGradientFvPatchFields.H"
 #include "extrapolatedCalculatedFvPatchFields.H"
 #include "solutionControl.H"
@@ -65,6 +70,238 @@ Description
 
 #include <chrono>
 #include <dlfcn.h>
+#include "tabulatedRealGasMixture.H"
+
+namespace
+{
+
+// Root-selection hysteresis (2026-07-24, extended): for cells with a
+// genuine 3-real-root EOS ambiguity, pick whichever ACTUAL cubic root
+// (never an interpolated non-root value) gives a density closer to the
+// cell's PREVIOUS-timestep density -- "sticky" branch selection driven by
+// history rather than an instantaneous, near-the-crossing noise-sensitive
+// fugacity comparison (see PEP and LAD Spike Suppression wiki secs 15-18).
+//
+// CRITICAL: rho and psi must be re-derived from the SAME chosen branch. An
+// earlier version corrected rho alone and left psi (read live via
+// thermo.psi() at the psis-construction call site) on the ORIGINAL hard-
+// argmin branch -- rho from branch B, psi from branch A at the same cell,
+// which corrupts the diagonal of the globally-coupled PEP pressure
+// equation and was found to blow the domain pressure up to the pMaxPaDome
+// clamp (wiki sec 18b). Passing a non-null psi here keeps both consistent.
+Foam::label correctRootHysteresis
+(
+    const Foam::tabulatedRealGasMixture& hook,
+    const Foam::PtrList<Foam::volScalarField>& Y,
+    const Foam::volScalarField& p,
+    const Foam::volScalarField& T,
+    const Foam::scalarField& rhoOld,
+    Foam::volScalarField& rho,
+    Foam::volScalarField* psi,
+    // Near-critical (T,p) band pre-filter (2026-07-24c): a genuine 3-real-
+    // root ambiguity is only possible near the mixture's critical point --
+    // cells outside this band are GUARANTEED D>0 (single real root) and
+    // would always be rejected by the EOS evaluation below anyway, but
+    // only after paying for it to find that out. Skips ~40-50% of the
+    // domain (measured via the band_cells diagnostic scan). Defaults match
+    // the established diagnostic near-critical scan band (O2
+    // Tc=154.6K/Pc=50.4bar).
+    const Foam::scalar TMin = 140,
+    const Foam::scalar TMax = 200,
+    const Foam::scalar pMin = 4.0e6,
+    const Foam::scalar pMax = 5.5e6,
+    // Tabulated-coefficient fast path (2026-07-24d): when non-null (and
+    // sized for the 5 SRK coefficients bM/coef1-3/cM, coeffNames() order),
+    // read bM/coef1-3/cM directly from this per-cell TABLE -- the SAME
+    // table fgmFluid::RGcoeffFields_ that thermo_.correct() already
+    // populated this timestep via enableCoeffTabulation() -- an O(1)
+    // lookup, instead of recomputing them from composition via
+    // calculateRealGas()'s O(n^2) species-pair mixing loop (~103 species
+    // in thermo.wang2011). That redundant re-derivation, not the O(1)
+    // psi/Cp/h work trimmed earlier, was the actual dominant cost (PEP and
+    // LAD Spike Suppression wiki sec 18f). Null falls back to the live
+    // composition-based eosRootBranchProperties() (e.g. tabulation
+    // disabled/not yet armed).
+    const Foam::PtrList<Foam::volScalarField>* RGcoeffFields = nullptr,
+    // Mean molecular weight field, needed only by the tabulated path (the
+    // live composition-based fallback derives Wm internally from Y). The
+    // caller passes thermo_.W() -- computed once outside the per-cell loop
+    // (it returns a tmp<volScalarField>, so calling it per-cell would
+    // itself allocate a whole field just to read one value).
+    const Foam::volScalarField* Wfield = nullptr,
+    // Diagnostic only (2026-07-24e, drift-hypothesis follow-up): when
+    // non-null, set to 1 for cells where the sticky pick DIFFERS from the
+    // just-computed hard-argmin value, 0 otherwise (overwritten fresh each
+    // call -- a snapshot of "which cells are hysteresis overriding RIGHT
+    // NOW", not an accumulator). Lets a caller check whether overridden
+    // cells sit at a density-jump boundary with their (uncorrected)
+    // neighbours -- see PEP and LAD Spike Suppression wiki sec 20.
+    Foam::volScalarField* flagField = nullptr,
+    // Neighbour-consistency cap (2026-07-24f): the (T,p) band pre-filter
+    // contains the domain-wide pressure blow-up (wiki sec 21) by letting a
+    // blown-up cell fall out of hysteresis control and relax, but a
+    // residual LOCAL spike survives -- confirmed to correlate with
+    // corrected cells sitting at a density-jump boundary with their
+    // uncorrected neighbours (corrected-uncorrected pairs show a ~5x
+    // higher jump rate than the general population). Narrowing the (T,p)
+    // band further is NOT viable for a combustion case (cells sweep a wide
+    // T range continuously as they heat -- a narrow band only catches a
+    // transient slice and reopens real bistable-pair coverage gaps; wiki
+    // sec 21 follow-up). Instead: when rhoNeighbourAvg is non-null and
+    // capRatio<GREAT, clip the STICKY pick itself to
+    // [rhoNeighbourAvg/capRatio, rhoNeighbourAvg*capRatio] before it's
+    // written -- mirrors the existing psisCapRatio pattern (face-averaged
+    // neighbour value via fvc::average(fvc::interpolate(.))) but applied
+    // to rho at the exact cells hysteresis touches, computed from the
+    // PRE-correction field so it reflects genuine spatial consensus, not
+    // hysteresis's own output.
+    const Foam::volScalarField* rhoNeighbourAvg = nullptr,
+    const Foam::scalar capRatio = Foam::GREAT
+)
+{
+    const Foam::scalarField& pc = p.primitiveField();
+    const Foam::scalarField& Tc = T.primitiveField();
+    Foam::scalarField& rhoc = rho.primitiveFieldRef();
+    Foam::scalarField* psic = psi ? &psi->primitiveFieldRef() : nullptr;
+    Foam::scalarField* flagc =
+        flagField ? &flagField->primitiveFieldRef() : nullptr;
+    if (flagc)
+    {
+        *flagc = 0;
+    }
+    const bool tabulated =
+        RGcoeffFields && RGcoeffFields->size() >= 5 && Wfield;
+
+    Foam::List<Foam::scalar> Yc(Y.size());
+    Foam::label nFlipped = 0;
+
+    forAll(rhoc, celli)
+    {
+        if
+        (
+            Tc[celli] < TMin || Tc[celli] > TMax
+         || pc[celli] < pMin || pc[celli] > pMax
+        )
+        {
+            continue;
+        }
+
+        Foam::scalar rMin, rMax, psiMin, psiMax;
+        bool ok;
+
+        if (tabulated)
+        {
+            ok = hook.eosRootBranchPropertiesFromCoeffs
+            (
+                (*RGcoeffFields)[0].primitiveField()[celli],  // bM
+                (*RGcoeffFields)[1].primitiveField()[celli],  // coef1
+                (*RGcoeffFields)[2].primitiveField()[celli],  // coef2
+                (*RGcoeffFields)[3].primitiveField()[celli],  // coef3
+                (*RGcoeffFields)[4].primitiveField()[celli],  // cM
+                Wfield->primitiveField()[celli],              // Wm
+                pc[celli], Tc[celli],
+                rMin, rMax, psiMin, psiMax,
+                psic != nullptr
+            );
+        }
+        else
+        {
+            forAll(Y, i)
+            {
+                Yc[i] = Y[i].primitiveField()[celli];
+            }
+
+            Foam::scalar CpMin, CpMax, hMin, hMax;
+            ok = hook.eosRootBranchProperties
+            (
+                Yc, pc[celli], Tc[celli],
+                rMin, rMax, psiMin, psiMax, CpMin, CpMax, hMin, hMax,
+                psic != nullptr,  // needPsi: only the site-A (rho,psi) call
+                false             // needCpH: never consumed in this module
+            );
+        }
+
+        if (ok)
+        {
+            bool pickMin =
+                Foam::mag(rMin - rhoOld[celli])
+             <= Foam::mag(rMax - rhoOld[celli]);
+
+            // Neighbour-consistency tie-break (2026-07-24f, corrected): if
+            // the history-preferred branch is badly inconsistent with the
+            // cell's (pre-correction) face-averaged neighbourhood, and the
+            // OTHER branch would be more consistent, switch to it instead.
+            // CRITICAL: this must pick between the two REAL cubic roots,
+            // never clamp to an arbitrary in-between value -- an earlier
+            // version clamped rHyst but left psi keyed to the ORIGINAL
+            // pickMin, silently reintroducing the exact rho/psi branch
+            // mismatch this whole mechanism exists to prevent (confirmed:
+            // it neither closed the residual spike nor kept bistable pairs
+            // at 0). Switching pickMin itself keeps rho AND psi consistent
+            // with the SAME (possibly reconsidered) branch.
+            if (rhoNeighbourAvg && capRatio < Foam::GREAT)
+            {
+                const Foam::scalar rAvg =
+                    rhoNeighbourAvg->primitiveField()[celli];
+                const Foam::scalar rPick = pickMin ? rMin : rMax;
+                const Foam::scalar ratio =
+                    Foam::max(rPick, rAvg)
+                   /Foam::max(Foam::min(rPick, rAvg), Foam::small);
+                if (ratio > capRatio)
+                {
+                    pickMin =
+                        Foam::mag(rMin - rAvg) <= Foam::mag(rMax - rAvg);
+                }
+            }
+
+            const Foam::scalar rHyst = pickMin ? rMin : rMax;
+
+            // Relative tolerance, not ==: rhoc comes from the BLENDED
+            // two-root EOS path (and may additionally have been relaxed), so
+            // it is never bit-equal to a pure cubic root even where
+            // hysteresis changed nothing. An exact test flagged every in-band
+            // cell and made the diagnostic useless.
+            if
+            (
+                Foam::mag(rHyst - rhoc[celli])
+              > 1e-3*Foam::mag(rhoc[celli])
+            )
+            {
+                nFlipped++;
+                if (flagc)
+                {
+                    (*flagc)[celli] = 1;
+                }
+            }
+            rhoc[celli] = rHyst;
+
+            if (psic)
+            {
+                (*psic)[celli] = pickMin ? psiMin : psiMax;
+            }
+        }
+    }
+
+    rho.correctBoundaryConditions();
+    if (psi)
+    {
+        psi->correctBoundaryConditions();
+    }
+    if (flagField)
+    {
+        flagField->correctBoundaryConditions();
+    }
+
+    // Global count: the callers report this through Info<<, which prints on
+    // the master only. Without the reduction a run whose in-band cells all
+    // live off-master reports zero and the diagnostic is blind in parallel.
+    Foam::reduce(nFlipped, Foam::sumOp<Foam::label>());
+
+    return nFlipped;
+}
+
+} // End anonymous namespace
+
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
@@ -869,6 +1106,14 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // (pressureCorrector에서) → CPU에서 ~23% 빠름(FGM thermo가 s/step의 ~70%,
     // 스텝당 4→1회). ★GPU(gpuThermo on)에선 false 쓰지 말 것: per-corrector SoA
     // 재기록 불변식이 깨져 rgpFgmScratchDirty가 fail-closed로 막는다 — CPU 전용 노브.
+    //
+    // OPT: this manifold-reseed + EOS refresh is ~93% of the pressure-corrector
+    // cost and, at nOuter x nCorr, is called 4x/step (the dominant s/step term).
+    // thermoPerCorrector=false hoists it to once-per-outer (standard PIMPLE),
+    // done in pressureCorrector() before the corrector loop -- cheaper, but the
+    // psi/rho used by the 2nd+ correctors is then the outer's start-of-step
+    // state (stale), which is exactly the ill-conditioning RANK 1 was added to
+    // cure, so it must be validated against the injector spike before use.
     const Switch thermoPerCorrector
     (
         pimple.dict().lookupOrDefault<Switch>("thermoPerCorrector", true)
@@ -926,12 +1171,129 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // the EOS density stayed positive. Snapping rho_ to the just-corrected
     // thermo state each corrector removes the drift (rho.oldTime() is
     // untouched, so the ddt history stays consistent).
-    rho_ = thermo.rho();
-    rho_.correctBoundaryConditions();
-
-    const volScalarField& psi = thermo.psi();
+    //
+    // (2026-07-26) This used to be done twice: an `rho_ = thermo.rho();
+    // rho_.correctBoundaryConditions();` pair here, immediately followed by
+    // the `rho = thermo.rho()` below -- and `rho` is a reference to `rho_`
+    // (see the alias at the top of this function), so the first assignment
+    // was unconditionally overwritten by the second and had no effect. The
+    // dead pair is removed; the re-sync itself is unchanged and now happens
+    // exactly once, at the assignment below.
+    volScalarField psi(thermo.psi());
     rho = thermo.rho();
     rho.relax();
+
+    // Root-selection hysteresis: correct rho AND psi together, from the
+    // SAME chosen branch, before psis (below) is built from them. See
+    // correctRootHysteresis() at the top of this file.
+    if (pimple.dict().lookupOrDefault<Switch>("rootHysteresis", false))
+    {
+        const tabulatedRealGasMixture* hook =
+            dynamic_cast<const tabulatedRealGasMixture*>(&thermo_);
+
+        if (hook)
+        {
+            // Route through the tabulated bM/coef1-3/cM (RGcoeffFields_)
+            // when armed -- avoids re-deriving them via calculateRealGas()'s
+            // O(n^2) mixing (see correctRootHysteresis() comment above).
+            tmp<volScalarField> tW;
+            const volScalarField* Wptr = nullptr;
+            if (tabRealGasCoeffs_)
+            {
+                tW = thermo_.W();
+                Wptr = &tW();
+            }
+
+            // Neighbour-consistency cap (2026-07-24f): pre-correction
+            // face-averaged rho, so the cap reflects genuine spatial
+            // consensus (not hysteresis's own output). Only computed when
+            // the cap is actually requested (fvc::average/interpolate cost
+            // avoided otherwise).
+            const scalar rootHysteresisCapRatio
+            (
+                pimple.dict()
+                   .lookupOrDefault<scalar>("rootHysteresisCapRatio", GREAT)
+            );
+            tmp<volScalarField> tRhoAvg;
+            const volScalarField* rhoAvgPtr = nullptr;
+            if (rootHysteresisCapRatio < GREAT)
+            {
+                tRhoAvg = fvc::average(fvc::interpolate(rho));
+                rhoAvgPtr = &tRhoAvg();
+            }
+
+            const label nFlipped = correctRootHysteresis
+            (
+                *hook, Y_, thermo_.p(), thermo_.T(),
+                rho_.oldTime().primitiveField(), rho, &psi,
+                pimple.dict().lookupOrDefault<scalar>("rootHysteresisTMin", 140),
+                pimple.dict().lookupOrDefault<scalar>("rootHysteresisTMax", 200),
+                pimple.dict().lookupOrDefault<scalar>("rootHysteresisPMin", 4.0e6),
+                pimple.dict().lookupOrDefault<scalar>("rootHysteresisPMax", 5.5e6),
+                tabRealGasCoeffs_ ? &RGcoeffFields_ : nullptr,
+                Wptr,
+                nullptr,
+                rhoAvgPtr,
+                rootHysteresisCapRatio
+            );
+
+            if (nFlipped > 0)
+            {
+                Info<< "rootHysteresis: " << nFlipped
+                    << " cell(s) switched to the history-consistent branch"
+                    << " (rho, psi)" << endl;
+            }
+        }
+    }
+
+    // Face density used to (a) convert the RC transient term to volumetric and
+    // (b) RECONSTRUCT the mass flux from the solved volumetric flux (below).
+    //
+    // 'rhofUpwind' (default off, read each step): use the UPWIND (donor-cell)
+    // density instead of the linear interpolate. Rationale, ported from the
+    // real-fluid literature: the spurious pressure/velocity at a transcritical
+    // contact is attributed to FLUX INCONSISTENCY at the face -- the PEP
+    // condition of the conservative schemes is precisely an algebraic
+    // consistency requirement between the numerical energy flux and the
+    // numerical MASS flux (dF_rhoe = alpha_hat*dF_rho; EPEP-RG, arXiv:2605.03617),
+    // and the double-flux family removes the oscillation by evaluating the
+    // face state TWICE from the two donor cells rather than once from an
+    // averaged state (Ma, Lv & Ihme, JCP 340 (2017) 330).
+    //
+    // The same inconsistency exists here in discrete form: the convection
+    // operators transport with the UPWIND density while phi is rebuilt with a
+    // LINEARLY interpolated rhof. Across the LOX/gas contact (rho 25-60x) the
+    // two disagree by O(rho_ratio) -- the identical defect already measured and
+    // fixed on the Courant number (see setRDeltaT.C 'densityConsistentCourant',
+    // maxCo_eff ~0.001 vs the target 0.2).
+    const Switch rhofUpwind
+    (
+        pimple.dict().lookupOrDefault<Switch>("rhofUpwind", false)
+    );
+
+    // 신규 upstream pCorr 노브(rootHysteresis/rhofUpwind/pep*/psis* 계열)는
+    // CPU 전용 — 디바이스 pEqn 조립·상주 체인은 이 항/필드 보정을 모른다.
+    // thermoPerCorrector와 동일한 fail-closed 원칙: gpuPEqn/gpuUEqn과 동시
+    // 요청 시 즉시 fatal (조용한 물리 불일치 금지).
+    {
+        const bool hostOnlyPEP =
+            pimple.dict().lookupOrDefault<Switch>("rootHysteresis", false)
+         || rhofUpwind
+         || pimple.dict().lookupOrDefault<Switch>("pepFull", false)
+         || pimple.dict().lookupOrDefault<Switch>("pepAdvect", false)
+         || pimple.dict().lookupOrDefault<Switch>("pepRHS", false)
+         || pimple.dict().lookupOrDefault<Switch>("psisFreezeOuter", false)
+         || pimple.dict().lookupOrDefault<Switch>("psisTabulated", false)
+         || pimple.dict().lookupOrDefault<Switch>("psisSmooth", false);
+        if (hostOnlyPEP && (gpuPEqn_ || gpuUEqn_))
+        {
+            FatalErrorInFunction
+                << "rootHysteresis/rhofUpwind/pepFull/pepAdvect/pepRHS/"
+                << "psisFreezeOuter/psisTabulated/psisSmooth are CPU-only "
+                << "knobs -- not supported with gpuPEqn/gpuUEqn"
+                << exit(FatalError);
+        }
+    }
 
     // pCorrGPU 디바이스 체인: gpuUEqn(rAU/HbyA 디바이스) + gpuPEqn일 때
     // fvc 준비체인(rhof/rhorAUf/rAUf/psis/phiHbyAv)을 GPU 상주로 대체.
@@ -958,7 +1320,13 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     tmp<surfaceScalarField> trhof;
     if (!devChain)
     {
-        trhof = surfaceScalarField::New("rhof", fvc::interpolate(rho));
+        trhof = surfaceScalarField::New
+        (
+            "rhof",
+            rhofUpwind
+          ? upwind<scalar>(mesh, phi).interpolate(rho)
+          : fvc::interpolate(rho)
+        );
     }
 
     // UEqnGPU: 행렬이 디바이스 상주이므로 rAU=1/A(), H(U)를 GPU에서 산출
@@ -1170,26 +1538,199 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     (
         pimple.dict().lookupOrDefault<Switch>("psisIsentropic", false)
     );
+    // pepFull (2026-07-18): COMPLETE Terashima-Koshi pressure-evolution
+    // equation. The half-PEP (isentropic diagonal alone) measurably WORSENED
+    // the interface trap metrics (A/B: dome capped cells 23.6k -> 76.8k,
+    // downstream 3.9k -> 28.1k over one equal segment) because the full
+    // formulation balances the acoustically-correct diagonal with TWO terms
+    // the lite version lacks:
+    //   psis*(dp/dt + u.grad(p)) + div(u) = (gamma-1)*psis*div(Deff grad h)
+    // (Terashima & Koshi JCP 231 (2012) 6907, volumetric form; the RHS is the
+    // thermal/species-diffusion expansion source written with the SAME
+    // effective enthalpy diffusivity as the h equation for discrete
+    // consistency; reaction expansion enters through the per-corrector
+    // rho(T) refresh). pepFull implies the isentropic diagonal. Default off.
+    const Switch pepFull
+    (
+        pimple.dict().lookupOrDefault<Switch>("pepFull", false)
+    );
+    // v2 term-isolation switches for the 1-D benchmark: pepAdvect enables the
+    // pressure-advection term alone, pepRHS the diffusive-expansion RHS alone.
+    // pepFull implies both. Each read every step.
+    const Switch pepAdvect
+    (
+        pepFull
+     || pimple.dict().lookupOrDefault<Switch>("pepAdvect", false)
+    );
+    const Switch pepRHS
+    (
+        pepFull
+     || pimple.dict().lookupOrDefault<Switch>("pepRHS", false)
+    );
+    // psisFreezeOuter (2026-07-24): double-flux/RFQC-literal "freeze the
+    // acoustic coefficient over the step" -- psis is computed ONCE per OUTER
+    // iteration (in pressureCorrector(), before the corrector loop, stored in
+    // the registry as "psisFrozen") instead of being re-evaluated from the
+    // current (highly nonlinear near the transcritical interface) EOS state
+    // every corrector. This is a more literal implementation of the double-
+    // flux idea than psisAdvect (a separate material-transport PDE for psis,
+    // tested 2026-07-23 and found to DESTABILISE further) -- no new PDE, just
+    // hoisting psis out of the corrector loop the same way thermoPerCorrector
+    // =false already hoists the manifold/EOS refresh. Default off.
+    const Switch psisFreezeOuter
+    (
+        pimple.dict().lookupOrDefault<Switch>("psisFreezeOuter", false)
+    );
+    // psisTabulated (2026-07-24): use the per-cell FGM:psisTab field (offline
+    // SRK+JANAF re-derivation of psis, gamma-clipped/smoothed at manifold-
+    // build time -- build_psis_table_v2.py) instead of the pointwise runtime
+    // EOS evaluation. Highest priority in the chain below: the whole point is
+    // to bypass BOTH the raw pointwise nonlinearity AND the ad-hoc
+    // psisCapRatio patch that reacts to it. No-op (falls through) if the
+    // table wasn't built with a psisTab field (tabPsis_ false). Default off.
+    const Switch psisTabulated
+    (
+        pimple.dict().lookupOrDefault<Switch>("psisTabulated", false)
+    );
     tmp<volScalarField> tpsis;
     if (!devChain)
     {
         tpsis = volScalarField::New
         (
             "psis",
-            psisIsentropic
-          ? volScalarField(thermo.psi()/(rho*thermo.gamma()))
-          : volScalarField(thermo.psi()/rho)
+            (psisTabulated && tabPsis_)
+          ? volScalarField(psisTabField_())
+          : (psisFreezeOuter && mesh.foundObject<volScalarField>("psisFrozen"))
+          ? volScalarField(mesh.lookupObject<volScalarField>("psisFrozen"))
+          : (psisIsentropic || pepFull)
+          ? volScalarField(psi/(rho*thermo.gamma()))
+          : volScalarField(psi/rho)
         );
-        if (psisCapRatio < GREAT)
+        volScalarField& psis = tpsis.ref();
+        // Skip both regularisers when psisTabulated is active: the tabulated
+        // field is already smoothed offline (gamma-clipped at build time).
+        if (psisTabulated && tabPsis_)
         {
-            volScalarField& psis = tpsis.ref();
+            // no-op
+        }
+        else if (psisSmooth)
+        {
+            fvc::smooth(psis, psisSmoothCoeff);
+        }
+        else if (psisCapRatio < GREAT)
+        {
             const volScalarField psisSm
             (
                 fvc::average(fvc::interpolate(psis))
             );
+            // Diagnostic (2026-07-23): count how many cells the neighbour-
+            // average floor actually overrides each corrector (upstream).
+            const scalarField& psisIf = psis.primitiveField();
+            const scalarField psisFloor(psisSm.primitiveField()/psisCapRatio);
+            label nCapped = 0;
+            forAll(psisIf, celli)
+            {
+                if (psisIf[celli] < psisFloor[celli])
+                {
+                    nCapped++;
+                }
+            }
+            Info<< "psisCapRatio: " << nCapped << " of " << psisIf.size()
+                << " cells capped (" << (100.0*nCapped/psisIf.size()) << "%)"
+                << endl;
             psis = max(psis, psisSm/psisCapRatio);
             psis.correctBoundaryConditions();
         }
+    }
+
+    // --- psisAdvect: ADVECTED acoustic coefficient (RFQC port) ---------------
+    // The quasi-conservative real-fluid family does NOT re-evaluate the
+    // thermodynamic coefficient pointwise from the cubic EOS every step at a
+    // contact: the double-flux model FREEZES gamma* = rho c^2/p and e*_0 over
+    // the step (Ma, Lv & Ihme, JCP 340 (2017) 330), and its generalisation RFQC
+    // ADVECTS the Grueneisen-related coefficient xi = h/c^2 and the remainder
+    // E0 with the material, d_t xi + u.grad(xi) = 0 (Bai et al., JCP 564 (2026)
+    // 115156), recovering p = (rho e - E0)/xi. Pointwise re-evaluation is what
+    // injects the spurious pressure, because the coefficient jumps
+    // discontinuously as the interface sweeps a cell.
+    //
+    // In a PRESSURE-BASED solver the acoustic coefficient is not an energy-flux
+    // weight but the pEqn DIAGONAL psis = kappa (d rho/dp)/rho. No published
+    // pressure-based double-flux implementation exists (all are density-based;
+    // the open question in the literature is exactly WHAT the freeze should
+    // modify in a segregated algorithm), so the port here is: transport psis as
+    // its own scalar with a slow relaxation back to the EOS value, and use the
+    // transported field as the pEqn diagonal.
+    //
+    //     d(psisStar)/dt + div(phiv, psisStar) = (psisEOS - psisStar)/tau
+    //
+    // tau is a PHYSICAL relaxation time, so the formulation is well defined
+    // under LTS (where "frozen over the time step" is ambiguous -- the local
+    // dt differs per cell). tau -> 0 recovers the present pointwise EOS value;
+    // tau -> large is a pure freeze. The relaxation is the continuous analogue
+    // of the RFQC re-projection (local O(dt^2), global O(dt) there).
+    //
+    // psisAdvect (default off) + psisTau [s] (default 1e-5), read each step.
+    const Switch psisAdvect
+    (
+        pimple.dict().lookupOrDefault<Switch>("psisAdvect", false)
+    );
+    if (psisAdvect)
+    {
+        const dimensionedScalar psisTau
+        (
+            "psisTau",
+            dimTime,
+            pimple.dict().lookupOrDefault<scalar>("psisTau", 1e-5)
+        );
+
+        if (!mesh.foundObject<volScalarField>("psisStar"))
+        {
+            // zeroGradient BCs so the implicit psisEqn can form patch
+            // coefficients (psis itself carries 'calculated' BCs, which have no
+            // matrix contribution and abort in valueInternalCoeffs).
+            mesh.objectRegistry::store
+            (
+                new volScalarField
+                (
+                    IOobject
+                    (
+                        "psisStar",
+                        runTime.name(),
+                        mesh,
+                        IOobject::READ_IF_PRESENT,
+                        IOobject::AUTO_WRITE
+                    ),
+                    psis,
+                    wordList
+                    (
+                        mesh.boundary().size(),
+                        zeroGradientFvPatchField<scalar>::typeName
+                    )
+                )
+            );
+        }
+
+        volScalarField& psisStar =
+            mesh.lookupObjectRef<volScalarField>("psisStar");
+
+        const surfaceScalarField phivPsis("phivPsis", phi/rhof);
+
+        fvScalarMatrix psisEqn
+        (
+            fvm::ddt(psisStar)
+          + fvm::div(phivPsis, psisStar)
+          + fvm::Sp(1.0/psisTau, psisStar)
+         ==
+            psis/psisTau
+        );
+        psisEqn.solve();
+
+        // Positivity guard: the pEqn diagonal must stay strictly positive.
+        psisStar.max(SMALL*dimensionedScalar(psis.dimensions(), 1));
+        psisStar.correctBoundaryConditions();
+
+        psis = psisStar;
     }
 
     // Volumetric predicted face flux with the RHO-CONSISTENT transient
@@ -1347,15 +1888,27 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     (
         pimple.dict().lookupOrDefault<scalar>("LADrhoCoeff", scalar(0))
     );
-    // ladOddEven (upstream b61de26): Jameson-type odd-even(체커보드) 압력
-    // 센서로 AMD를 게이팅 — 질량 확산이 스퓨리어스 계면 셀에만 작동하고
-    // 물리 LOX/가스 접촉·물리 제트는 안 건드림. |grad rho| 센서만으로는
-    // 둘 다 급구배라 구분 못 하지만, 압력은 실접촉에선 매끈(역학평형)·
-    // 스퓨리어스는 셀-셀 체커보드라 구분됨.
-    //   theta = |lap(p)|·V^⅔ / (|lap(p)|·V^⅔ + |grad(p)|·V^⅓ + eps) ∈[0,1)
-    // ~1 체커보드, ~0 매끈/정적. 게이트 on이면 LADrhoCoeff를 세게(2-4)
-    // 밀어 스파이크만 소산, 물리 벌크 95%는 무손상. default off, 매 스텝.
-    // (CPU와 동일 호스트 계산 — Dr은 srcCellExtra로 디바이스에 주입)
+    // ladOddEven: gate the AMD by a Jameson-type odd-even (checkerboard)
+    // detector on PRESSURE, so the mass diffusion fires ONLY on the spurious
+    // interface cells and not on the physical LOx/gas contact or the physical
+    // high-speed jet. The plain |grad rho| sensor cannot distinguish the two:
+    // BOTH the physical contact and the spurious spike carry a steep density
+    // gradient, so boosting LADrhoCoeff globally smears the physical jet
+    // (measured: the physical cold-flow ceiling is ~112 m/s Bernoulli, yet the
+    // spurious tail reaches the limitU clamp of 800). The distinguishing
+    // signature is PRESSURE: across a real contact the pressure is smooth
+    // (mechanical equilibrium) while the spurious velocity is driven by a
+    // cell-to-cell pressure CHECKERBOARD. The detector
+    //   theta = |lap(p)|*dx^2 / (|lap(p)|*dx^2 + |grad(p)|*dx + eps)  in [0,1)
+    // is the ratio of the undivided 2nd difference to the 1st difference: ~1 at
+    // an odd-even oscillation (2nd diff >> 1st diff), ~0 for a smooth or
+    // monotone pressure field, and ~0 in quiescent cells (eps dominates). With
+    // the gate on, LADrhoCoeff can be pushed hard (2-4) to dissipate the
+    // spurious spike WITHOUT touching the 95% physical bulk -- unlike the
+    // earlier uniform LAD boost (Seg A), which smeared everything and worsened
+    // dt. ladOddEven default off; read each step. epsPa is the quiescent-cell
+    // pressure floor (default 1e3 Pa).
+    // (GPU: CPU와 동일 호스트 계산 — Dr은 srcCellExtra로 디바이스에 주입)
     const Switch ladOddEven
     (
         pimple.dict().lookupOrDefault<Switch>("ladOddEven", false)
@@ -1397,11 +1950,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             const scalarField V23(V13*V13);
             const scalarField d2p
             (
-                mag(fvc::laplacian(p))().primitiveField()*V23     // 2차차분 [Pa]
+                mag(fvc::laplacian(p))().primitiveField()*V23     // 2nd diff [Pa]
             );
             const scalarField d1p
             (
-                mag(fvc::grad(p))().primitiveField()*V13          // 1차차분 [Pa]
+                mag(fvc::grad(p))().primitiveField()*V13          // 1st diff [Pa]
             );
             const scalarField theta(d2p/(d2p + d1p + ladEpsPa));
             sensor *= theta;
@@ -2608,6 +3161,35 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             pDDtEqn -= fvc::laplacian(Dr, rho)/rho;
         }
 
+        // --- pepFull: pressure ADVECTION + energy-diffusion RHS (upstream
+        // 599e06f/48dc9bb; 호스트 경로 전용 -- gpuPEqn과 동시 사용은 위 fatal 게이트)
+        if (pepAdvect)
+        {
+            const surfaceScalarField phivAdv("phivAdv", phi/trhof());
+            // psis face value: HARMONIC mean (v2) -- the arithmetic
+            // interpolate over-weights the soft-gas side across the ~250x
+            // psis jump (upstream v1 suspect #3).
+            const surfaceScalarField Fpsis
+            (
+                "Fpsis", (1.0/fvc::interpolate(1.0/tpsis()))*phivAdv
+            );
+            // v2.2: EXPLICIT advection source (implicit forms blew up on the
+            // 1-D benchmark; correction-form pEqn vs total-p advection).
+            pDDtEqn +=
+                fvc::div(Fpsis*fvc::interpolate(p)) - p*fvc::div(Fpsis);
+        }
+        if (pepRHS)
+        {
+            if (fgmTable_.useEnthalpy())
+            {
+                const volScalarField& h = hPtr_();
+                const volScalarField DhP("DhP", Deff("h"));
+                pDDtEqn -=
+                    (thermo.gamma() - scalar(1))*tpsis()
+                   *fvc::laplacian(DhP, h);
+            }
+        }
+
         while (pimple.correctNonOrthogonal())
         {
             fvScalarMatrix pEqn
@@ -2748,6 +3330,13 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     // its min and the surgical max) -- only the pMinPa floor was active.
     fvConstraints().constrain(p);
 
+    // faceGradP (upstream 41b3300/6d08065): pimple 딕셔너리 별칭 — CPU
+    // 케이스는 faceGradP로 balanced-force 셀 U 갱신을 켠다. GPU 풀스택은
+    // pGradRecon(fgmProperties)이 동일 기능의 디바이스 경로.
+    const Switch faceGradP
+    (
+        pimple.dict().lookupOrDefault<Switch>("faceGradP", false)
+    );
     if (gpuUEqn_ && gpuPEqn_)
     {
         // U = HbyA − rAU∇p — grad p·연산을 디바이스에서 (HbyA/rAU 상주)
@@ -2768,7 +3357,8 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             {
                 const volVectorField gradPRec
                 (
-                    fvc::reconstruct(fvc::snGrad(p)*mesh.magSf())
+                    // safeReconstruct: AMR hanging-node SIGFPE guard (6d08065)
+                    safeReconstruct(fvc::snGrad(p)*mesh.magSf(), fvc::grad(p))
                 );
                 const vectorField& gp = gradPRec.primitiveField();
                 gpuGradReconBuf_.setSize(3*nc);
@@ -2846,10 +3436,11 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
             }
         }
     }
-    else if (pGradRecon_)
+    else if (pGradRecon_ || faceGradP)
     {
         // balanced-force: pEqn 플럭스와 면-일관인 재구성 구배
-        U = HbyA - rAAtU*fvc::reconstruct(fvc::snGrad(p)*mesh.magSf());
+        // safeReconstruct: AMR hanging-node SIGFPE guard (upstream 6d08065)
+        U = HbyA - rAAtU*safeReconstruct(fvc::snGrad(p)*mesh.magSf(), fvc::grad(p));
     }
     else
     {
@@ -2864,6 +3455,125 @@ void Foam::solvers::fgmFluid::correctPressurePEP()
     {
         rho = thermo.rho();
         rho.relax();
+
+        // Root-selection hysteresis (2026-07-24): near the O2 near-critical
+        // band the hard minimum-fugacity switch in SRKGasI.H::Z() can flip
+        // liquid/vapour branch between adjacent cells (or between
+        // iterations) for p perturbations as small as 0.05-3%, jumping rho
+        // by 2-5x -- see PEP and LAD Spike Suppression wiki secs 6-9. The
+        // rootBlendTol logistic blend (secs 10-14) fixed that but corrupted
+        // the cold-start pressure field (2-3x nominal overshoot, root cause
+        // not isolated after two redesign attempts -- sec 14-16). This is a
+        // different, non-blending fix: for cells with a genuine 3-real-root
+        // ambiguity, pick whichever ACTUAL root (never an interpolated
+        // non-root value) gives a density closer to this cell's PREVIOUS-
+        // timestep density -- "sticky" branch selection driven by the
+        // cell's own history rather than an instantaneous (and, near the
+        // crossing, essentially noise-sensitive) fugacity comparison.
+        // MUST run here too, after this LAST unconditional rho =
+        // thermo.rho() in this function -- this is the value that reaches
+        // fvc::correctRhoUf and next-timestep's oldTime() (an earlier
+        // attempt placed the ONLY correction right after the FIRST such
+        // assignment near the top of correctPressurePEP() and was silently
+        // overwritten by this one -- diagnosed 2026-07-24 by a matched
+        // hysteresis-on/off A/B that came back bit-identical). psi is NOT
+        // re-corrected here: it was already made rho-consistent, earlier in
+        // this function, at the point psis is actually built from it (see
+        // correctRootHysteresis() call above and at the top of this file);
+        // nothing downstream of this point reads psi again. Off by default;
+        // enable with 'rootHysteresis true;' in PIMPLE.
+        if (pimple.dict().lookupOrDefault<Switch>("rootHysteresis", false))
+        {
+            const tabulatedRealGasMixture* hook =
+                dynamic_cast<const tabulatedRealGasMixture*>(&thermo_);
+
+            if (hook)
+            {
+                tmp<volScalarField> tW;
+                const volScalarField* Wptr = nullptr;
+                if (tabRealGasCoeffs_)
+                {
+                    tW = thermo_.W();
+                    Wptr = &tW();
+                }
+
+                // Diagnostic (2026-07-24e): 'rootHysteresisDiag true;' writes
+                // a per-cell "FGM:hystCorrected" flag (1 = this cell's final
+                // rho was hysteresis-overridden this corrector) so it can be
+                // checked post-hoc for spatial correlation with neighbour
+                // density jumps -- see PEP and LAD Spike Suppression wiki
+                // sec 20.
+                volScalarField* flagPtr = nullptr;
+                if
+                (
+                    pimple.dict()
+                       .lookupOrDefault<Switch>("rootHysteresisDiag", false)
+                )
+                {
+                    if (mesh.foundObject<volScalarField>("FGM:hystCorrected"))
+                    {
+                        flagPtr = &mesh.lookupObjectRef<volScalarField>
+                        (
+                            "FGM:hystCorrected"
+                        );
+                    }
+                    else
+                    {
+                        flagPtr = new volScalarField
+                        (
+                            IOobject
+                            (
+                                "FGM:hystCorrected",
+                                mesh.time().name(),
+                                mesh,
+                                IOobject::NO_READ,
+                                IOobject::AUTO_WRITE
+                            ),
+                            mesh,
+                            dimensionedScalar(dimless, 0)
+                        );
+                        mesh.objectRegistry::store(flagPtr);
+                    }
+                }
+
+                const scalar rootHysteresisCapRatio
+                (
+                    pimple.dict().lookupOrDefault<scalar>
+                    (
+                        "rootHysteresisCapRatio", GREAT
+                    )
+                );
+                tmp<volScalarField> tRhoAvg;
+                const volScalarField* rhoAvgPtr = nullptr;
+                if (rootHysteresisCapRatio < GREAT)
+                {
+                    tRhoAvg = fvc::average(fvc::interpolate(rho_));
+                    rhoAvgPtr = &tRhoAvg();
+                }
+
+                const label nFlipped = correctRootHysteresis
+                (
+                    *hook, Y_, thermo_.p(), thermo_.T(),
+                    rho_.oldTime().primitiveField(), rho_, nullptr,
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisTMin", 140),
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisTMax", 200),
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisPMin", 4.0e6),
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisPMax", 5.5e6),
+                    tabRealGasCoeffs_ ? &RGcoeffFields_ : nullptr,
+                    Wptr,
+                    flagPtr,
+                    rhoAvgPtr,
+                    rootHysteresisCapRatio
+                );
+
+                if (nFlipped > 0)
+                {
+                    Info<< "rootHysteresis: " << nFlipped
+                        << " cell(s) switched to the history-consistent"
+                        << " branch (final rho)" << endl;
+                }
+            }
+        }
     }
 
     // Correct rhoUf if the mesh is moving
@@ -2911,6 +3621,98 @@ void Foam::solvers::fgmFluid::pressureCorrector()
         else
         {
             thermo_.correct();
+        }
+    }
+
+    // psisFreezeOuter: compute psis ONCE here (double-flux/RFQC-literal
+    // freeze, see the psis block in correctPressurePEP() for the full
+    // rationale) using the JUST-refreshed (or previous-outer-final, if
+    // thermoPerCorrector=true) rho/thermo state, store it in the registry so
+    // every corrector this outer reuses the SAME value instead of
+    // recomputing pointwise from the current (possibly still-settling)
+    // thermodynamic state.
+    const Switch psisFreezeOuter
+    (
+        pimple.dict().lookupOrDefault<Switch>("psisFreezeOuter", false)
+    );
+    if (psisFreezeOuter)
+    {
+        const Switch psisIsentropic
+        (
+            pimple.dict().lookupOrDefault<Switch>("psisIsentropic", false)
+        );
+        const Switch pepFullSw
+        (
+            pimple.dict().lookupOrDefault<Switch>("pepFull", false)
+        );
+
+        // Root-selection hysteresis: keep this frozen-psis snapshot
+        // rho/psi-consistent too (see correctRootHysteresis() at the top of
+        // this file / the identical correction in correctPressurePEP()).
+        volScalarField psiNow(thermo.psi());
+        if (pimple.dict().lookupOrDefault<Switch>("rootHysteresis", false))
+        {
+            const tabulatedRealGasMixture* hook =
+                dynamic_cast<const tabulatedRealGasMixture*>(&thermo_);
+
+            if (hook)
+            {
+                tmp<volScalarField> tW;
+                const volScalarField* Wptr = nullptr;
+                if (tabRealGasCoeffs_)
+                {
+                    tW = thermo_.W();
+                    Wptr = &tW();
+                }
+
+                const scalar rootHysteresisCapRatio
+                (
+                    pimple.dict().lookupOrDefault<scalar>
+                    (
+                        "rootHysteresisCapRatio", GREAT
+                    )
+                );
+                tmp<volScalarField> tRhoAvg;
+                const volScalarField* rhoAvgPtr = nullptr;
+                if (rootHysteresisCapRatio < GREAT)
+                {
+                    tRhoAvg = fvc::average(fvc::interpolate(rho_));
+                    rhoAvgPtr = &tRhoAvg();
+                }
+
+                correctRootHysteresis
+                (
+                    *hook, Y_, thermo_.p(), thermo_.T(),
+                    rho_.oldTime().primitiveField(), rho_, &psiNow,
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisTMin", 140),
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisTMax", 200),
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisPMin", 4.0e6),
+                    pimple.dict().lookupOrDefault<scalar>("rootHysteresisPMax", 5.5e6),
+                    tabRealGasCoeffs_ ? &RGcoeffFields_ : nullptr,
+                    Wptr,
+                    nullptr,
+                    rhoAvgPtr,
+                    rootHysteresisCapRatio
+                );
+            }
+        }
+
+        const volScalarField psisNow
+        (
+            (psisIsentropic || pepFullSw)
+          ? psiNow/(rho_*thermo.gamma())
+          : psiNow/rho_
+        );
+        if (!mesh.foundObject<volScalarField>("psisFrozen"))
+        {
+            mesh.objectRegistry::store
+            (
+                new volScalarField("psisFrozen", psisNow)
+            );
+        }
+        else
+        {
+            mesh.lookupObjectRef<volScalarField>("psisFrozen") = psisNow;
         }
     }
 

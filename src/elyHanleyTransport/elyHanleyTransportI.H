@@ -604,13 +604,20 @@ inline void Foam::elyHanleyTransport<Thermo>::updatePedersenConst()
     {
         // Pedersen Eqs. 11-27..11-30: Tcmix, Pcmix combining rule
         scalar num = 0, den = 0;
+        // (Tc/Pc)^(1/3) depends on one index only -- hoisted out of the inner
+        // loop, so this is N cube roots instead of N^2. Same expression, same
+        // operands, same accumulation order: num/den are bit-identical.
+        scalarList tcr(n);
         forAll(Xmd_, i)
         {
-            const scalar ti = pow(Tcmd_[i][i]/max(Pcmd_[i][i], scalar(1e-30)), 1.0/3.0);
+            tcr[i] = pow(Tcmd_[i][i]/max(Pcmd_[i][i], scalar(1e-30)), 1.0/3.0);
+        }
+        forAll(Xmd_, i)
+        {
+            const scalar ti = tcr[i];
             forAll(Xmd_, j)
             {
-                const scalar tj =
-                    pow(Tcmd_[j][j]/max(Pcmd_[j][j], scalar(1e-30)), 1.0/3.0);
+                const scalar tj = tcr[j];
                 const scalar v  = pow(ti + tj, 3.0);
                 const scalar xx = Xmd_[i]*Xmd_[j];
                 num += xx*v*sqrt(Tcmd_[i][i]*Tcmd_[j][j]);

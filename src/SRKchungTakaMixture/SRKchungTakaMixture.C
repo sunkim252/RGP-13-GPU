@@ -25,6 +25,7 @@ License
 
 #include "SRKchungTakaMixture.H"
 #include "thermodynamicConstants.H"
+#include "mathematicalConstants.H"
 #include "FGMTable.H"
 #include <cstdint>
 
@@ -76,7 +77,8 @@ void Foam::SRKchungTakaMixture<ThermoType>::calculateRealGas
     scalar& TcM,
     scalar& omegaM,
     scalar& miuiM,
-    scalar& kappaiM
+    scalar& kappaiM,
+    const bool needTransportMix
 ) const
 {
     // Linear mixing for SRK co-volume
@@ -100,36 +102,72 @@ void Foam::SRKchungTakaMixture<ThermoType>::calculateRealGas
     scalar sigma3M = 0, epsilonkM0 = 0, omegaM0 = 0, MM0 = 0, miuiM0 = 0;
 
     // Diagonal terms (i == j)
-    forAll(COEF1_, i)
+    if (needTransportMix)
     {
-        const scalar Xi2 = X[i]*X[i];
-        coef1      += Xi2*COEF1_[i][i];
-        coef2      += Xi2*COEF2_[i][i];
-        coef3      += Xi2*COEF3_[i][i];
-        sigma3M    += Xi2*SIGMA3M_[i][i];
-        epsilonkM0 += Xi2*EPSILONKM0_[i][i];
-        omegaM0    += Xi2*OMEGAM0_[i][i];
-        MM0        += Xi2*MM0_[i][i];
-        miuiM0     += Xi2*MIUIM0_[i][i];
-        kappaiM    += Xi2*KAPPAIM_[i][i];
+        forAll(COEF1_, i)
+        {
+            const scalar Xi2 = X[i]*X[i];
+            coef1      += Xi2*COEF1_[i][i];
+            coef2      += Xi2*COEF2_[i][i];
+            coef3      += Xi2*COEF3_[i][i];
+            sigma3M    += Xi2*SIGMA3M_[i][i];
+            epsilonkM0 += Xi2*EPSILONKM0_[i][i];
+            omegaM0    += Xi2*OMEGAM0_[i][i];
+            MM0        += Xi2*MM0_[i][i];
+            miuiM0     += Xi2*MIUIM0_[i][i];
+            kappaiM    += Xi2*KAPPAIM_[i][i];
+        }
+    }
+    else
+    {
+        // EOS-coefficient-only path (e.g. root-selection hysteresis):
+        // skip the 6 Chung transport-mixing accumulators entirely -- with
+        // ~100 species this is the dominant cost, see the .H comment.
+        forAll(COEF1_, i)
+        {
+            const scalar Xi2 = X[i]*X[i];
+            coef1 += Xi2*COEF1_[i][i];
+            coef2 += Xi2*COEF2_[i][i];
+            coef3 += Xi2*COEF3_[i][i];
+        }
     }
 
     // Off-diagonal terms (i < j), doubled by symmetry
-    for (label i = 0; i < COEF1_.size(); i++)
+    if (needTransportMix)
     {
-        for (label j = i + 1; j < COEF1_.size(); j++)
+        for (label i = 0; i < COEF1_.size(); i++)
         {
-            const scalar twoXiXj = 2.0*X[i]*X[j];
-            coef1      += twoXiXj*COEF1_[i][j];
-            coef2      += twoXiXj*COEF2_[i][j];
-            coef3      += twoXiXj*COEF3_[i][j];
-            sigma3M    += twoXiXj*SIGMA3M_[i][j];
-            epsilonkM0 += twoXiXj*EPSILONKM0_[i][j];
-            omegaM0    += twoXiXj*OMEGAM0_[i][j];
-            MM0        += twoXiXj*MM0_[i][j];
-            miuiM0     += twoXiXj*MIUIM0_[i][j];
-            kappaiM    += twoXiXj*KAPPAIM_[i][j];
+            for (label j = i + 1; j < COEF1_.size(); j++)
+            {
+                const scalar twoXiXj = 2.0*X[i]*X[j];
+                coef1      += twoXiXj*COEF1_[i][j];
+                coef2      += twoXiXj*COEF2_[i][j];
+                coef3      += twoXiXj*COEF3_[i][j];
+                sigma3M    += twoXiXj*SIGMA3M_[i][j];
+                epsilonkM0 += twoXiXj*EPSILONKM0_[i][j];
+                omegaM0    += twoXiXj*OMEGAM0_[i][j];
+                MM0        += twoXiXj*MM0_[i][j];
+                miuiM0     += twoXiXj*MIUIM0_[i][j];
+                kappaiM    += twoXiXj*KAPPAIM_[i][j];
+            }
         }
+    }
+    else
+    {
+        for (label i = 0; i < COEF1_.size(); i++)
+        {
+            for (label j = i + 1; j < COEF1_.size(); j++)
+            {
+                const scalar twoXiXj = 2.0*X[i]*X[j];
+                coef1 += twoXiXj*COEF1_[i][j];
+                coef2 += twoXiXj*COEF2_[i][j];
+                coef3 += twoXiXj*COEF3_[i][j];
+            }
+        }
+
+        sigmaM = 0; epsilonkM = 0; MM = 0; VcM = 0;
+        TcM = 0; omegaM = 0; miuiM = 0; kappaiM = 0;
+        return;
     }
 
     //- For visc. and cond. in Chung's model
@@ -781,6 +819,120 @@ Foam::SRKchungTakaMixture<ThermoType>::transportMixture
 
 // - - - - tabulatedRealGasMixture interface (Tier-2 manifold tabulation) - - //
 
+namespace Foam
+{
+namespace
+{
+
+// Root-selection hysteresis core (2026-07-24d): the cubic-root solve and
+// rho/psi branch evaluation, factored out of eosRootBranchProperties() so
+// it can also be driven DIRECTLY from already-known mixture coefficients
+// (bM/coef1-3/cM/Wm) -- e.g. read from the SAME per-cell coefficient
+// TABLE (fgmFluid::RGcoeffFields_, populated by enableCoeffTabulation())
+// that the rest of the solver already uses for O(1) lookups -- instead of
+// recomputing them from scratch via calculateRealGas()'s O(n^2) species-
+// pair mixing loop (~103 species in thermo.wang2011). Re-deriving those
+// coefficients redundantly, every hysteresis call, on top of the identical
+// work thermo_.correct() already just did via the table, was the actual
+// dominant cost (see eosRootBranchPropertiesFromCoeffs() below and PEP and
+// LAD Spike Suppression wiki sec 18f).
+bool eosCubicBranchRhoPsi
+(
+    const scalar bM, const scalar coef1, const scalar coef2,
+    const scalar coef3, const scalar cM, const scalar Wm,
+    const scalar p, const scalar T,
+    scalar& Zmin, scalar& Zmax,
+    scalar& rhoMin, scalar& rhoMax,
+    scalar& psiMin, scalar& psiMax,
+    const bool needPsi
+)
+{
+    const scalar RR = Foam::constant::thermodynamic::RR;
+
+    auto cubicRoots = [&](scalar pp, scalar TT, scalar& Zmn, scalar& Zmx) -> bool
+    {
+        const scalar aAlpha = coef1 - coef2*sqrt(TT) + coef3*TT;
+        const scalar A = aAlpha*pp/sqr(RR*TT);
+        const scalar B = bM*pp/(RR*TT);
+
+        const scalar a2 = -1.0;
+        const scalar a1 = A - B - sqr(B);
+        const scalar a0 = -A*B;
+        const scalar Q = (3*a1 - a2*a2)/9.0;
+        const scalar Rl = (9*a2*a1 - 27*a0 - 2*a2*a2*a2)/54.0;
+        const scalar Q3 = Q*Q*Q;
+        const scalar D = Q3 + Rl*Rl;
+
+        if (D > 0)
+        {
+            return false;
+        }
+
+        const scalar th = ::acos(max(scalar(-1), min(scalar(1), Rl/sqrt(-Q3))));
+        const scalar qm = 2*sqrt(-Q);
+        const scalar pi = constant::mathematical::pi;
+        const scalar r[3] =
+        {
+            qm*cos(th/3.0) - a2/3.0,
+            qm*cos((th + 2*pi)/3.0) - a2/3.0,
+            qm*cos((th + 4*pi)/3.0) - a2/3.0
+        };
+        Zmn = min(r[0], min(r[1], r[2]));
+        Zmx = max(r[0], max(r[1], r[2]));
+        return true;
+    };
+
+    if (!cubicRoots(p, T, Zmin, Zmax))
+    {
+        // Single real root: no branch ambiguity, nothing to hysteresis over
+        return false;
+    }
+
+    auto rhoFromZv = [&](scalar pp, scalar Zv) -> scalar
+    {
+        // kg/m^3: RR is the UNIVERSAL constant, so p/(Z RR T) is kmol/m^3.
+        // Wm converts to mass basis -- matches SRKGasI.H::rhoFromZ, which
+        // divides by this->R() = RR/W. The Peneloux denominator below and
+        // the hMin/hMax departures further down both assume kg/m^3.
+        const scalar rhoSRK = pp*Wm/(Zv*RR*T);
+        if (cM != 0)
+        {
+            const scalar denom = 1.0 - cM*rhoSRK/Wm;
+            if (denom > small)
+            {
+                return rhoSRK/denom;
+            }
+        }
+        return rhoSRK;
+    };
+
+    rhoMin = rhoFromZv(p, Zmin);
+    rhoMax = rhoFromZv(p, Zmax);
+
+    psiMin = 1e-3*rhoMin/p;
+    psiMax = 1e-3*rhoMax/p;
+    if (needPsi)
+    {
+        // psi = (drho/dp)_T via a per-branch forward FD -- see the
+        // rootBlendTol comment history in SRKGasI.H::psi for why each
+        // branch must be differenced against ITSELF (never crosses the
+        // Zmin<->Zmax jump).
+        const scalar dp = 1e-3*p;
+        scalar Zmin1, Zmax1;
+        if (cubicRoots(p + dp, T, Zmin1, Zmax1))
+        {
+            psiMin = max((rhoFromZv(p + dp, Zmin1) - rhoMin)/dp, psiMin);
+            psiMax = max((rhoFromZv(p + dp, Zmax1) - rhoMax)/dp, psiMax);
+        }
+    }
+
+    return true;
+}
+
+} // End anonymous namespace
+} // End namespace Foam
+
+
 template<class ThermoType>
 void Foam::SRKchungTakaMixture<ThermoType>::realGasCoeffs
 (
@@ -804,6 +956,147 @@ void Foam::SRKchungTakaMixture<ThermoType>::realGasCoeffs
         coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
         coeffs[5], coeffs[6], coeffs[7], coeffs[8], coeffs[9], coeffs[10],
         coeffs[11], coeffs[12]
+    );
+}
+
+
+template<class ThermoType>
+bool Foam::SRKchungTakaMixture<ThermoType>::eosRootBranchProperties
+(
+    const List<scalar>& Y,
+    const scalar p,
+    const scalar T,
+    scalar& rhoMin, scalar& rhoMax,
+    scalar& psiMin, scalar& psiMax,
+    scalar& CpMin,  scalar& CpMax,
+    scalar& hMin,   scalar& hMax,
+    const bool needPsi,
+    const bool needCpH
+) const
+{
+    // Mixture SRK EoS coefficients (bM, coef1-3, Peneloux cM) via the exact
+    // live mixing rules -- same call as realGasCoeffs(), self-contained
+    // here (no scalarFieldListSlice / thermoMixture() needed: this stays
+    // reachable from the abstract tabulatedRealGasMixture interface, i.e.
+    // callable from fgmFluid via a dynamic_cast without naming the
+    // concrete (energy-variant) mixture template type -- same reason
+    // realGasCoeffs()/enableCoeffTabulation() take a plain List<scalar>).
+    List<scalar> X, Yl;
+    compositionToX(Y, X, Yl);
+
+    scalar bM = 0, coef1 = 0, coef2 = 0, coef3 = 0, cM = 0,
+           sigmaM = 0, epsilonkM = 0, MM = 0, VcM = 0, TcM = 0, omegaM = 0,
+           miuiM = 0, kappaiM = 0;
+    // needTransportMix=false: only bM/coef1-3/cM (SRK EOS) are used below,
+    // never sigmaM/epsilonkM/.../kappaiM (Chung transport mixing) -- with
+    // ~100 species that mixing loop is the dominant per-cell cost by far,
+    // see the .H comment on calculateRealGas().
+    calculateRealGas
+    (
+        X, bM, coef1, coef2, coef3, cM,
+        sigmaM, epsilonkM, MM, VcM, TcM, omegaM, miuiM, kappaiM,
+        false
+    );
+
+    scalar invWm = 0;
+    forAll(Y, i)
+    {
+        invWm += Y[i]/this->specieThermo(i).W();
+    }
+    const scalar Wm = (invWm > small) ? 1.0/invWm : 1.0;
+
+    scalar Zmin, Zmax;
+    if
+    (
+        !eosCubicBranchRhoPsi
+        (
+            bM, coef1, coef2, coef3, cM, Wm, p, T,
+            Zmin, Zmax, rhoMin, rhoMax, psiMin, psiMax, needPsi
+        )
+    )
+    {
+        return false;
+    }
+
+    CpMin = 0; CpMax = 0;
+    const scalar RR = Foam::constant::thermodynamic::RR;
+    hMin = (RR*T*(Zmin - 1))/Wm;
+    hMax = (RR*T*(Zmax - 1))/Wm;
+    if (!needCpH)
+    {
+        return true;
+    }
+
+    // h, Cp departure functions -- identical formulation to
+    // SRKGasI.H::hFromZ/CpFromZ, substituted with the mixture-level
+    // coefficients (bM, coef1-3, Wm) in place of the pure-substance
+    // (b_, coef1_-coef3_, W()). No cM dependence: the Peneloux shift
+    // translates molar volume only, not the energy departure.
+    const scalar sqrtT = sqrt(T);
+    const scalar aAlphaM = coef1 - coef2*sqrtT + coef3*T;
+    const scalar daAlphaM = -coef2/(2*sqrtT) + coef3;
+    const scalar ddaAlphaM = coef2/(4*T*sqrtT);
+    const scalar Am = aAlphaM*p/sqr(RR*T);
+    scalar Bm = bM*p/(RR*T);
+    if (Bm <= 0)
+    {
+        Bm = 1e-16;
+    }
+
+    auto hFromZv = [&](scalar Zv) -> scalar
+    {
+        if (Zv <= Bm || Bm == -Zv)
+        {
+            return (RR*T*(Zv - 1))/Wm;
+        }
+        return
+        (
+            RR*T*(Zv - 1)
+          + (T*daAlphaM - aAlphaM)/bM*log((Zv + Bm)/Zv)
+        )/Wm;
+    };
+
+    auto CpFromZv = [&](scalar Zv) -> scalar
+    {
+        if (Zv <= Bm)
+        {
+            return 0;
+        }
+        const scalar M = (sqr(Zv) + Bm*Zv)/(Zv - Bm);
+        const scalar N = daAlphaM*Bm/(bM*RR);
+        return
+        (
+            (T/bM)*ddaAlphaM*log((Zv + Bm)/Zv)
+          + RR*sqr(M - N)/(sqr(M) - Am*(2*Zv + Bm))
+          - RR
+        )/Wm;
+    };
+
+    hMin = hFromZv(Zmin);
+    hMax = hFromZv(Zmax);
+    CpMin = CpFromZv(Zmin);
+    CpMax = CpFromZv(Zmax);
+
+    return true;
+}
+
+
+template<class ThermoType>
+bool Foam::SRKchungTakaMixture<ThermoType>::eosRootBranchPropertiesFromCoeffs
+(
+    const scalar bM, const scalar coef1, const scalar coef2,
+    const scalar coef3, const scalar cM, const scalar Wm,
+    const scalar p, const scalar T,
+    scalar& rhoMin, scalar& rhoMax,
+    scalar& psiMin, scalar& psiMax,
+    const bool needPsi
+) const
+{
+    scalar Zmin, Zmax;
+    return eosCubicBranchRhoPsi
+    (
+        bM, coef1, coef2, coef3, cM, Wm, p, T,
+        Zmin, Zmax, rhoMin, rhoMax, psiMin, psiMax, needPsi
     );
 }
 

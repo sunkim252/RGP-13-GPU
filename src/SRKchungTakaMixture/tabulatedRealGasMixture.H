@@ -197,6 +197,75 @@ public:
             return false;
         }
 
+        //- Root-selection hysteresis support: evaluate BOTH cubic-EOS
+        //  branches (liquid Zmin, vapour Zmax) of the mixture at (p,T) for
+        //  a mass-fraction composition Y, and return rho, psi=(drho/dp)_T,
+        //  Cp and h for EACH branch. Returns false when the state has only
+        //  one real root (no branch ambiguity -- nothing to hysteresis
+        //  over) or the backend doesn't implement real-fluid EOS branching.
+        //  Lets a caller (fgmFluid) pick whichever branch is closer to the
+        //  cell's PREVIOUS-timestep density -- a "sticky" root selection
+        //  using an actual cubic root at all times (never an interpolated
+        //  non-root value, unlike the rootBlendTol logistic blend in
+        //  SRKGasI.H, which was found to corrupt the cold-start pressure
+        //  field; see PEP and LAD Spike Suppression wiki secs 14-16) --
+        //  and then re-derive EVERY property the caller consumes (rho,
+        //  psi, Cp, h) from that SAME chosen branch. A partial correction
+        //  (rho alone) leaves psi/Cp/h thermodynamically inconsistent with
+        //  the swapped rho, which was found to blow up the globally-
+        //  coupled PEP pressure equation (wiki sec 18b). needPsi/needCpH
+        //  (both default true) let a caller that only needs a subset skip
+        //  the rest -- psi requires a 2nd cubic solve (forward FD), Cp/h
+        //  require 4 additional log()-based departure evaluations; over
+        //  the full (unmasked) domain every corrector, computing all of
+        //  them unconditionally was measured to cost ~6x more wall-clock
+        //  per iteration than the original rho-only correction (wiki sec
+        //  18c). Skipped outputs are left at a safe (never-uninitialised)
+        //  floor/ideal-gas value, not garbage.
+        virtual bool eosRootBranchProperties
+        (
+            const List<scalar>& Y,
+            const scalar p,
+            const scalar T,
+            scalar& rhoMin, scalar& rhoMax,
+            scalar& psiMin, scalar& psiMax,
+            scalar& CpMin,  scalar& CpMax,
+            scalar& hMin,   scalar& hMax,
+            const bool needPsi = true,
+            const bool needCpH = true
+        ) const
+        {
+            return false;
+        }
+
+        //- Root-selection hysteresis from ALREADY-KNOWN mixture EOS
+        //  coefficients (bM/coef1-3/cM, Peneloux/SRK) and mixture molar
+        //  mass Wm -- e.g. read directly from a per-cell coefficient
+        //  TABLE (fgmFluid::RGcoeffFields_, populated by
+        //  enableCoeffTabulation()) that the rest of the solver's
+        //  thermo_.correct() already uses for O(1) lookups. Skips
+        //  compositionToX()+calculateRealGas() entirely -- with ~100
+        //  species that O(n^2) mixing loop dominates
+        //  eosRootBranchProperties()'s cost by orders of magnitude, and
+        //  re-deriving coefficients the table has ALREADY computed this
+        //  same timestep was found to be the actual bottleneck (not the
+        //  O(1) psi/Cp/h work trimmed by eosRootBranchProperties()'s
+        //  needPsi/needCpH -- see PEP and LAD Spike Suppression wiki sec
+        //  18f). Prefer this over eosRootBranchProperties() whenever the
+        //  caller's coefficients are already tabulated.
+        virtual bool eosRootBranchPropertiesFromCoeffs
+        (
+            const scalar bM, const scalar coef1, const scalar coef2,
+            const scalar coef3, const scalar cM, const scalar Wm,
+            const scalar p, const scalar T,
+            scalar& rhoMin, scalar& rhoMax,
+            scalar& psiMin, scalar& psiMax,
+            const bool needPsi = true
+        ) const
+        {
+            return false;
+        }
+
         //- Disable the tabulated lookup (revert to live O(n^2) mixing).
         virtual void disableCoeffTabulation() const = 0;
 

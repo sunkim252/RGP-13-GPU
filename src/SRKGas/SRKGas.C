@@ -32,6 +32,9 @@ License
 template<class Specie>
 bool Foam::SRKGas<Specie>::stableRoot_ = false;
 
+template<class Specie>
+Foam::scalar Foam::SRKGas<Specie>::rootBlendTol_ = 0;
+
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
@@ -116,6 +119,23 @@ Foam::SRKGas<Specie>::SRKGas
                 << "in the subcritical 3-root regime." << endl;
         }
         stableRoot_ = true;
+    }
+
+    // Optional smoothing of the minimum-fugacity root switch: replaces the
+    // hard argmin(lnPhiL,lnPhiV) with a logistic blend over a ln(fugacity)
+    // deadband of this width, to remove cell-to-cell root-selection
+    // bistability near the Widom line (see PEP and LAD Spike Suppression
+    // wiki, secs 6-10). 0 (default) is bit-identical to the pre-existing
+    // hard switch.
+    if (rfDict.found("rootBlendTol"))
+    {
+        const scalar tol = rfDict.lookup<scalar>("rootBlendTol");
+        if (tol != rootBlendTol_)
+        {
+            Info<< "SRKGas: rootBlendTol = " << tol << " -- cubic root "
+                << "switch smoothed over this ln(fugacity) deadband" << endl;
+        }
+        rootBlendTol_ = tol;
     }
 }
 

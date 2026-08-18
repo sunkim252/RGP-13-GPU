@@ -128,6 +128,10 @@ class FGMTable
         //- Optional tabulated temperature [K] (empty if not present).
         List<scalar> T_table_;
 
+        //- Optional pre-tabulated isentropic compressibility psis
+        //  (empty if not present, 2026-07-24).
+        List<scalar> psis_table_;
+
         //- Tabulated species mass fractions, keyed by species name.
         //  Each entry is a flat list of length nZ*nGz*nC*nChi.
         HashTable<List<scalar>> Y_tables_;
@@ -201,8 +205,16 @@ public:
 
     // Constructors
 
-        //- Construct from mesh
+        //- Construct from mesh (reads constant/fgmProperties)
         FGMTable(const fvMesh& mesh);
+
+        //- Construct from mesh, reading a NAMED dictionary. Lets the solver
+        //  load a SECOND manifold alongside the main one -- e.g. a
+        //  (Z,gZ,C,chi_st) source-only UFPV table (constant/fgmPropertiesChi)
+        //  next to the (Z,gZ,C,dh) non-adiabatic thermo table (2026-07-28).
+        //  Same reader/validation path as the main constructor; only the
+        //  dictionary name differs.
+        FGMTable(const fvMesh& mesh, const word& dictName);
 
 
     //- Destructor
@@ -252,6 +264,16 @@ public:
                 scalar Z, scalar gZ, scalar C, scalar chi
             ) const;
 
+            //- Quadrilinear interpolation of the pre-tabulated isentropic
+            //  compressibility psis=psi/(rho*gamma) (offline SRK+JANAF
+            //  re-derivation, gamma-clipped at build time -- see
+            //  build_psis_table_v2.py, 2026-07-24). Caller must check
+            //  hasPsis() first.
+            scalar interpolatePsis
+            (
+                scalar Z, scalar gZ, scalar C, scalar chi
+            ) const;
+
         // Shared-stencil entry points (fast path for many-field queries)
 
             //- Build the interpolation stencil for one query point.
@@ -275,6 +297,9 @@ public:
 
             inline const List<scalar>& Ttable() const
             { return T_table_; }
+
+            inline const List<scalar>& psisTable() const
+            { return psis_table_; }
 
             inline const List<scalar>& Ytable(const word& sp) const
             { return Y_tables_[sp]; }
@@ -332,6 +357,7 @@ public:
             (
                 const word& specie, scalar Z, scalar gZ, scalar C
             ) const;
+            scalar interpolatePsis(scalar Z, scalar gZ, scalar C) const;
 
         // Predicates
 
@@ -339,6 +365,9 @@ public:
             { return Y_tables_.found(specie); }
 
             inline bool hasT() const { return !T_table_.empty(); }
+
+            //- True if the table carries the pre-tabulated psisTab field.
+            inline bool hasPsis() const { return !psis_table_.empty(); }
 
             //- True if the table carries the Tier-2 real-gas coefficient
             //  fields (RG_*). The solver then enables the per-cell coefficient

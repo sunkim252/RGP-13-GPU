@@ -213,7 +213,21 @@ private:
             List<scalar>& Yl
         ) const;
 
-        //- Calculate real-gas mixture parameters from mole fractions
+        //- Calculate real-gas mixture parameters from mole fractions.
+        //  needTransportMix (default true): the O(n^2) pair-interaction
+        //  loop below accumulates 9 quantities per species pair, but only
+        //  3 (coef1-3, the SRK attraction-parameter mixing) plus the O(n)
+        //  bM/cM are needed for the EOS coefficients alone -- the other 6
+        //  (sigma3M, epsilonkM0, omegaM0, MM0, miuiM0, kappaiM) are Chung
+        //  transport-mixing terms, unused by an EOS-only caller. With
+        //  ~100 species (e.g. thermo.wang2011) the O(n^2) loop dominates
+        //  total cost by orders of magnitude over any O(1) per-cell work,
+        //  so skipping 6 of 9 accumulators there is the real lever -- see
+        //  eosRootBranchProperties(), which only needs bM/coef1-3/cM per
+        //  cell and was found to gain nothing from trimming O(1) log()
+        //  calls alone (PEP and LAD Spike Suppression wiki sec 18d).
+        //  sigmaM/epsilonkM/MM/VcM/TcM/omegaM/miuiM/kappaiM are left
+        //  unset (0) when false -- callers must not read them.
         void calculateRealGas
         (
             const List<scalar>& X,
@@ -229,7 +243,8 @@ private:
             scalar& TcM,
             scalar& omegaM,
             scalar& miuiM,
-            scalar& kappaiM
+            scalar& kappaiM,
+            const bool needTransportMix = true
         ) const;
 
         //- Compute mixture from a composition slice (shared logic)
@@ -370,6 +385,34 @@ public:
             const labelList& pvIds,
             scalar& LeZ,
             scalar& LeC
+        ) const;
+
+        //- Root-selection hysteresis: cubic-EOS branch rho/psi/Cp/h at
+        //  (p,T) for a mass-fraction composition Y. See
+        //  tabulatedRealGasMixture.H.
+        virtual bool eosRootBranchProperties
+        (
+            const List<scalar>& Y,
+            const scalar p,
+            const scalar T,
+            scalar& rhoMin, scalar& rhoMax,
+            scalar& psiMin, scalar& psiMax,
+            scalar& CpMin,  scalar& CpMax,
+            scalar& hMin,   scalar& hMax,
+            const bool needPsi = true,
+            const bool needCpH = true
+        ) const;
+
+        //- Root-selection hysteresis from already-known EOS coefficients
+        //  (skips the O(n^2) mixing loop). See tabulatedRealGasMixture.H.
+        virtual bool eosRootBranchPropertiesFromCoeffs
+        (
+            const scalar bM, const scalar coef1, const scalar coef2,
+            const scalar coef3, const scalar cM, const scalar Wm,
+            const scalar p, const scalar T,
+            scalar& rhoMin, scalar& rhoMax,
+            scalar& psiMin, scalar& psiMax,
+            const bool needPsi = true
         ) const;
 
         //- Disable the tabulated lookup (revert to live mixing).

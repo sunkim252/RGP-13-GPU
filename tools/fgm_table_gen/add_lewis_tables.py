@@ -58,6 +58,10 @@ def main():
     ap.add_argument("--yaml", dest="srk_yaml", required=True,
                     help="SRK Cantera mechanism (e.g. wang2011_srk_v32.yaml)")
     ap.add_argument("--transport", default="high-pressure-Chung")
+    ap.add_argument("--blend-kinetic-yaml", default=None,
+                    help="ideal-gas yaml for the kinetic baseline: activates "
+                    "the zone-blended lam/mu (kinetic in the dilute limit, "
+                    "HP-Chung in the dense limit; Le-verdict 2026-07-28)")
     ap.add_argument("--tmin-skip", type=float, default=85.0,
                     help="nodes below this T are median-filled (default 85)")
     ap.add_argument("--tmin-eval", type=float, default=85.0,
@@ -94,6 +98,7 @@ def main():
         tables, species, P, args.srk_yaml,
         transport_model=args.transport,
         Tmin_skip=args.tmin_skip, Tmin_eval=args.tmin_eval,
+        blend_kin_yaml=args.blend_kinetic_yaml,
     )
     print(f"[add-le] Lewis evaluation done in {time.time()-t0:.0f}s")
 

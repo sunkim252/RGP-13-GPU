@@ -576,6 +576,18 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False,
         # local (window narrower than the global family -> no upper-envelope
         # over-sourcing).
         cw = (chi_axis[-1] / chi_axis[0]) ** (0.65 / max(n_chi - 1, 1))
+        # Source fields use the SAME neighborhood-max (_laminar_branch) closure
+        # as the steady build, applied PER SLICE (2026-07-28 fix). Plain
+        # _laminar_one hollowed slices whose steady curves normalise to
+        # c == 1.0 exactly: the clip lands them ON the c=1 boundary row
+        # (omega=0), griddata keeps one of the duplicate coordinates -- the
+        # zero -- and whole Z columns of the slice go dark (observed: slices
+        # chi=0.195/0.72 all-zero at Zst while their window flamelets carry
+        # omega ~ 3e4). The branch closure's window-max is immune to
+        # coordinate duplicates; within a x2.34 chi window the S-curve spread
+        # is small, so the original "no upper-envelope over-sourcing"
+        # rationale for _laminar_one is not compromised.
+        SRC_FIELDS = {"omega_C", "hrr"}
         for iChi, chi_target in enumerate(chi_axis):
             lo, hi = chi_target / cw, chi_target * cw
             window = [fl for fl in fls if lo <= fl["chi_st"] <= hi]
@@ -584,7 +596,10 @@ def build_tables(fls, species, n_chi=N_CHI, eq=None, chi_mode=False,
                     np.log(max(fl["chi_st"], EPS)) - np.log(max(chi_target, EPS))))[:3]
             Zs, cs, Ws = _cloud(window)
             for f in field_names:
-                lam[f][iChi] = _laminar_one(Zs, cs, Ws[f], Zq, C_axis)
+                lam[f][iChi] = (
+                    _laminar_branch(Zs, cs, Ws[f], Zq, C_axis)
+                    if f in SRC_FIELDS
+                    else _laminar_one(Zs, cs, Ws[f], Zq, C_axis))
         print(f"[build] chi-window cw={cw:.2f}x, ~{len(window)} flamelets/slice")
         n_slices = n_chi
     print(f"[build] {len(field_names)} fields × {n_slices} slice(s) "
@@ -793,7 +808,8 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
                          transport_model="high-pressure-Chung",
                          Tmin_skip=200.0, Tmin_eval=250.0,
                          soret=False, Z_axis=None, C_axis=None,
-                         C_norm=None, x_fuel=None, x_ox=None):
+                         C_norm=None, x_fuel=None, x_ox=None,
+                         blend_kin_yaml=None):
     """Tier-4: tabulate the differential-diffusion Lewis numbers Le_Z and Le_C
     over the manifold from the REAL-FLUID (SRK + high-pressure-Chung/Takahashi)
     transport evaluated at each node's tabulated (T, Y).
@@ -855,6 +871,26 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
     for s in sp_in_mech:
         Ymat[:, idx[s]] = np.asarray(tables[f"Y_{s}"]).reshape(-1)
 
+    # ---- optional zone-blended lam/mu (Le-model verdict 2026-07-28) ----
+    # NIST @52.5 bar: kinetic theory wins the dilute/hot regime (O2 lam 1.0%,
+    # CO2 3.8%, H2O mu 3.1% vs HP-Chung 6-33%), HP-Chung wins the cryo dense
+    # regime (O2 lam 17.6% vs kinetic 47.9%). Blend on the NON-IDEALITY of the
+    # state, w = smoothstep(|rho_SRK/rho_ideal - 1|; 0.05, 0.35): dense LOX
+    # nodes -> full HP-Chung, flame/product nodes -> pure kinetic theory.
+    # D_k stays HP (= kinetic x Takahashi, already correct in both limits).
+    gkin = None
+    if blend_kin_yaml:
+        gkin = ct.Solution(str(blend_kin_yaml))
+        gkin.transport_model = "mixture-averaged"
+        kmap = [idx[s] if s in idx else -1
+                for s in gkin.species_names]        # kin col <- srk col
+        print(f"[lewis] zone-blended lam/mu active "
+              f"(kinetic baseline: {Path(blend_kin_yaml).name})")
+
+    def _smooth(x, lo=0.05, hi=0.35):
+        t = min(max((x - lo)/(hi - lo), 0.0), 1.0)
+        return t*t*(3.0 - 2.0*t)
+
     # ---- Soret setup: manifold gradients + Bilger coefficients ----
     do_soret = bool(soret) and Z_axis is not None and C_axis is not None
     if do_soret:
@@ -902,6 +938,14 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
             lam = gas.thermal_conductivity
             cp = gas.cp_mass
             rho = gas.density
+            if gkin is not None:
+                yk = np.array([y[c] if c >= 0 else 0.0 for c in kmap])
+                sk = yk.sum()
+                if sk > 1e-8:
+                    gkin.TPY = max(Tn, Tmin_eval), P, yk / sk
+                    w = _smooth(abs(rho / max(gkin.density, 1e-30) - 1.0))
+                    mu = (1.0 - w)*gkin.viscosity + w*mu
+                    lam = (1.0 - w)*gkin.thermal_conductivity + w*lam
             nu = mu / max(rho, 1e-30)
             alpha = lam / max(rho * cp, 1e-30)
             Dk = np.clip(gas.mix_diff_coeffs, 1e-12, None)
@@ -948,7 +992,8 @@ def compute_lewis_tables(tables, species, P, srk_yaml,
     LeC, medC, nbadC = _fill(LeC, 0.1, 10.0, 0.60)
     stag = ("OFF" if not do_soret else
             ("PV-only (no dbeta)" if do_soret == "C-only" else "Z+C"))
-    print(f"[lewis] real-fluid differential diffusion ({transport_model}, "
+    print(f"[lewis] real-fluid differential diffusion "
+          f"({'blend[kinetic+' + transport_model + ']' if gkin is not None else transport_model}, "
           f"Soret={stag}) on "
           f"{nNode} nodes: Le_Z med={medZ:.3f} [{LeZ.min():.2f},{LeZ.max():.2f}] "
           f"Le_C med={medC:.3f} [{LeC.min():.2f},{LeC.max():.2f}]")
